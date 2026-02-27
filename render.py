@@ -712,7 +712,8 @@ class TaichiRenderer:
     def __init__(self, width, height, skybox, disk_tex,
                  step_size=0.1, r_max=10.0, device="cpu",
                  r_disk_inner=R_DISK_INNER_DEFAULT,
-                 r_disk_outer=R_DISK_OUTER_DEFAULT):
+                 r_disk_outer=R_DISK_OUTER_DEFAULT,
+                 disk_tilt=0.0):
         import taichi as ti
         self.ti = ti
         self.width = width
@@ -721,6 +722,7 @@ class TaichiRenderer:
         self.r_max = r_max
         self.r_disk_inner = r_disk_inner
         self.r_disk_outer = r_disk_outer
+        self.disk_tilt = disk_tilt
 
         ti.init(arch=ti.cpu if device == "cpu" else ti.gpu)
 
@@ -829,13 +831,19 @@ class TaichiRenderer:
                           cam_up_field: ti.template(), cam_forward_field: ti.template(),
                           pixel_width_field: ti.template(),
                           pixel_height_field: ti.template(), r_escape_field: ti.template(),
-                          h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32):
+                          h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32,
+                          disk_tilt: ti.f32):
             cp = cam_pos_field[None]
             cr = cam_right_field[None]
             cu = cam_up_field[None]
             cf = cam_forward_field[None]
             pw = pixel_width_field[None]
             ph = pixel_height_field[None]
+
+            # 吸积盘倾斜旋转矩阵（绕 x 轴）
+            tilt_rad = disk_tilt * ti.math.pi / 180.0
+            cos_t = ti.cos(tilt_rad)
+            sin_t = ti.sin(tilt_rad)
 
             center = cp + cf * 1.0
             tl = center - cr * (pw * width / 2) + cu * (ph * height / 2)
@@ -896,15 +904,19 @@ class TaichiRenderer:
                         t_frac = -old_z / (new_z - old_z + 1e-8)
                         hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
                         hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
-                        hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
-                        if r_outer >= hit_r >= r_inner:
-                            disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
+                        hit_z = old_pos[2] + t_frac * (new_pos[2] - old_pos[2])
+                        # 反向旋转：盘面倾斜导致 z 坐标变化，需要补偿
+                        # 绕 x 轴旋转回去
+                        tilted_y = hit_y * cos_t - hit_z * sin_t
+                        tilted_r = ti.sqrt(hit_x ** 2 + tilted_y ** 2)
+                        if r_outer >= tilted_r >= r_inner:
+                            disk_rgba = sample_disk(hit_x, tilted_y, r_inner, r_outer, t_offset)
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
                             disk_alpha = disk_rgba[3]  # 边缘透明度
 
                             # 多普勒效应：亮度 + 颜色偏移
-                            v_orb = ti.sqrt(0.5 / hit_r)
-                            phi = ti.atan2(hit_y, hit_x)
+                            v_orb = ti.sqrt(0.5 / tilted_r)
+                            phi = ti.atan2(tilted_y, hit_x)
                             vdx = -v_orb * ti.sin(phi)
                             vdy = v_orb * ti.cos(phi)
                             ray_d = dir_.normalized()
@@ -1049,11 +1061,13 @@ class TaichiRenderer:
         r_inner = float(self.r_disk_inner)
         r_outer = float(self.r_disk_outer)
         t_offset = float(frame) * 0.1
+        disk_tilt = float(self.disk_tilt)
 
         self._render_kernel(
             self.image_field, self.disk_layer_field, self.cam_pos_field, self.cam_right_field,
             self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
-            self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset
+            self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset,
+            disk_tilt
         )
 
         # 对吸积盘层做 bloom
@@ -1070,7 +1084,7 @@ class TaichiRenderer:
 def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
                   n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
-                  r_disk_outer=R_DISK_OUTER_DEFAULT):
+                  r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0):
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
@@ -1082,7 +1096,8 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
     renderer = TaichiRenderer(
         width, height, skybox, disk_tex,
         step_size=step_size, r_max=r_max, device=device,
-        r_disk_inner=r_disk_inner, r_disk_outer=r_disk_outer
+        r_disk_inner=r_disk_inner, r_disk_outer=r_disk_outer,
+        disk_tilt=disk_tilt
     )
 
     t0 = time.time()
@@ -1239,6 +1254,8 @@ def parse_args():
                         help=f"吸积盘内半径 (default: {R_DISK_INNER_DEFAULT})")
     parser.add_argument("--ar2", type=float, default=R_DISK_OUTER_DEFAULT,
                         help=f"吸积盘外半径 (default: {R_DISK_OUTER_DEFAULT})")
+    parser.add_argument("--disk_tilt", type=float, default=0.0,
+                        help="吸积盘倾角 (度, default: 0)")
     parser.add_argument("--framework", "-f", type=str, default="taichi",
                         choices=["numpy", "taichi"],
                         help="渲染框架: numpy 或 taichi (default: taichi)")
@@ -1278,12 +1295,13 @@ if __name__ == "__main__":
         renderer = TaichiRenderer(
             width, height, skybox, disk_tex,
             step_size=args.step_size, r_max=args.r_max, device=args.device,
-            r_disk_inner=args.ar1, r_disk_outer=args.ar2
+            r_disk_inner=args.ar1, r_disk_outer=args.ar2,
+            disk_tilt=args.disk_tilt
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
         print(f"  orbit={args.orbit}")
-        print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}")
+        print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}, disk_tilt={args.disk_tilt}°")
 
         render_video(
             renderer, width, height,
@@ -1307,6 +1325,7 @@ if __name__ == "__main__":
                 disk_texture_path=args.disk_texture,
                 r_disk_inner=args.ar1,
                 r_disk_outer=args.ar2,
+                disk_tilt=args.disk_tilt,
             )
         else:
             img = render_numpy(
