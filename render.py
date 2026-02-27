@@ -1094,11 +1094,9 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
 
 
 def render_video(renderer, width, height, n_frames, fps, output_path,
-                 fov, static_cam_pos, orbit=False, orbit_radius=None, orbit_z=0.5,
-                 resume=False):
-    # 默认 orbit_radius 使用 POV 距离
-    if orbit_radius is None:
-        orbit_radius = float(np.linalg.norm(static_cam_pos))
+                 fov, static_cam_pos, orbit=False, resume=False):
+    # orbit 时使用 POV 的距离绕原点旋转
+    orbit_radius = float(np.linalg.norm(static_cam_pos))
     """
     渲染视频（多帧并合成视频）。
 
@@ -1129,8 +1127,6 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         "n_frames": n_frames,
         "fov": fov,
         "orbit": orbit,
-        "orbit_radius": orbit_radius,
-        "orbit_z": orbit_z,
     }
 
     completed = set()
@@ -1160,6 +1156,7 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         if orbit:
             angle_deg = frame * angle_step
             angle_rad = np.radians(angle_deg)
+            orbit_z = static_cam_pos[2]
             cx = orbit_radius * np.cos(angle_rad)
             cy = orbit_radius * np.sin(angle_rad)
             cam_pos = [cx, cy, orbit_z]
@@ -1252,10 +1249,6 @@ def parse_args():
                         help="视频模式：渲染多帧并合成视频")
     parser.add_argument("--orbit", action="store_true",
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
-    parser.add_argument("--orbit_radius", type=float, default=None,
-                        help="轨道半径 (default: 使用 --pov 距离, 仅 --orbit 有效)")
-    parser.add_argument("--orbit_z", type=float, default=0.5,
-                        help="轨道高度 (default: 0.5, 仅 --orbit 有效)")
     parser.add_argument("--n_frames", type=int, default=3600,
                         help="视频帧数 (default: 3600, 仅 --video 有效)")
     parser.add_argument("--fps", type=int, default=36,
@@ -1289,14 +1282,14 @@ if __name__ == "__main__":
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
-        print(f"  orbit={args.orbit}, radius={args.orbit_radius}, z={args.orbit_z}")
+        print(f"  orbit={args.orbit}")
         print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}")
 
         render_video(
             renderer, width, height,
             n_frames=args.n_frames, fps=args.fps, output_path=args.output,
             fov=fov, static_cam_pos=args.pov,
-            orbit=args.orbit, orbit_radius=args.orbit_radius, orbit_z=args.orbit_z,
+            orbit=args.orbit,
             resume=args.resume
         )
     else:
