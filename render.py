@@ -1094,8 +1094,11 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
 
 
 def render_video(renderer, width, height, n_frames, fps, output_path,
-                 fov, static_cam_pos, orbit=False, orbit_radius=8.0, orbit_z=0.5,
+                 fov, static_cam_pos, orbit=False, orbit_radius=None, orbit_z=0.5,
                  resume=False):
+    # 默认 orbit_radius 使用 POV 距离
+    if orbit_radius is None:
+        orbit_radius = float(np.linalg.norm(static_cam_pos))
     """
     渲染视频（多帧并合成视频）。
 
@@ -1249,8 +1252,8 @@ def parse_args():
                         help="视频模式：渲染多帧并合成视频")
     parser.add_argument("--orbit", action="store_true",
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
-    parser.add_argument("--orbit_radius", type=float, default=8.0,
-                        help="轨道半径 (default: 8.0, 仅 --orbit 有效)")
+    parser.add_argument("--orbit_radius", type=float, default=None,
+                        help="轨道半径 (default: 使用 --pov 距离, 仅 --orbit 有效)")
     parser.add_argument("--orbit_z", type=float, default=0.5,
                         help="轨道高度 (default: 0.5, 仅 --orbit 有效)")
     parser.add_argument("--n_frames", type=int, default=3600,
