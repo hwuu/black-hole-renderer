@@ -353,10 +353,72 @@ dt = dt_base · min(r / rs, 10)
 v_orbital = sqrt(M/r) = sqrt(1/(2r))        # 开普勒速度
 v_disk = v_orbital · (-sin φ, cos φ, 0)     # 逆时针轨道方向
 doppler = 1 / (1 - v_disk · ray_dir)        # 多普勒因子
-brightness *= clamp(doppler³, 0, 8)          # 相对论 beaming (I ∝ δ³)
+brightness *= clamp(doppler^1.0, 0, 1.5) * 0.6  # 亮度调制
 ```
 
-效果：朝观察者运动的一侧更亮（蓝移），远离的一侧更暗（红移）。
+**颜色偏移**（蓝移偏蓝、红移偏红）：
+
+```
+shift = doppler - 1.0
+r = color.r * (1 - shift * 0.6)      # 蓝移时红减少
+g = color.g * (1 - |shift| * 0.3)    # 中间色影响较小
+b = color.b * (1 + shift * 0.4)      # 蓝移时蓝增加
+```
+
+效果：朝观察者运动的一侧更亮且偏蓝，远离的一侧更暗且偏红。
+
+### 6.4 边缘软化 ✅
+
+吸积盘边缘（内外圈）渐变透明，避免硬边界：
+
+```python
+def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.1):
+    # 内圈：vv < inner_soft -> 逐渐透明
+    alpha[inner_mask] = (v[inner_mask] / inner_soft) ** 3.0
+    # 外圈：vv > (1 - outer_soft) -> 逐渐透明
+    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 5.0
+```
+
+- 程序生成纹理和外部纹理统一使用此逻辑
+- 中间区域完全不透明
+
+### 6.5 分离式 Bloom（待实现）
+
+模拟相机镜头遇到强光的泛光效果：
+
+```
++------------------+     +------------------+
+| Render Kernel    |     |                  |
+| background ------+---->| image_field      |
+| disk_layer ------+--+  +------------------+
++------------------+  |
+                      v  +------------------+
+                      +->| disk_layer_field |
+                      |  +------------------+
+                      |         |
+                      |         v
+                      |  +------------------+
+                      +->| Bloom Kernel     |
+                         | (disk only)      |
+                         +------------------+
+                                  |
+                                  v
+                         +------------------+
+                         | final = bg +     |
+                         | disk + disk_bloom|
+                         +------------------+
+```
+
+**优点**：
+- 只对吸积盘做 bloom，不影响背景星空
+- 保持星空清晰，吸积盘有自然的光晕
+
+**参数**：
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| threshold | 0.5 | 高亮提取阈值 |
+| intensity | 0.6 | bloom 强度 |
+| blur_sigma | 4.0 | 高斯模糊半径 |
 
 ---
 
@@ -371,6 +433,7 @@ brightness *= clamp(doppler³, 0, 8)          # 相对论 beaming (I ∝ δ³)
 
 ## 变更记录
 
+- v5.3 (2026-02-27): 多普勒颜色偏移（蓝移偏蓝、红移偏红）、边缘软化公共函数（compute_edge_alpha）、降低亮度避免过曝
 - v5.2 (2026-02-27): 吸积盘纹理大幅改进：FBM噪声絮状云雾、螺旋臂结构、径向丝状条纹、间隙效果、alpha合成（多次穿透衰减）、双线性插值、体积渲染（高斯密度剖面）
 - v5.1 (2026-02-27): 视频模式新增 --resume 断点续传，参数变化时自动从头开始；吸积盘改进：Doppler boost 上限提升、温度剖面纹理、真实自转（开普勒角速度）、边缘软化、角度方向条纹细节
 - v5.0 (2026-02-27): 合并 render.py 和 demo.py，提取 TaichiRenderer 类（kernel 一次编译），新增视频模式（--video, --orbit），默认框架改为 taichi
