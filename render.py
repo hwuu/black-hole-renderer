@@ -287,14 +287,14 @@ R_DISK_INNER_DEFAULT = 2.0 * RS
 R_DISK_OUTER_DEFAULT = 3.5 * RS
 
 
-def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.1):
+def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
     """计算边缘软化的 alpha 通道"""
     v = np.linspace(0, 1, height).astype(np.float32)
     alpha = np.ones_like(v)
     inner_mask = v < inner_soft
     outer_mask = v > (1 - outer_soft)
     alpha[inner_mask] = (v[inner_mask] / inner_soft) ** 3.0
-    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 5.0
+    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 2.0
     return alpha
 
 
@@ -738,6 +738,7 @@ class TaichiRenderer:
         self.disk_texture_field.from_numpy(disk_tex)
 
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.disk_layer_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
 
         self.cam_pos_field = ti.Vector.field(3, dtype=ti.f32, shape=())
         self.cam_right_field = ti.Vector.field(3, dtype=ti.f32, shape=())
@@ -823,9 +824,10 @@ class TaichiRenderer:
                     c11 * fu * fv)
 
         @ti.kernel
-        def render_kernel(image_field: ti.template(), cam_pos_field: ti.template(),
-                          cam_right_field: ti.template(), cam_up_field: ti.template(),
-                          cam_forward_field: ti.template(), pixel_width_field: ti.template(),
+        def render_kernel(image_field: ti.template(), disk_layer_field: ti.template(),
+                          cam_pos_field: ti.template(), cam_right_field: ti.template(),
+                          cam_up_field: ti.template(), cam_forward_field: ti.template(),
+                          pixel_width_field: ti.template(),
                           pixel_height_field: ti.template(), r_escape_field: ti.template(),
                           h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32):
             cp = cam_pos_field[None]
@@ -908,7 +910,7 @@ class TaichiRenderer:
                             ray_d = dir_.normalized()
                             vdot = vdx * ray_d[0] + vdy * ray_d[1]
                             doppler = 1.0 / ti.max(1.0 - vdot, 0.1)
-                            brightness = ti.min((doppler * 0.85) ** 3, 16)
+                            brightness = ti.min((doppler * 0.7) ** 3, 8)
 
                             shift = doppler - 1.0
                             r_col = disk_col[0] * (1.0 - shift * 0.6)
@@ -922,12 +924,15 @@ class TaichiRenderer:
                     dir_ = new_dir
                     step_count += 1
 
-                # 加法混合
+                # 分离式渲染：背景和吸积盘分开存储
+                bg_color = ti.Vector([0.0, 0.0, 0.0])
                 if event_horizon_hit:
-                    image_field[i, j] = ti.math.clamp(accum_disk, 0.0, 1.0)
-                else:
-                    bg_color = sample_skybox(escape_dir) if escaped else ti.Vector([0.0, 0.0, 0.0])
-                    image_field[i, j] = ti.math.clamp(bg_color + accum_disk, 0.0, 1.0)
+                    bg_color = ti.Vector([0.0, 0.0, 0.0])
+                elif escaped:
+                    bg_color = sample_skybox(escape_dir)
+
+                image_field[i, j] = bg_color
+                disk_layer_field[i, j] = ti.math.clamp(accum_disk, 0.0, 1.0)
 
         self._render_kernel = render_kernel
 
@@ -948,13 +953,13 @@ class TaichiRenderer:
             for i, j in blur_field:
                 sum_col = ti.Vector([0.0, 0.0, 0.0])
                 weight_sum = 0.0
-                for dy in range(-3, 4):
-                    for dx in range(-3, 4):
+                for dy in range(-12, 13):
+                    for dx in range(-12, 13):
                         ni = i + dy
                         nj = j + dx
                         if 0 <= ni < w and 0 <= nj < h:
                             dist_sq = ti.cast(dx * dx + dy * dy, ti.f32)
-                            weight = ti.exp(-dist_sq / 8.0)
+                            weight = ti.exp(-dist_sq / 64.0)
                             sum_col += bright_field[ni, nj] * weight
                             weight_sum += weight
                 if weight_sum > 0.0:
@@ -1046,15 +1051,20 @@ class TaichiRenderer:
         t_offset = float(frame) * 0.1
 
         self._render_kernel(
-            self.image_field, self.cam_pos_field, self.cam_right_field,
+            self.image_field, self.disk_layer_field, self.cam_pos_field, self.cam_right_field,
             self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
             self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset
         )
 
-        # self._bloom_kernel(self.image_field, self.bright_field, self.blur_field, 0.5, 0.6)
+        # 对吸积盘层做 bloom
+        self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4)
 
+        # 合并：背景 + 吸积盘 + bloom
         img = self.image_field.to_numpy()
-        return np.clip(img, 0, 1).transpose(1, 0, 2)
+        disk = self.disk_layer_field.to_numpy()
+        disk_bloom = self.blur_field.to_numpy()
+        final = np.clip(img + disk + disk_bloom, 0, 1)
+        return final.transpose(1, 0, 2)
 
 
 def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
