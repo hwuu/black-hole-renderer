@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# type: ignore[attr-defined, misc, valid-type]
 """
 Schwarzschild 黑洞光线追踪渲染器
 
@@ -286,14 +287,27 @@ R_DISK_INNER_DEFAULT = 2.0 * RS
 R_DISK_OUTER_DEFAULT = 3.5 * RS
 
 
+def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.1):
+    """计算边缘软化的 alpha 通道"""
+    v = np.linspace(0, 1, height).astype(np.float32)
+    alpha = np.ones_like(v)
+    inner_mask = v < inner_soft
+    outer_mask = v > (1 - outer_soft)
+    alpha[inner_mask] = (v[inner_mask] / inner_soft) ** 3.0
+    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 5.0
+    return alpha
+
+
 def load_disk_texture(path):
-    """加载吸积盘纹理，返回 (h, w, 4) float32 数组（RGBA，外部纹理 alpha=1）"""
+    """加载吸积盘纹理，返回 (h, w, 4) float32 数组（RGBA，边缘软化 alpha）"""
     if path and os.path.isfile(path):
         print(f"Loading disk texture: {path}")
         img = Image.open(path).convert("RGB")
         rgb = np.array(img, dtype=np.float32) / 255.0
-        # 外部纹理没有 alpha，补 1.0
-        alpha = np.ones((*rgb.shape[:2], 1), dtype=np.float32)
+        h, w = rgb.shape[:2]
+        alpha = compute_edge_alpha(h)[:, None].astype(np.float32)
+        alpha = np.broadcast_to(alpha, (h, w)).copy()
+        alpha = alpha[:, :, None]
         return np.concatenate([rgb, alpha], axis=2)
     return None
 
@@ -354,7 +368,7 @@ def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1):
     return result / total_amp
 
 
-def generate_disk_texture(tex_w=1024, tex_h=128, seed=42):
+def generate_disk_texture(tex_w=1024, tex_h=512, seed=42):
     """
     程序化生成吸积盘纹理（絮状云雾 + 螺旋臂 + 径向丝状结构 + 间隙）
     返回 (tex_h, tex_w, 4) float32，第 4 通道为 alpha（密度）
@@ -384,52 +398,25 @@ def generate_disk_texture(tex_w=1024, tex_h=128, seed=42):
         spiral += arm_val
     spiral = np.clip(spiral, 0, 1)
 
-    # 2. FBM 云雾噪声（絮状结构）— 柔和调制
-    cloud = _fbm_noise((tex_h, tex_w), rng, octaves=5, persistence=0.55, base_scale=4)
+    # 2. FBM 云雾噪声（絮状结构）— 柔和
+    cloud = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.5, base_scale=8)
 
-    # 3. 径向丝状结构（细条纹）— 减弱强度
-    n_filaments = rng.integers(8, 15)
+    # 3. 径向丝状结构（细条纹）— 禁用
     filaments = np.ones((tex_h, tex_w), dtype=np.float32)
-    for _ in range(n_filaments):
-        pos = rng.uniform(0, 1)
-        width = rng.uniform(0.005, 0.02)
-        strength = rng.uniform(0.1, 0.35)
-        dist = np.abs(uu - pos)
-        dist = np.minimum(dist, 1 - dist)
-        filaments *= 1.0 - strength * np.exp(-0.5 * (dist / width) ** 2)
 
-    # 4. 角度方向的宽条纹 — 减弱
-    n_streaks = rng.integers(3, 6)
+    # 4. 角度方向的宽条纹 — 禁用
     streaks = np.ones((tex_h, tex_w), dtype=np.float32)
-    for _ in range(n_streaks):
-        pos = rng.uniform(0, 1)
-        width = rng.uniform(0.03, 0.1)
-        strength = rng.uniform(0.1, 0.3)
-        dist = np.abs(uu - pos)
-        dist = np.minimum(dist, 1 - dist)
-        streaks *= 1.0 - strength * np.exp(-0.5 * (dist / width) ** 2)
 
-    # 5. 间隙 — 更少更小
-    n_gaps = rng.integers(1, 3)
+    # 5. 间隙 — 已禁用
     gaps = np.ones((tex_h, tex_w), dtype=np.float32)
-    for _ in range(n_gaps):
-        pos_u = rng.uniform(0, 1)
-        pos_v = rng.uniform(0.2, 0.8)
-        size_u = rng.uniform(0.05, 0.15)
-        size_v = rng.uniform(0.15, 0.4)
-        dist_u = np.abs(uu - pos_u)
-        dist_u = np.minimum(dist_u, 1 - dist_u)
-        dist_v = np.abs(vv - pos_v)
-        gap_mask = np.exp(-0.5 * ((dist_u / size_u) ** 2 + (dist_v / size_v) ** 2))
-        gaps *= 1.0 - gap_mask * rng.uniform(0.3, 0.6)
 
-    # 组合密度场：高基底 + 结构调制
-    density = 0.5 + spiral * 0.25 + cloud * 0.25
+    # 组合密度场
+    density = 0.6 + cloud * 0.15 + spiral * 0.1
     density *= filaments * streaks * gaps
 
-    # 边缘软化（内外边缘渐隐）
-    edge = np.sin(np.pi * vv) ** 0.4
-    density *= edge
+    # 边缘软化
+    edge = compute_edge_alpha(tex_h)
+    density *= edge[:, None]
 
     # 归一化到 [0, 1]
     density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
@@ -449,9 +436,9 @@ def generate_disk_texture(tex_w=1024, tex_h=128, seed=42):
 
     # 组合 RGBA
     tex = np.zeros((tex_h, tex_w, 4), dtype=np.float32)
-    tex[:, :, 0] = np.clip(r_ch * density * 1.6, 0, 1)
-    tex[:, :, 1] = np.clip(g_ch * density * 1.6, 0, 1)
-    tex[:, :, 2] = np.clip(b_ch * density * 1.6, 0, 1)
+    tex[:, :, 0] = np.clip(r_ch * density * 8.0, 0, 1)
+    tex[:, :, 1] = np.clip(g_ch * density * 8.0, 0, 1)
+    tex[:, :, 2] = np.clip(b_ch * density * 8.0, 0, 1)
     tex[:, :, 3] = np.clip(density, 0, 1)  # alpha = 密度
 
     return tex
@@ -760,6 +747,9 @@ class TaichiRenderer:
         self.pixel_height_field = ti.field(dtype=ti.f32, shape=())
         self.r_escape_field = ti.field(dtype=ti.f32, shape=())
 
+        self.bright_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+
         self._compile_kernels()
 
     def _compile_kernels(self):
@@ -865,11 +855,12 @@ class TaichiRenderer:
 
                 escaped = False
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
+                event_horizon_hit = False
                 accum_disk = ti.Vector([0.0, 0.0, 0.0])
-                disk_transmit = 1.0  # 剩余透射率（1=完全透明，0=完全不透明）
                 step_count = 0
 
                 while step_count < max_iter:
+                    old_pos = pos
                     old_z = pos[2]
                     r_cur = pos.norm()
                     h = h_base * ti.min(r_cur / r_cap, max_fac)
@@ -889,6 +880,7 @@ class TaichiRenderer:
                     r = new_pos.norm()
 
                     if r < r_cap:
+                        event_horizon_hit = True
                         break
                     elif r > r_esc:
                         escaped = True
@@ -897,52 +889,130 @@ class TaichiRenderer:
 
                     new_z = new_pos[2]
 
-                    # 吸积盘体积渲染：|z| < h(r) 区域内累积颜色
-                    # h(r) = h0 * (r/r_inner)^1.2 (flared disk)
-                    r_cyl = ti.sqrt(new_pos[0] ** 2 + new_pos[1] ** 2)
-                    if r_cyl >= r_inner and r_cyl <= r_outer:
-                        disk_h = 0.15 * ti.pow(r_cyl / r_inner, 1.2)
-                        if ti.abs(new_z) < disk_h:
-                            disk_rgba = sample_disk(new_pos[0], new_pos[1], r_inner, r_outer, t_offset)
+                    # 吸积盘检测：穿过 z=0 平面
+                    if old_z * new_z < 0:
+                        t_frac = -old_z / (new_z - old_z + 1e-8)
+                        hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
+                        hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
+                        hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
+                        if r_outer >= hit_r >= r_inner:
+                            disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
-                            tex_alpha = disk_rgba[3]
+                            disk_alpha = disk_rgba[3]  # 边缘透明度
 
-                            # 密度随 |z| 衰减（高斯剖面）
-                            z_frac = new_z / disk_h
-                            density = ti.exp(-2.0 * z_frac * z_frac) * tex_alpha
-
-                            # 多普勒
-                            v_orb = ti.sqrt(0.5 / r_cyl)
-                            phi = ti.atan2(new_pos[1], new_pos[0])
+                            # 多普勒效应：亮度 + 颜色偏移
+                            v_orb = ti.sqrt(0.5 / hit_r)
+                            phi = ti.atan2(hit_y, hit_x)
                             vdx = -v_orb * ti.sin(phi)
                             vdy = v_orb * ti.cos(phi)
                             ray_d = dir_.normalized()
                             vdot = vdx * ray_d[0] + vdy * ray_d[1]
                             doppler = 1.0 / ti.max(1.0 - vdot, 0.1)
-                            boost = ti.max(1.0 + ti.log(doppler) * 1.5, 0.1)
+                            brightness = ti.min((doppler * 0.85) ** 3, 16)
 
                             shift = doppler - 1.0
-                            r_col = disk_col[0] * (1.0 - shift * 0.75)
-                            g_col = disk_col[1] * (1.0 - ti.abs(shift) * 0.1)
-                            b_col = disk_col[2] * (1.0 + shift * 0.7)
-                            col_shifted = ti.Vector([r_col, g_col, b_col])
+                            r_col = disk_col[0] * (1.0 - shift * 0.6)
+                            g_col = disk_col[1] * (1.0 - ti.abs(shift) * 0.3)
+                            b_col = disk_col[2] * (1.0 + shift * 0.4)
+                            col_shifted = ti.Vector([ti.max(r_col, 0.0), ti.max(g_col, 0.0), ti.max(b_col, 0.0)])
 
-                            # 体积累积：step_alpha ∝ density * step_size
-                            step_alpha = ti.min(density * h * 4.0, 0.5)
-                            accum_disk += col_shifted * boost * disk_transmit * step_alpha
-                            disk_transmit *= (1.0 - step_alpha)
+                            accum_disk += col_shifted * brightness * disk_alpha
 
                     pos = new_pos
                     dir_ = new_dir
                     step_count += 1
 
-                if escaped:
-                    image_field[i, j] = ti.math.clamp(
-                        sample_skybox(escape_dir) + accum_disk, 0.0, 1.0)
-                else:
+                # 加法混合
+                if event_horizon_hit:
                     image_field[i, j] = ti.math.clamp(accum_disk, 0.0, 1.0)
+                else:
+                    bg_color = sample_skybox(escape_dir) if escaped else ti.Vector([0.0, 0.0, 0.0])
+                    image_field[i, j] = ti.math.clamp(bg_color + accum_disk, 0.0, 1.0)
 
         self._render_kernel = render_kernel
+
+        @ti.kernel
+        def bloom_kernel(image_field: ti.template(), bright_field: ti.template(),
+                         blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32):
+            w = ti.cast(image_field.shape[0], ti.i32)
+            h = ti.cast(image_field.shape[1], ti.i32)
+
+            for i, j in image_field:
+                col = image_field[i, j]
+                lum = col[0] * 0.2126 + col[1] * 0.7152 + col[2] * 0.0722
+                if lum > threshold:
+                    bright_field[i, j] = col
+                else:
+                    bright_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+
+            for i, j in blur_field:
+                sum_col = ti.Vector([0.0, 0.0, 0.0])
+                weight_sum = 0.0
+                for dy in range(-3, 4):
+                    for dx in range(-3, 4):
+                        ni = i + dy
+                        nj = j + dx
+                        if 0 <= ni < w and 0 <= nj < h:
+                            dist_sq = ti.cast(dx * dx + dy * dy, ti.f32)
+                            weight = ti.exp(-dist_sq / 8.0)
+                            sum_col += bright_field[ni, nj] * weight
+                            weight_sum += weight
+                if weight_sum > 0.0:
+                    blur_field[i, j] = sum_col / weight_sum
+                else:
+                    blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+
+            for i, j in image_field:
+                image_field[i, j] = ti.math.clamp(
+                    image_field[i, j] + blur_field[i, j] * intensity, 0.0, 1.0)
+
+        self._bloom_kernel = bloom_kernel
+
+        @ti.kernel
+        def lens_flare_kernel(image_field: ti.template(),
+                              disk_center_x: ti.f32, disk_center_y: ti.f32,
+                              screen_center_x: ti.f32, screen_center_y: ti.f32,
+                              intensity: ti.f32):
+            w = ti.cast(image_field.shape[0], ti.i32)
+            h = ti.cast(image_field.shape[1], ti.i32)
+
+            for i, j in image_field:
+                dx = ti.cast(i, ti.f32) - disk_center_x
+                dy = ti.cast(j, ti.f32) - disk_center_y
+                dist = ti.sqrt(dx * dx + dy * dy)
+
+                flare = ti.Vector([0.0, 0.0, 0.0])
+
+                for g in range(6):
+                    t = ti.cast(g + 1, ti.f32) * 0.10
+                    ghost_x = disk_center_x + (screen_center_x - disk_center_x) * t
+                    ghost_y = disk_center_y + (screen_center_y - disk_center_y) * t
+                    gdx = ti.cast(i, ti.f32) - ghost_x
+                    gdy = ti.cast(j, ti.f32) - ghost_y
+                    gdist = ti.sqrt(gdx * gdx + gdy * gdy)
+                    gsize = ti.cast(20 + g * 15, ti.f32)
+                    if gdist < gsize:
+                        galpha = (1.0 - gdist / gsize) * (1.0 - ti.cast(g, ti.f32) * 0.12) * 0.4
+                        ghost_col = ti.Vector([1.0, 0.9, 0.7]) * galpha
+                        flare += ghost_col
+
+                ring_t = 0.3
+                ring_x = disk_center_x + (screen_center_x - disk_center_x) * ring_t
+                ring_y = disk_center_y + (screen_center_y - disk_center_y) * ring_t
+                rdx = ti.cast(i, ti.f32) - ring_x
+                rdy = ti.cast(j, ti.f32) - ring_y
+                rdist = ti.sqrt(rdx * rdx + rdy * rdy)
+                ring_r = 80.0
+                ring_w = 8.0
+                ring_alpha = 0.0
+                if ti.abs(rdist - ring_r) < ring_w:
+                    ring_alpha = (1.0 - ti.abs(rdist - ring_r) / ring_w) * 0.15
+                if ring_alpha > 0:
+                    flare += ti.Vector([0.6, 0.7, 1.0]) * ring_alpha
+
+                image_field[i, j] = ti.math.clamp(image_field[i, j] + flare * intensity, 0.0, 1.0)
+
+        self._lens_flare_kernel = lens_flare_kernel
 
     def render(self, cam_pos, fov, frame=0):
         """
@@ -980,6 +1050,8 @@ class TaichiRenderer:
             self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
             self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset
         )
+
+        # self._bloom_kernel(self.image_field, self.bright_field, self.blur_field, 0.5, 0.6)
 
         img = self.image_field.to_numpy()
         return np.clip(img, 0, 1).transpose(1, 0, 2)
