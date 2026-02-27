@@ -840,10 +840,8 @@ class TaichiRenderer:
             pw = pixel_width_field[None]
             ph = pixel_height_field[None]
 
-            # 吸积盘倾斜旋转矩阵（绕 x 轴）
+            # 吸积盘倾斜角度（弧度）
             tilt_rad = disk_tilt * ti.math.pi / 180.0
-            cos_t = ti.cos(tilt_rad)
-            sin_t = ti.sin(tilt_rad)
 
             center = cp + cf * 1.0
             tl = center - cr * (pw * width / 2) + cu * (ph * height / 2)
@@ -872,6 +870,7 @@ class TaichiRenderer:
                 while step_count < max_iter:
                     old_pos = pos
                     old_z = pos[2]
+                    old_y = pos[1]
                     r_cur = pos.norm()
                     h = h_base * ti.min(r_cur / r_cap, max_fac)
 
@@ -898,25 +897,27 @@ class TaichiRenderer:
                         break
 
                     new_z = new_pos[2]
+                    new_y = new_pos[1]
 
-                    # 吸积盘检测：穿过 z=0 平面
-                    if old_z * new_z < 0:
-                        t_frac = -old_z / (new_z - old_z + 1e-8)
+                    # 吸积盘检测：穿过倾斜平面 z = y * tan(tilt)
+                    # 平面方程: z - y * tan_t = 0
+                    tan_t = ti.tan(tilt_rad)
+                    f_old = old_z - old_y * tan_t
+                    f_new = new_z - new_y * tan_t
+                    f_new = new_z - new_y * tan_t
+                    if f_old * f_new < 0:
+                        t_frac = f_old / (f_old - f_new + 1e-8)
                         hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
                         hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
-                        hit_z = old_pos[2] + t_frac * (new_pos[2] - old_pos[2])
-                        # 反向旋转：盘面倾斜导致 z 坐标变化，需要补偿
-                        # 绕 x 轴旋转回去
-                        tilted_y = hit_y * cos_t - hit_z * sin_t
-                        tilted_r = ti.sqrt(hit_x ** 2 + tilted_y ** 2)
-                        if r_outer >= tilted_r >= r_inner:
-                            disk_rgba = sample_disk(hit_x, tilted_y, r_inner, r_outer, t_offset)
+                        hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
+                        if r_outer >= hit_r >= r_inner:
+                            disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
-                            disk_alpha = disk_rgba[3]  # 边缘透明度
+                            disk_alpha = disk_rgba[3]
 
-                            # 多普勒效应：亮度 + 颜色偏移
-                            v_orb = ti.sqrt(0.5 / tilted_r)
-                            phi = ti.atan2(tilted_y, hit_x)
+                            # 多普勒效应
+                            v_orb = ti.sqrt(0.5 / hit_r)
+                            phi = ti.atan2(hit_y, hit_x)
                             vdx = -v_orb * ti.sin(phi)
                             vdy = v_orb * ti.cos(phi)
                             ray_d = dir_.normalized()
