@@ -31,22 +31,22 @@ EPS = 1e-6
 
 # —— g 因子着色相关 —— 影响吸积盘自身的亮度/颜色，背景天空不受这些参数影响。
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
-G_FACTOR_CAP = 3
+G_FACTOR_CAP = 6
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
-G_LUMINOSITY_POWER = 3
+G_LUMINOSITY_POWER = 6
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
 G_BRIGHTNESS_GAIN = 0.6
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
-DISK_ALPHA_GAIN = 1.2
+DISK_ALPHA_GAIN = 1.5
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
 DISK_BASE_TINT = (1.1, 0.92, 0.75)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3，此处默认 12 便于放大对比）
 DISK_RADIAL_BRIGHTNESS_POWER = 3
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.2
-DISK_RADIAL_BRIGHTNESS_MAX = 6.0
+DISK_RADIAL_BRIGHTNESS_MAX = 16.0
 
 # ============================================================================
 # 公共模块：相机
@@ -371,29 +371,39 @@ def sample_disk_texture(texture, x, y, r_inner, r_outer):
 
 
 def _tileable_noise(shape, rng, freq_u=6, freq_v=6):
-    """生成在 u/v 方向上都周期的噪声，避免 seam。"""
+    """用多条弧线生成云雾效果，保证 phi 方向无缝。"""
     h, w = shape
-    u = np.linspace(0, 2 * np.pi, w, endpoint=False)
-    v = np.linspace(0, 2 * np.pi, h, endpoint=False)
-    uu, vv = np.meshgrid(u, v)
 
-    noise = np.zeros((h, w), dtype=np.float32)
-    for ku in range(1, freq_u + 1):
-        for kv in range(freq_v + 1):
-            phase = rng.uniform(0, 2 * np.pi)
-            amp = rng.normal(0, 1) / (ku + kv + 1)
-            noise += amp * np.cos(ku * uu + kv * vv + phase)
+    cloud = np.zeros((h, w), dtype=np.float32)
+    n_arcs = rng.integers(30, 60)
 
-    noise -= noise.min()
-    noise /= (noise.max() + 1e-6)
-    return noise
+    for _ in range(n_arcs):
+        arc_phi = rng.uniform(0, 2 * np.pi)
+        arc_r = np.sqrt(rng.uniform(0.0, 1.0))
+        arc_phi_width = rng.uniform(0.15, 0.5)
+        arc_r_width = rng.uniform(0.03, 0.08)
+        arc_intensity = rng.uniform(0.03, 0.12)
+
+        kappa = 1.0 / (arc_phi_width ** 2) * 0.6
+
+        phi = np.linspace(0, 2 * np.pi, w, endpoint=False)
+        r_norm = np.linspace(0, 1, h)
+        phi_grid, r_grid = np.meshgrid(phi, r_norm)
+
+        r_diff = r_grid - arc_r
+        arc_val = np.exp(kappa * (np.cos(phi_grid - arc_phi) - 1))
+        arc_val *= np.exp(-0.5 * (r_diff / arc_r_width) ** 2)
+        arc_val *= arc_intensity
+
+        cloud += arc_val
+
+    cloud = np.clip(cloud, 0, 1)
+    return cloud
 
 
 def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=False):
     """分形布朗运动噪声（多层叠加）。wrap_u=True 时用 tileable 噪声替代。"""
     if wrap_u:
-        # 使用 tileable noise 保证 u 方向周期
-        # 叠加多频率
         result = np.zeros(shape, dtype=np.float32)
         for i in range(octaves):
             freq = int(base_scale * (2 ** i))
@@ -417,6 +427,7 @@ def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=Fals
     return result / total_amp
 
 
+
 def _blend_azimuthal_seam(tex, seam_width=64):
     """
     将纹理在 u=0/u=2π 方向做平滑过渡，避免拼接时出现明显缝隙。
@@ -435,88 +446,151 @@ def _blend_azimuthal_seam(tex, seam_width=64):
     return tex_blended
 
 
-def generate_disk_texture(tex_w=1024, tex_h=512, seed=42):
+def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5):
     """
-    程序化生成吸积盘纹理：
-    - 多尺度湍流（coarse/fine）塑造云雾层次
-    - 螺旋臂 + 剪切（shear）模拟 Kepler 流造成的拉丝
-    - 温度/密度剖面分离：温度决定基色，密度决定 alpha 与局部亮度
-    返回 (tex_h, tex_w, 4) float32，第 4 通道为 alpha（面密度）
+    直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
+    - n_phi: 角度方向分辨率（对应 0-2π）
+    - n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
+    返回 (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
     """
     rng = np.random.default_rng(seed)
 
-    u = np.linspace(0, 1, tex_w, endpoint=False)  # 角度方向
-    v = np.linspace(0, 1, tex_h)                   # 径向方向（0=inner, 1=outer）
-    uu, vv = np.meshgrid(u, v)
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+    r_norm = np.linspace(0, 1, n_r)
+    phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
 
-    # ----- 温度剖面（来自 Novikov-Thorne power law）并允许噪声扰动 -----
-    r_inner = 2.0
-    r_outer = 3.5
-    r_vals = r_inner + (r_outer - r_inner) * vv[:, 0]
+    r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
+
+    # ----- 温度剖面（Novikov-Thorne power law）-----
     T = (1 - np.sqrt(r_inner / np.maximum(r_vals, r_inner + 1e-3))) ** 0.25
     T /= np.max(T)
-    temp_coarse = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.6, base_scale=6, wrap_u=True)
-    temp_fine = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.45, base_scale=3, wrap_u=True)
+
+    temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
+    temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
     temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
-    temperature_field = np.clip(T[:, None] * (0.8 + 0.3 * temp_noise), 0, 1)
+    temperature_field = np.clip(T * (0.8 + 0.3 * temp_noise), 0, 1)
 
     # ----- 密度场 -----
-    # 1) 大尺度螺旋臂
-    n_arms = rng.integers(2, 5)
-    spiral = np.zeros((tex_h, tex_w), dtype=np.float32)
-    tightness = rng.uniform(1.5, 2.8)
-    shear = vv ** 1.35 * rng.uniform(3.0, 5.0)
-    base_angle = (uu + shear) * 2 * np.pi
-    for arm in range(n_arms):
-        phase = arm * 2 * np.pi / n_arms + rng.uniform(0, np.pi)
-        width = rng.uniform(0.18, 0.32)
-        angle = base_angle + vv * tightness * 2 * np.pi + phase
-        arm_val = np.exp(-0.5 * ((np.sin(angle) / width) ** 2))
+    # 1) 大尺度螺旋臂（8-15条，2-3条从中心开始，其余从随机位置开始，每条2-5圈）
+    n_arms = rng.integers(8, 16)
+    n_from_center = rng.integers(2, 4)
+    spiral = np.zeros((n_r, n_phi), dtype=np.float32)
+
+    # 生成一条噪声用于调制悬臂宽度和强度
+    arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
+
+    used_angles = []
+    for arm_idx in range(n_arms):
+        if arm_idx < n_from_center:
+            r_start = 0.0
+            base_angle = arm_idx * 2 * np.pi / n_from_center
+        else:
+            r_start = rng.uniform(0.05, 0.5)
+            base_angle = rng.uniform(0, 2 * np.pi)
+
+        for existing in used_angles:
+            if abs(base_angle - existing) < 0.4:
+                base_angle = (base_angle + 0.5) % (2 * np.pi)
+        used_angles.append(base_angle)
+
+        rotations = rng.uniform(2.0, 5.0)
+        base_width = rng.uniform(0.1, 0.2)
+        intensity = rng.uniform(0.6, 1.0)
+
+        r_length = rotations / 6.0 * (1.0 - r_start)
+        r_length = min(r_length, 1.0 - r_start)
+        r_end = r_start + r_length
+
+        arm_angle = phi_grid - base_angle - r_norm_grid * rotations * 2 * np.pi
+
+        # 宽度随噪声变化
+        width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
+        width_mod = np.clip(width_mod, 0.3, 2.0)
+
+        arm_kappa = 1.0 / (base_width ** 2) * 1.5
+        arm_val = np.exp(arm_kappa * (np.cos(arm_angle) - 1) / width_mod)
+
+        mask = (r_norm_grid >= r_start) & (r_norm_grid <= r_end)
+        arm_val = np.where(mask, arm_val, 0)
+
+        # 强度随噪声变化（断断续续）
+        intensity_mod = 0.3 + 0.7 * (arm_noise ** 0.5)
+
+        fade_in = np.clip((r_norm_grid - r_start) / 0.08, 0, 1)
+        fade_out = np.clip((r_end - r_norm_grid) / 0.08, 0, 1)
+        arm_val *= fade_in * fade_out * intensity * intensity_mod
+
         spiral += arm_val
-    spiral = np.clip(spiral / np.max(spiral + 1e-6), 0, 1)
 
-    # 2) 多尺度湍流
-    coarse = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.55, base_scale=5, wrap_u=True)
-    fine = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.5, base_scale=2, wrap_u=True)
-    turbulence = np.clip(0.55 * coarse + 0.45 * fine, 0, 1)
+    spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
 
-    # 3) 径向细丝（利用噪声调制 sin 波）
-    filament_freq = rng.uniform(40, 60)
-    filament = 0.5 + 0.5 * np.sin(vv * filament_freq + coarse * 6.0 + rng.uniform(0, np.pi))
+    # 2) 高频云雾（不用 FBM，直接高频）
+    turbulence = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
 
-    # 4) 方位热点（强化自转可视化）
-    az_freq = rng.uniform(3.0, 6.0)
-    az_wave = 0.5 + 0.5 * np.sin((uu + shear) * az_freq * 2 * np.pi + rng.uniform(0, 2 * np.pi))
-    az_noise = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.6, base_scale=3, wrap_u=True)
-    az_hotspot = np.clip(0.65 * az_wave + 0.35 * az_noise, 0, 1) ** 1.4
+    # 3) 角方向弧形结构（破碎结构）- 沿 phi 方向的弧
+    arc_count = rng.integers(10, 25)
+    arcs = np.zeros((n_r, n_phi), dtype=np.float32)
+    for _ in range(arc_count):
+        arc_phi_start = rng.uniform(0, 2 * np.pi)
+        arc_phi_length = rng.uniform(0.15, 0.4)
+        arc_r = rng.uniform(0.1, 0.9)
+        arc_r_width = rng.uniform(0.015, 0.04)
+        arc_intensity = rng.uniform(0.4, 1.0)
+
+        arc_kappa = 1.0 / (arc_phi_length ** 2) * 1.5
+
+        r_diff = r_norm_grid - arc_r
+
+        arc_val = np.exp(arc_kappa * (np.cos(phi_grid - arc_phi_start) - 1))
+        arc_val *= np.exp(-0.5 * (r_diff / arc_r_width) ** 2)
+        arc_val *= arc_intensity
+
+        arcs += arc_val
+    arcs = np.clip(arcs, 0, 1)
+
+    # 4) 多个温度热点（弧形，高斯径向）
+    hotspot_count = rng.integers(15, 35)
+    hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
+    for _ in range(hotspot_count):
+        h_phi = rng.uniform(0, 2 * np.pi)
+        h_r = rng.uniform(0.1, 0.9)
+        h_phi_width = rng.uniform(0.08, 0.2)
+        h_r_width = rng.uniform(0.01, 0.03)
+        h_intensity = rng.uniform(0.4, 1.0)
+
+        h_kappa = 1.0 / (h_phi_width ** 2) * 1.5
+
+        r_diff = r_norm_grid - h_r
+        h_val = np.exp(h_kappa * (np.cos(phi_grid - h_phi) - 1)) * np.exp(-0.5 * (r_diff / h_r_width) ** 2)
+        hotspot += h_intensity * h_val
+    hotspot = np.clip(hotspot, 0, 1)
+
+    # 5) 方位热点（低频正弦 + 噪声，自转流动感）
+    az_freq = rng.integers(2, 5)
+    shear = r_norm_grid ** 1.2 * rng.uniform(2.0, 4.0)
+    az_wave = 0.5 + 0.5 * np.sin((phi_grid + shear) * az_freq)
+    az_noise = _fbm_noise((n_r, n_phi), rng, octaves=3, persistence=0.5, base_scale=3, wrap_u=True)
+    az_hotspot = np.clip(0.6 * az_wave + 0.4 * az_noise, 0, 1) ** 1.2
 
     # 组合密度
-    radial_density = np.ones((tex_h, tex_w), dtype=np.float32)
-    density = radial_density * (0.45 + 0.2 * spiral + 0.25 * turbulence + 0.15 * filament)
+    density = 0.1 + 0.3 * spiral + 0.3 * turbulence + 0.2 * hotspot + 0.1 * arcs
 
-    # 局部冷/热区造成的密度波动（模拟温度/密度分离）
-    hotspot = np.clip(temp_noise ** 1.5, 0, 1)
-    density *= (0.8 + 0.25 * hotspot + 0.35 * az_hotspot)
-
-    # 内圈高光抑制：靠近 r_inner 时再乘一次渐变，避免俯视图过曝
-    density *= (0.6 + 0.2 * hotspot + 0.3 * az_hotspot)
-
-    # 边缘软化（沿径向），保留 alpha 的内外渐变
-    edge = compute_edge_alpha(tex_h)
+    # 边缘软化（沿径向）
+    edge = compute_edge_alpha(n_r)
     density *= edge[:, None]
 
     # 归一化
     density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
 
-    # ----- 颜色（温度 -> 颜色映射），加入噪声差异 -----
+    # ----- 颜色（温度 -> 颜色映射）-----
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
     hot_bias = np.clip(temp_aniso, 0, 1)
     r_ch = np.clip(hot_bias ** 0.38 * (0.95 + 0.25 * hotspot), 0, 1)
     g_ch = np.clip(hot_bias ** 0.55 * (0.7 + 0.15 * turbulence), 0, 1)
     b_ch = np.clip(hot_bias ** 0.85 * (0.38 + 0.18 * (1 - hotspot)), 0, 1)
 
-    brightness_scale = 0.45
-    tex = np.zeros((tex_h, tex_w, 4), dtype=np.float32)
+    brightness_scale = 0.25
+    tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
     tex[:, :, 0] = np.clip(r_ch * density * 6.0 * brightness_scale, 0, 1)
     tex[:, :, 1] = np.clip(g_ch * density * 6.0 * brightness_scale, 0, 1)
     tex[:, :, 2] = np.clip(b_ch * density * 6.0 * brightness_scale, 0, 1)
