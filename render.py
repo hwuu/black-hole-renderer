@@ -501,7 +501,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         r_length = min(r_length, 1.0 - r_start)
         r_end = r_start + r_length
 
-        arm_angle = phi_grid - base_angle - r_norm_grid * rotations * 2 * np.pi
+        arm_angle = phi_grid - base_angle + r_norm_grid * rotations * 2 * np.pi
 
         # 宽度随噪声变化
         width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
