@@ -951,7 +951,8 @@ class TaichiRenderer:
 
         @ti.kernel
         def bloom_kernel(image_field: ti.template(), bright_field: ti.template(),
-                         blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32):
+                         blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32,
+                         kernel_radius: ti.i32, sigma_scale: ti.f32):
             w = ti.cast(image_field.shape[0], ti.i32)
             h = ti.cast(image_field.shape[1], ti.i32)
 
@@ -963,7 +964,7 @@ class TaichiRenderer:
                 else:
                     bright_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
 
-            # 水平方向模糊
+            # 水平方向模糊（sigma 按 sigma_scale 缩放）
             for i, j in blur_field:
                 sum_r = 0.0
                 sum_g = 0.0
@@ -972,15 +973,16 @@ class TaichiRenderer:
                 weight_g = 0.0
                 weight_b = 0.0
                 
-                for dx in range(-28, 29):
+                dx = -kernel_radius
+                while dx <= kernel_radius:
                     ni = i + dx
                     if 0 <= ni < w:
                         dist_sq = ti.cast(dx * dx, ti.f32)
                         col = bright_field[ni, j]
                         
-                        w_r = ti.exp(-dist_sq / 25.0)
-                        w_g = ti.exp(-dist_sq / 80.0)
-                        w_b = ti.exp(-dist_sq / 200.0)
+                        w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
+                        w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
                         
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
@@ -988,6 +990,7 @@ class TaichiRenderer:
                         weight_r += w_r
                         weight_g += w_g
                         weight_b += w_b
+                    dx += 1
                 
                 if weight_r > 0.0:
                     blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
@@ -998,7 +1001,7 @@ class TaichiRenderer:
             for i, j in bright_field:
                 bright_field[i, j] = blur_field[i, j]
             
-            # 垂直方向模糊
+            # 垂直方向模糊（sigma 按 sigma_scale 缩放）
             for i, j in blur_field:
                 sum_r = 0.0
                 sum_g = 0.0
@@ -1007,15 +1010,16 @@ class TaichiRenderer:
                 weight_g = 0.0
                 weight_b = 0.0
                 
-                for dy in range(-28, 29):
+                dy = -kernel_radius
+                while dy <= kernel_radius:
                     nj = j + dy
                     if 0 <= nj < h:
                         dist_sq = ti.cast(dy * dy, ti.f32)
                         col = bright_field[i, nj]
                         
-                        w_r = ti.exp(-dist_sq / 25.0)
-                        w_g = ti.exp(-dist_sq / 80.0)
-                        w_b = ti.exp(-dist_sq / 200.0)
+                        w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
+                        w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
                         
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
@@ -1023,6 +1027,7 @@ class TaichiRenderer:
                         weight_r += w_r
                         weight_g += w_g
                         weight_b += w_b
+                    dy += 1
                 
                 if weight_r > 0.0:
                     blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
@@ -1120,8 +1125,10 @@ class TaichiRenderer:
             disk_tilt
         )
 
-        # 对吸积盘层做 bloom
-        self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4)
+        # 对吸积盘层做 bloom（卷积范围和 sigma 按分辨率比例缩放）
+        kernel_radius = int(self.width * 0.02)
+        sigma_scale = (self.width / 640.0) ** 2
+        self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4, kernel_radius, sigma_scale)
 
         # 合并：背景 + 吸积盘 + bloom
         img = self.image_field.to_numpy()
