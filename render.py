@@ -958,19 +958,38 @@ class TaichiRenderer:
                     bright_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
 
             for i, j in blur_field:
-                sum_col = ti.Vector([0.0, 0.0, 0.0])
-                weight_sum = 0.0
-                for dy in range(-12, 13):
-                    for dx in range(-12, 13):
+                sum_r = 0.0
+                sum_g = 0.0
+                sum_b = 0.0
+                weight_r = 0.0
+                weight_g = 0.0
+                weight_b = 0.0
+                
+                for dy in range(-28, 29):
+                    for dx in range(-28, 29):
                         ni = i + dy
                         nj = j + dx
                         if 0 <= ni < w and 0 <= nj < h:
                             dist_sq = ti.cast(dx * dx + dy * dy, ti.f32)
-                            weight = ti.exp(-dist_sq / 64.0)
-                            sum_col += bright_field[ni, nj] * weight
-                            weight_sum += weight
-                if weight_sum > 0.0:
-                    blur_field[i, j] = sum_col / weight_sum
+                            col = bright_field[ni, nj]
+                            
+                            # 红色：小模糊半径
+                            w_r = ti.exp(-dist_sq / 25.0)
+                            sum_r += col[0] * w_r
+                            weight_r += w_r
+                            
+                            # 绿色：中等模糊半径
+                            w_g = ti.exp(-dist_sq / 80.0)
+                            sum_g += col[1] * w_g
+                            weight_g += w_g
+                            
+                            # 蓝色：大模糊半径，明显色散
+                            w_b = ti.exp(-dist_sq / 200.0)
+                            sum_b += col[2] * w_b
+                            weight_b += w_b
+                
+                if weight_r > 0.0 and weight_g > 0.0 and weight_b > 0.0:
+                    blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
                 else:
                     blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
 
