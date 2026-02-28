@@ -65,7 +65,6 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--disk_tilt` | 吸积盘倾角（度） | 0 |
 | `--step_size`, `-s` | 积分步长 | 0.1 |
 | `--output`, `-o` | 输出文件路径 | output/blackhole.png |
-| `--framework`, `-f` | 渲染框架: numpy/taichi | taichi |
 | `--device`, `-d` | Taichi 设备: cpu/gpu | cpu |
 
 ### 视频参数

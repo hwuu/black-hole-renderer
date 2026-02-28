@@ -50,7 +50,7 @@
 ### 1.3 非目标
 
 - **不做 Kerr 度规**：仅支持无自旋黑洞（史瓦西解）
-- **双重框架**：支持 NumPy（compact 算法）和 Taichi（while_loop 算法）
+- **单一框架**：只维护 Taichi 并行实现，不再保留 NumPy 备选
 - **不做实时渲染**：非 GPU 加速（Taichi 可选 GPU），不追求交互帧率
 
 ---
@@ -83,6 +83,14 @@ d²x/dλ² = -1.5 · L² · x / r⁵
 
 这个等效形式来自 Schwarzschild 有效势 `V_eff = L²/(2r²) - L²/(2r³)` 对 r 求导后的广义相对论修正项。牛顿引力的 `-1/r²` 项被角动量守恒吸收，剩下的 `-1.5L²/r⁵` 是纯 GR 效应，正是它导致了光线弯曲和黑洞阴影。
 
+将上述笛卡尔方程沿径向投影，并记 `L² = |x × v|² = r⁴ φ̇²`，可得到熟悉的 Schwarzschild 零测地线径向方程：
+
+```
+r̈ = (L² / r³) - (1.5 L² / r⁴)
+```
+
+因此“缺失”的牛顿 `L²/r³` 项会在投影后自动回到径向方程里，等价于传统的 `-1/r² + L²/r³ - 1.5L²/r⁴` 分解；我们在数值测试中也验证了本公式能重现弱场偏折角与 photon ring 位置。
+
 ### 2.3 守恒量
 
 角动量平方 `L² = |v × x|²` 在整个积分过程中守恒，只需在初始化时计算一次。这是因为 Schwarzschild 时空具有球对称性，角动量是运动积分。
@@ -93,18 +101,8 @@ d²x/dλ² = -1.5 · L² · x / r⁵
 
 ### 3.1 整体流程
 
-两种渲染框架：
+渲染流程（Taichi 框架）：
 
-**NumPy 框架（compact 算法）**：
-```
-+----------+  +----------+  +----------+  +----------+
-| Camera   |->| Skybox   |->| RK4      |->| Classify |->| Shade   |
-| Generate |  | Load/Gen |  | Compact  |  | Rays     |  | Escape  |
-| Rays     |  |          |  | Batch    |  |          |  | Capture |
-+----------+  +----------+  +----------+  +----------+
-```
-
-**Taichi 框架（while_loop 算法）**：
 ```
 +----------+  +----------+  +-------------------------+
 | Camera   |->| Skybox   |->| Taichi Kernel           |
@@ -153,10 +151,7 @@ L²        = |velocity × position|²        # conserved angular momentum square
 
 **两种算法**：
 
-| 算法 | 框架 | 描述 |
-|------|------|------|
-| **compact** | NumPy | 向量化批量处理，每步移除终止光线 |
-| **while_loop** | Taichi | 每条光线独立 while 循环，并行执行 |
+所有光线在 Taichi kernel 的 while_loop 中独立积分，可运行于 CPU/GPU。
 
 **加速度计算**：
 
@@ -172,9 +167,9 @@ acceleration = -1.5 * L² * pos / r⁵
 |------|------|------|
 | r < rs | 事件视界 | captured（黑色） |
 | r > max(r_max, 2×distance) | 逃逸半径 | escaped（采样天空） |
-| step > r_escape×20/dt | 超时 | 视为 escaped |
+| λ_accum > r_escape × 40 | 超时 | 视为 escaped（λ 为累计仿射参数） |
 
-默认 `r_max = 10`，`dt = 0.5`（可通过参数调整）
+默认 `r_max = 10`，`dt = 0.1`（可通过参数调整）
 
 ### 3.5 天空盒采样
 
@@ -203,12 +198,9 @@ acceleration = -1.5 * L² * pos / r⁵
 
 | 框架 | 算法 | 适用场景 | 性能 |
 |------|------|----------|------|
-| NumPy | compact | CPU 开发调试 | 慢 (~10s for 640×360) |
-| Taichi | while_loop | 正式渲染 | 快 (~0.1s for 640×360) |
+| Taichi | while_loop | CPU/GPU 渲染 | 1080p 单帧 ~2s（CPU），GPU 更快 |
 
-**NumPy compact 策略**：向量化批量处理，每步检测并移除终止光线。
-
-**Taichi while_loop**：每条光线独立 while 循环，Taichi 自动并行化（CPU/GPU）。
+Taichi kernel 中每条光线使用 while_loop 独立积分，支持 CPU/GPU 并行；不再保留 NumPy 版本，调试模式可通过 `--device cpu` 和低分辨率实现。
 
 ### 4.2 为什么选择笛卡尔方案
 
@@ -253,7 +245,6 @@ black-hole-renderer/
 | `--ar1` | 吸积盘内半径 | 2.0 rs |
 | `--ar2` | 吸积盘外半径 | 3.5 rs |
 | `--output`, `-o` | 输出文件路径 | output/blackhole.png |
-| `--framework`, `-f` | 渲染框架: numpy/taichi | **taichi** |
 | `--device`, `-d` | Taichi 设备: cpu/gpu | cpu |
 
 **视频模式**（添加 `--video` 开启）：
@@ -285,7 +276,7 @@ black-hole-renderer/
 | 状态维度 | 2 (r, φ) | 6 (x, y, z, vx, vy, vz) |
 | 坐标变换 | 需要 3D↔2D 旋转矩阵 | 不需要 |
 | 吸积盘 | 支持（温度模型 + 黑体辐射） | 不支持 |
-| 并行框架 | 纯 NumPy | NumPy + Taichi (CPU/GPU) |
+| 并行框架 | 纯 NumPy | Taichi (CPU/GPU) |
 
 ### 5.2 starless 的优势
 
@@ -306,15 +297,15 @@ black-hole-renderer/
 
 ### 6.1 自适应步长 ✅
 
-基于径向距离的启发式步长调整：
+基于径向距离 + 曲率抑制的启发式步长调整：
 
 ```
-dt = dt_base · min(r / rs, 10)
+dt = dt_base · clamp( √(r/rs) / (1 + 2 (rs / r)³), 0.2, 8 )
 ```
 
-- 远场 (r >> rs)：步长放大至 10×，加速逃逸
-- 近场 (r ~ rs)：步长缩小，提高精度
-- 实测：固定步长 272 步 → 自适应 101 步，渲染时间减少 ~60%
+- 远场 (r >> rs)：`√(r/rs)` 主导，步长最多放大到 8×，大幅减少逃逸射线的步数
+- 近场 (r ≳ rs)：`(rs/r)³` 抑制因子让步长自动缩到 ~0.3×，保护 photon ring / ghost image 的积分精度
+- 终止条件改为累计仿射参数 `λ_accum > r_escape × 40`，不再依赖瞬时步长，避免远场大步长误判超时
 
 ### 6.2 吸积盘渲染 ✅
 
@@ -324,6 +315,7 @@ dt = dt_base · min(r / rs, 10)
 - 纹理贴图：柱面 UV 映射（`u = φ/2π`, `v = (r-r1)/(r2-r1)`），支持外部纹理或程序生成
 - 光线穿透：命中吸积盘后光线继续传播，多次命中累加颜色（ghost images）
 - 加法混合：`final = clamp(background + Σ disk_hits, 0, 1)`
+- 透明度：体积积分和直接命中时的 alpha 都会乘以 `disk_alpha_gain = 1.5`，整体更不透明
 
 ```
 每步积分后:
@@ -332,8 +324,8 @@ dt = dt_base · min(r / rs, 10)
     hit_xy = pos_old + t * (pos_new - pos_old)  # 交点
     r_hit = |hit_xy|
     if r_inner <= r_hit <= r_outer:
-      color = sample_disk_texture(hit_x, hit_y)  # 纹理采样
-      color *= doppler_boost(hit_xy, ray_dir)     # 多普勒 beaming
+      color = sample_disk_texture(hit_x, hit_y)   # 纹理采样
+      color = apply_g_factor(color, hit_xy, ray_dir, camera_pos)  # 多普勒+引力红移
       accumulated_color += color                   # 累加，光线继续
 ```
 
@@ -345,25 +337,46 @@ dt = dt_base · min(r / rs, 10)
 | r_outer | 3.5 rs | `--ar2` | 吸积盘外半径 |
 | disk_texture | 程序生成 | `--disk_texture` | 吸积盘纹理路径 |
 
-### 6.3 多普勒 Beaming ✅
+**程序纹理细节**：
+- 多尺度噪声：coarse/fine FBM 混合，用剪切项 `shear ∝ r^1.35` 将噪声沿轨道方向拉伸，模拟 Kepler 剪切导致的条纹。
+- 螺旋臂 + 细丝：2~4 条大尺度螺旋形成主亮臂，叠加半随机的径向细丝和温度热点，营造破碎结构。
+- 方位热点：低频正弦 + 噪声混合的 azimuthal hotspot，使盘面在 φ 方向出现局部亮斑，随自转产生明显的流动感。
+- 温度/密度分离：温度按 Novikov-Thorne power law（`T ∝ (1 - √(r_in/r))^0.25`）计算，并用噪声扰动；密度独立归一化后写入 alpha 通道，渲染时再乘 g 因子，避免“纯色贴图”带来的死板观感。
+- 边缘软化：同一 `compute_edge_alpha()`，外内圈自然过渡。
 
-吸积盘物质沿开普勒轨道旋转，产生相对论多普勒效应：
+### 6.3 多普勒 & 引力红移（g 因子） ✅
 
-```
-v_orbital = sqrt(M/r) = sqrt(1/(2r))        # 开普勒速度
-v_disk = v_orbital · (-sin φ, cos φ, 0)     # 逆时针轨道方向
-doppler = 1 / (1 - v_disk · ray_dir)        # 多普勒因子
-brightness *= clamp(doppler^1.0, 0, 1.5) * 0.6  # 亮度调制
-```
-
-**颜色偏移**（蓝移偏蓝、红移偏红）：
+参考 [rantonels/starless](https://github.com/rantonels/starless)（[Redshift 文档](https://rantonels.github.io/starless/)）的推导，我们用统一的 g 因子来同时处理 relativistic beaming 与 gravitational redshift：
 
 ```
-shift = doppler - 1.0
-r = color.r * (1 - shift * 0.6)      # 蓝移时红减少
-g = color.g * (1 - |shift| * 0.3)    # 中间色影响较小
-b = color.b * (1 + shift * 0.4)      # 蓝移时蓝增加
+g = (k · u_obs) / (k · u_em) = g_grav · g_doppler
 ```
+
+实现细节：
+
+1. **盘元四速度**：吸积盘在赤道面做 Kepler 轨道，角速度 `Ω = sqrt(M / r³)`（rs=1 ⇒ M=1/2）。
+   ```
+   β = r · Ω / sqrt(1 - rs/r)
+   γ = 1 / sqrt(1 - β²)
+   v_disk = β · (-sin φ, cos φ, 0)
+   ```
+2. **Doppler 因子**：令 `cosθ = dot(normalize(v_disk), -normalize(ray_dir))`，并将 `1 - β·cosθ` 钳制到 `[1e-3, +∞)`，则
+   ```
+   g_doppler = 1 / (γ · (1 - β · cosθ))
+   ```
+3. **引力红移**：静止观察者位于 `r_obs`（通常是相机到原点的距离），发射点 `r_em = |hit_xy|`，有
+   ```
+   g_grav = sqrt(1 - rs / r_obs) / sqrt(1 - rs / r_em)
+   ```
+   若观察者在无穷远，可令分子≈1。
+4. **着色**：
+   ```
+  color = apply_wavelength_shift(texture_color, g)
+  brightness *= gain · g^p / (1 + g^p / g_max)  # p≈2, gain≈0.35, g_max≈3，Reinhard 风格
+   ```
+   纹理仍在累加管线中（ghost images），Bloom 只作用于吸积盘层。
+
+代码注释与本文均说明：g 因子公式引用自 starless，用于保证多普勒/红移处理与主流实现一致。
 
 效果：朝观察者运动的一侧更亮且偏蓝，远离的一侧更暗且偏红。
 
@@ -372,11 +385,14 @@ b = color.b * (1 + shift * 0.4)      # 蓝移时蓝增加
 吸积盘边缘（内外圈）渐变透明，避免硬边界：
 
 ```python
-def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.1):
+def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
+    v = np.linspace(0, 1, height)
+    alpha = np.ones_like(v)
     # 内圈：vv < inner_soft -> 逐渐透明
     alpha[inner_mask] = (v[inner_mask] / inner_soft) ** 3.0
     # 外圈：vv > (1 - outer_soft) -> 逐渐透明
-    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 5.0
+    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 2.0
+    return alpha
 ```
 
 - 程序生成纹理和外部纹理统一使用此逻辑
@@ -446,8 +462,11 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.1):
 
 ---
 
-## 变更记录
-
+- v5.9 (2026-02-28): 吸积盘纹理加入方位热点（azimuthal hotspot）与更强螺旋剪切，对应 g 因子自转时亮斑更加明显
+- v5.8 (2026-02-28): 吸积盘程序纹理重写（多尺度湍流+螺旋剪切+温度/密度分离），盘面结构更破碎、热点更丰富
+- v5.7 (2026-02-28): 重写吸积盘半径亮度加权（亮度 ∝ (1 - (r-r_inner)/(r_outer-r_inner))^p），新增 `DISK_RADIAL_BRIGHTNESS_[MIN,MAX]` 钳制，方便拉开内亮外暗对比
+- v5.6 (2026-02-28): 调低吸积盘基础色温（DISK_BASE_TINT 采用暖色 1.1/0.92/0.75），默认视觉更接近日落/炽热尘埃的色调
+- v5.5 (2026-02-28): 移除 NumPy 渲染路径，改为纯 Taichi；新增 g 因子亮度 tone mapping、吸积盘透明度指数增益，CLI/文档同步更新
 - v5.4 (2026-02-28): 实现分离式 Bloom（只对吸积盘层泛光）、添加吸积盘倾角参数 --disk_tilt、简化 orbit 参数
 - v5.3 (2026-02-27): 多普勒颜色偏移（蓝移偏蓝、红移偏红）、边缘软化公共函数（compute_edge_alpha）、降低亮度避免过曝
 - v5.2 (2026-02-27): 吸积盘纹理大幅改进：FBM噪声絮状云雾、螺旋臂结构、径向丝状条纹、间隙效果、alpha合成（多次穿透衰减）、双线性插值、体积渲染（高斯密度剖面）

@@ -25,8 +25,28 @@ import hashlib
 # 公共常量
 # ============================================================================
 
-RS = 1.0  # 史瓦西半径 (几何单位制 G=c=1, 对应质量 M=1/2)
+# 核心常量（按需调参，可参考注释范围）
+RS = 1.0
+EPS = 1e-6
 
+# —— g 因子着色相关 —— 影响吸积盘自身的亮度/颜色，背景天空不受这些参数影响。
+# g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
+G_FACTOR_CAP = 3
+# g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
+G_LUMINOSITY_POWER = 3
+# 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
+G_BRIGHTNESS_GAIN = 0.6
+
+# —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
+# DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
+DISK_ALPHA_GAIN = 1.2
+# DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
+DISK_BASE_TINT = (1.1, 0.92, 0.75)
+# DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3，此处默认 12 便于放大对比）
+DISK_RADIAL_BRIGHTNESS_POWER = 3
+# 半径亮度增益的下限/上限，避免指数爆炸
+DISK_RADIAL_BRIGHTNESS_MIN = 0.2
+DISK_RADIAL_BRIGHTNESS_MAX = 6.0
 
 # ============================================================================
 # 公共模块：相机
@@ -287,14 +307,14 @@ R_DISK_INNER_DEFAULT = 2.0 * RS
 R_DISK_OUTER_DEFAULT = 3.5 * RS
 
 
-def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
+def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.3):
     """计算边缘软化的 alpha 通道"""
     v = np.linspace(0, 1, height).astype(np.float32)
     alpha = np.ones_like(v)
     inner_mask = v < inner_soft
     outer_mask = v > (1 - outer_soft)
     alpha[inner_mask] = (v[inner_mask] / inner_soft) ** 3.0
-    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 2.0
+    alpha[outer_mask] = ((1 - v[outer_mask]) / outer_soft) ** 2
     return alpha
 
 
@@ -350,8 +370,37 @@ def sample_disk_texture(texture, x, y, r_inner, r_outer):
             c11 * fu * fv)
 
 
-def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1):
-    """分形布朗运动噪声（多层叠加）"""
+def _tileable_noise(shape, rng, freq_u=6, freq_v=6):
+    """生成在 u/v 方向上都周期的噪声，避免 seam。"""
+    h, w = shape
+    u = np.linspace(0, 2 * np.pi, w, endpoint=False)
+    v = np.linspace(0, 2 * np.pi, h, endpoint=False)
+    uu, vv = np.meshgrid(u, v)
+
+    noise = np.zeros((h, w), dtype=np.float32)
+    for ku in range(1, freq_u + 1):
+        for kv in range(freq_v + 1):
+            phase = rng.uniform(0, 2 * np.pi)
+            amp = rng.normal(0, 1) / (ku + kv + 1)
+            noise += amp * np.cos(ku * uu + kv * vv + phase)
+
+    noise -= noise.min()
+    noise /= (noise.max() + 1e-6)
+    return noise
+
+
+def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=False):
+    """分形布朗运动噪声（多层叠加）。wrap_u=True 时用 tileable 噪声替代。"""
+    if wrap_u:
+        # 使用 tileable noise 保证 u 方向周期
+        # 叠加多频率
+        result = np.zeros(shape, dtype=np.float32)
+        for i in range(octaves):
+            freq = int(base_scale * (2 ** i))
+            tile_noise = _tileable_noise(shape, rng, freq_u=max(2, freq), freq_v=max(1, freq // 2))
+            result += tile_noise * (persistence ** i)
+        result /= np.max(result) + 1e-6
+        return result
     result = np.zeros(shape, dtype=np.float32)
     amplitude = 1.0
     total_amp = 0.0
@@ -360,18 +409,39 @@ def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1):
         sh = max(shape[0] // scale, 2)
         sw = max(shape[1] // scale, 2)
         small = rng.random((sh, sw)).astype(np.float32)
-        up = np.array(Image.fromarray((small * 255).astype(np.uint8)).resize(
-            (shape[1], shape[0]), Image.Resampling.BILINEAR)) / 255.0
+        pil = Image.fromarray((small * 255).astype(np.uint8))
+        up = np.array(pil.resize((shape[1], shape[0]), Image.Resampling.BILINEAR)) / 255.0
         result += up * amplitude
         total_amp += amplitude
         amplitude *= persistence
     return result / total_amp
 
 
+def _blend_azimuthal_seam(tex, seam_width=64):
+    """
+    将纹理在 u=0/u=2π 方向做平滑过渡，避免拼接时出现明显缝隙。
+    """
+    if seam_width <= 0:
+        return tex
+    if seam_width * 2 >= tex.shape[1]:
+        return tex
+    tex_blended = tex.copy()
+    left = tex[:, :seam_width, :].copy()
+    right = tex[:, -seam_width:, :].copy()
+    for i in range(seam_width):
+        t = (i + 1) / (seam_width + 1)
+        tex_blended[:, i, :] = (1 - t) * left[:, i, :] + t * right[:, i, :]
+        tex_blended[:, -seam_width + i, :] = (1 - t) * right[:, i, :] + t * left[:, i, :]
+    return tex_blended
+
+
 def generate_disk_texture(tex_w=1024, tex_h=512, seed=42):
     """
-    程序化生成吸积盘纹理（絮状云雾 + 螺旋臂 + 径向丝状结构 + 间隙）
-    返回 (tex_h, tex_w, 4) float32，第 4 通道为 alpha（密度）
+    程序化生成吸积盘纹理：
+    - 多尺度湍流（coarse/fine）塑造云雾层次
+    - 螺旋臂 + 剪切（shear）模拟 Kepler 流造成的拉丝
+    - 温度/密度剖面分离：温度决定基色，密度决定 alpha 与局部亮度
+    返回 (tex_h, tex_w, 4) float32，第 4 通道为 alpha（面密度）
     """
     rng = np.random.default_rng(seed)
 
@@ -379,320 +449,82 @@ def generate_disk_texture(tex_w=1024, tex_h=512, seed=42):
     v = np.linspace(0, 1, tex_h)                   # 径向方向（0=inner, 1=outer）
     uu, vv = np.meshgrid(u, v)
 
-    # 温度剖面
-    r_vals = np.linspace(2.0, 3.5, tex_h)
-    T = (1 - np.sqrt(2.0 / r_vals)) ** 0.25 / r_vals ** 0.75
-    T = T / np.max(T)
+    # ----- 温度剖面（来自 Novikov-Thorne power law）并允许噪声扰动 -----
+    r_inner = 2.0
+    r_outer = 3.5
+    r_vals = r_inner + (r_outer - r_inner) * vv[:, 0]
+    T = (1 - np.sqrt(r_inner / np.maximum(r_vals, r_inner + 1e-3))) ** 0.25
+    T /= np.max(T)
+    temp_coarse = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.6, base_scale=6, wrap_u=True)
+    temp_fine = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.45, base_scale=3, wrap_u=True)
+    temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
+    temperature_field = np.clip(T[:, None] * (0.8 + 0.3 * temp_noise), 0, 1)
 
-    # --- 密度场（决定哪里有物质，哪里是间隙）---
-
-    # 1. 大尺度螺旋臂（2-3 条）— 作为亮度调制而非开关
-    n_arms = rng.integers(2, 4)
+    # ----- 密度场 -----
+    # 1) 大尺度螺旋臂
+    n_arms = rng.integers(2, 5)
     spiral = np.zeros((tex_h, tex_w), dtype=np.float32)
+    tightness = rng.uniform(1.5, 2.8)
+    shear = vv ** 1.35 * rng.uniform(3.0, 5.0)
+    base_angle = (uu + shear) * 2 * np.pi
     for arm in range(n_arms):
         phase = arm * 2 * np.pi / n_arms + rng.uniform(0, np.pi)
-        tightness = rng.uniform(1.5, 3.0)
-        width = rng.uniform(0.2, 0.35)
-        angle = uu * 2 * np.pi + vv * tightness * 2 * np.pi + phase
+        width = rng.uniform(0.18, 0.32)
+        angle = base_angle + vv * tightness * 2 * np.pi + phase
         arm_val = np.exp(-0.5 * ((np.sin(angle) / width) ** 2))
         spiral += arm_val
-    spiral = np.clip(spiral, 0, 1)
+    spiral = np.clip(spiral / np.max(spiral + 1e-6), 0, 1)
 
-    # 2. FBM 云雾噪声（絮状结构）— 柔和
-    cloud = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.5, base_scale=8)
+    # 2) 多尺度湍流
+    coarse = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.55, base_scale=5, wrap_u=True)
+    fine = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.5, base_scale=2, wrap_u=True)
+    turbulence = np.clip(0.55 * coarse + 0.45 * fine, 0, 1)
 
-    # 3. 径向丝状结构（细条纹）— 禁用
-    filaments = np.ones((tex_h, tex_w), dtype=np.float32)
+    # 3) 径向细丝（利用噪声调制 sin 波）
+    filament_freq = rng.uniform(40, 60)
+    filament = 0.5 + 0.5 * np.sin(vv * filament_freq + coarse * 6.0 + rng.uniform(0, np.pi))
 
-    # 4. 角度方向的宽条纹 — 禁用
-    streaks = np.ones((tex_h, tex_w), dtype=np.float32)
+    # 4) 方位热点（强化自转可视化）
+    az_freq = rng.uniform(3.0, 6.0)
+    az_wave = 0.5 + 0.5 * np.sin((uu + shear) * az_freq * 2 * np.pi + rng.uniform(0, 2 * np.pi))
+    az_noise = _fbm_noise((tex_h, tex_w), rng, octaves=3, persistence=0.6, base_scale=3, wrap_u=True)
+    az_hotspot = np.clip(0.65 * az_wave + 0.35 * az_noise, 0, 1) ** 1.4
 
-    # 5. 间隙 — 已禁用
-    gaps = np.ones((tex_h, tex_w), dtype=np.float32)
+    # 组合密度
+    radial_density = np.ones((tex_h, tex_w), dtype=np.float32)
+    density = radial_density * (0.45 + 0.2 * spiral + 0.25 * turbulence + 0.15 * filament)
 
-    # 组合密度场
-    density = 0.6 + cloud * 0.15 + spiral * 0.1
-    density *= filaments * streaks * gaps
+    # 局部冷/热区造成的密度波动（模拟温度/密度分离）
+    hotspot = np.clip(temp_noise ** 1.5, 0, 1)
+    density *= (0.8 + 0.25 * hotspot + 0.35 * az_hotspot)
 
-    # 边缘软化
+    # 内圈高光抑制：靠近 r_inner 时再乘一次渐变，避免俯视图过曝
+    density *= (0.6 + 0.2 * hotspot + 0.3 * az_hotspot)
+
+    # 边缘软化（沿径向），保留 alpha 的内外渐变
     edge = compute_edge_alpha(tex_h)
     density *= edge[:, None]
 
-    # 归一化到 [0, 1]
+    # 归一化
     density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
 
-    # --- 颜色（基于温度）---
-    temp = T[:, None]
-    r_ch = np.clip(temp ** 0.35 * 1.1, 0, 1)
-    g_ch = np.clip(temp ** 0.5 * 0.75, 0, 1)
-    b_ch = np.clip(temp ** 0.8 * 0.5, 0, 1)
+    # ----- 颜色（温度 -> 颜色映射），加入噪声差异 -----
+    temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
+    hot_bias = np.clip(temp_aniso, 0, 1)
+    r_ch = np.clip(hot_bias ** 0.38 * (0.95 + 0.25 * hotspot), 0, 1)
+    g_ch = np.clip(hot_bias ** 0.55 * (0.7 + 0.15 * turbulence), 0, 1)
+    b_ch = np.clip(hot_bias ** 0.85 * (0.38 + 0.18 * (1 - hotspot)), 0, 1)
 
-    # 加入颜色变化（云雾区域偏暖）
-    color_var = _fbm_noise((tex_h, tex_w), np.random.default_rng(seed + 1),
-                           octaves=3, persistence=0.5, base_scale=8)
-    r_ch = r_ch + color_var * 0.1
-    g_ch = g_ch - color_var * 0.05
-    b_ch = b_ch - color_var * 0.05
-
-    # 组合 RGBA
+    brightness_scale = 0.45
     tex = np.zeros((tex_h, tex_w, 4), dtype=np.float32)
-    tex[:, :, 0] = np.clip(r_ch * density * 8.0, 0, 1)
-    tex[:, :, 1] = np.clip(g_ch * density * 8.0, 0, 1)
-    tex[:, :, 2] = np.clip(b_ch * density * 8.0, 0, 1)
-    tex[:, :, 3] = np.clip(density, 0, 1)  # alpha = 密度
+    tex[:, :, 0] = np.clip(r_ch * density * 6.0 * brightness_scale, 0, 1)
+    tex[:, :, 1] = np.clip(g_ch * density * 6.0 * brightness_scale, 0, 1)
+    tex[:, :, 2] = np.clip(b_ch * density * 6.0 * brightness_scale, 0, 1)
+    tex[:, :, 3] = np.clip(density * brightness_scale, 0, 1)
 
     return tex
 
 
-# ============================================================================
-# NumPy 渲染器（compact 算法）
-# ============================================================================
-
-def compute_acceleration_numpy(pos, L2):
-    """
-    计算加速度（NumPy 版本）
-
-    加速度公式：a = -1.5 * L² * pos / r⁵
-    这是史瓦西度规的笛卡尔等效形式
-    """
-    r2 = np.sum(pos * pos, axis=1)
-    r = np.sqrt(r2)
-    r5 = r2 * r2 * r
-    factor = -1.5 * L2 / r5
-    return factor[:, None] * pos
-
-
-def rk4_step_numpy(pos, vel, L2, dt):
-    """
-    单步 RK4 积分（NumPy 版本）
-
-    参数:
-        pos: (N, 3) 位置
-        vel: (N, 3) 速度
-        L2: (N,) 角动量平方
-        dt: 标量或 (N,) 自适应步长
-
-    返回:
-        (new_pos, new_vel)
-    """
-    # 支持标量和向量 dt
-    if np.ndim(dt) > 0:
-        dt = dt[:, None]  # (N, 1) for broadcasting
-
-    a1 = compute_acceleration_numpy(pos, L2)
-    p2 = pos + 0.5 * dt * vel
-    v2 = vel + 0.5 * dt * a1
-    a2 = compute_acceleration_numpy(p2, L2)
-    p3 = pos + 0.5 * dt * v2
-    v3 = vel + 0.5 * dt * a2
-    a3 = compute_acceleration_numpy(p3, L2)
-    p4 = pos + dt * v3
-    v4 = vel + dt * a3
-    a4 = compute_acceleration_numpy(p4, L2)
-
-    new_pos = pos + (dt / 6.0) * (vel + 2 * v2 + 2 * v3 + v4)
-    new_vel = vel + (dt / 6.0) * (a1 + 2 * a2 + 2 * a3 + a4)
-    return new_pos, new_vel
-
-
-def render_numpy(width, height, cam_pos, fov, step_size, skybox_path=None,
-                 n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0,
-                 disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
-                 r_disk_outer=R_DISK_OUTER_DEFAULT):
-    """
-    使用 NumPy 渲染（compact 向量化算法）
-
-    参数:
-        width, height: 图像尺寸
-        cam_pos: 相机位置
-        fov: 视野角度
-        step_size: 积分步长
-        skybox_path: 天空盒纹理路径
-        n_stars: 程序天空盒恒星数
-        tex_w, tex_h: 纹理尺寸
-        r_max: 逃逸半径
-        disk_texture_path: 吸积盘纹理路径
-        r_disk_inner: 吸积盘内半径
-        r_disk_outer: 吸积盘外半径
-
-    返回:
-        image: (height, width, 3) RGB 图像
-    """
-    t0 = time.time()
-    cam_pos_arr = np.array(cam_pos, dtype=np.float64)
-    distance = np.linalg.norm(cam_pos_arr)
-
-    # 构建相机
-    cam_pos_arr, cam_right, cam_up, cam_forward, pixel_width, pixel_height = build_camera(
-        cam_pos_arr, fov, width, height
-    )
-
-    # 生成光线
-    positions, velocities, L2, pixels = make_all_rays(
-        width, height, cam_pos_arr, cam_right, cam_up, cam_forward, pixel_width, pixel_height
-    )
-
-    # 加载天空盒
-    skybox, tex_h, tex_w = load_or_generate_skybox(skybox_path, tex_w, tex_h, n_stars)
-
-    # 加载吸积盘纹理
-    disk_tex = load_disk_texture(disk_texture_path)
-    if disk_tex is None:
-        disk_tex = generate_disk_texture()
-    has_disk = True
-
-    N = len(positions)
-    result_status = np.zeros(N, dtype=int)  # 0=active, 1=escaped, 2=captured
-    escape_dirs = np.zeros((N, 3))
-    accumulated_disk = np.zeros((N, 3), dtype=np.float32)  # 累积吸积盘颜色
-    disk_transmit = np.ones(N, dtype=np.float32)  # 剩余透射率
-
-    r_capture = RS
-    r_escape = max(r_max, distance * 2)
-    dt_base = step_size
-    max_factor = 10.0
-    max_steps = int(r_escape * 40 / dt_base)
-
-    # compact 算法：批量处理活跃光线
-    active_idx = np.arange(N)
-    act_pos = positions.copy()
-    act_vel = velocities.copy()
-    act_L2 = L2.copy()
-
-    print(f"NumPy compact: {N} rays, max {max_steps} steps, dt_base={dt_base} (adaptive)")
-
-    for step in range(max_steps):
-        n_active = len(active_idx)
-        if n_active == 0:
-            print(f"  All rays terminated at step {step}")
-            break
-
-        # 保存旧位置用于吸积盘检测
-        old_pos = act_pos.copy()
-
-        # 自适应步长：dt = dt_base * min(r / rs, max_factor)
-        r = np.sqrt(np.sum(act_pos * act_pos, axis=1))
-        dt = dt_base * np.minimum(r / RS, max_factor)
-
-        # RK4 积分
-        act_pos, act_vel = rk4_step_numpy(act_pos, act_vel, act_L2, dt)
-
-        # 吸积盘体积渲染：|z| < h(r) 区域内累积颜色
-        if has_disk:
-            new_z = act_pos[:, 2]
-            r_cyl = np.sqrt(act_pos[:, 0]**2 + act_pos[:, 1]**2)
-            in_radial = (r_cyl >= r_disk_inner) & (r_cyl <= r_disk_outer)
-            # h(r) = 0.15 * (r/r_inner)^1.2 (flared disk)
-            disk_h = np.where(in_radial, 0.15 * np.power(r_cyl / r_disk_inner, 1.2), 0)
-            in_volume = in_radial & (np.abs(new_z) < disk_h)
-            if np.any(in_volume):
-                vol_idx = np.where(in_volume)[0]
-                vol_global = active_idx[vol_idx]
-                vx = act_pos[vol_idx, 0]
-                vy = act_pos[vol_idx, 1]
-                vz = act_pos[vol_idx, 2]
-                vr = r_cyl[vol_idx]
-                vh = disk_h[vol_idx]
-
-                rgba = sample_disk_texture(disk_tex, vx, vy, r_disk_inner, r_disk_outer)
-                tex_alpha = rgba[:, 3]
-                colors = rgba[:, :3]
-
-                # 密度随 |z| 衰减（高斯剖面）
-                z_frac = vz / vh
-                density = np.exp(-2.0 * z_frac * z_frac) * tex_alpha
-
-                # 多普勒
-                v_orb = np.sqrt(0.5 / vr)
-                phi = np.arctan2(vy, vx)
-                vdx = -v_orb * np.sin(phi)
-                vdy = v_orb * np.cos(phi)
-                ray_vel = act_vel[vol_idx]
-                ray_norms = np.linalg.norm(ray_vel, axis=1, keepdims=True)
-                ray_dir = ray_vel / np.maximum(ray_norms, 1e-12)
-                vdot = vdx * ray_dir[:, 0] + vdy * ray_dir[:, 1]
-                doppler = 1.0 / np.maximum(1.0 - vdot, 0.1)
-                boost = np.clip(1.0 + np.log(doppler) * 1.5, 0.1, None)
-
-                shift = doppler - 1.0
-                shift = shift[:, None]
-                r_shift = 1.0 - shift * 0.75
-                g_shift = 1.0 - np.abs(shift) * 0.1
-                b_shift = 1.0 + shift * 0.7
-                colors = colors * np.concatenate([r_shift, g_shift, b_shift], axis=1)
-                colors = colors * boost[:, None]
-
-                # 体积累积：step_alpha ∝ density * step_size
-                dt_vol = dt[vol_idx] if np.ndim(dt) > 0 else dt
-                step_alpha = np.clip(density * dt_vol * 4.0, 0, 0.5)
-                transmit = disk_transmit[vol_global]
-                accumulated_disk[vol_global] += colors * (transmit * step_alpha)[:, None]
-                disk_transmit[vol_global] *= (1.0 - step_alpha)
-
-        # 分类光线
-        r = np.sqrt(np.sum(act_pos * act_pos, axis=1))
-        captured = r < r_capture
-        escaped = r > r_escape
-        terminated = captured | escaped
-
-        # 记录逃逸光线方向
-        if np.any(escaped):
-            esc_local = np.where(escaped)[0]
-            esc_global = active_idx[esc_local]
-            result_status[esc_global] = 1
-            esc_vel = act_vel[esc_local]
-            norms = np.linalg.norm(esc_vel, axis=1, keepdims=True)
-            escape_dirs[esc_global] = esc_vel / np.maximum(norms, 1e-12)
-
-        # 记录捕获光线
-        if np.any(captured):
-            cap_global = active_idx[captured]
-            result_status[cap_global] = 2
-
-        # 移除终止光线
-        if np.any(terminated):
-            keep = ~terminated
-            active_idx = active_idx[keep]
-            act_pos = act_pos[keep]
-            act_vel = act_vel[keep]
-            act_L2 = act_L2[keep]
-
-        if step % 500 == 0:
-            n_esc = np.sum(result_status == 1)
-            n_cap = np.sum(result_status == 2)
-            print(f"  step {step}: active={len(active_idx)}, escaped={n_esc}, captured={n_cap}")
-
-    # 剩余活跃光线视为逃逸
-    if len(active_idx) > 0:
-        result_status[active_idx] = 1
-        norms = np.linalg.norm(act_vel, axis=1, keepdims=True)
-        escape_dirs[active_idx] = act_vel / np.maximum(norms, 1e-12)
-
-    # 着色：背景 + 累积吸积盘颜色（加法混合）
-    print("Shading...")
-    image = np.zeros((height, width, 3), dtype=np.float32)
-
-    escaped_mask = result_status == 1
-    if np.any(escaped_mask):
-        esc_idx = np.where(escaped_mask)[0]
-        colors = sample_skybox_bilinear(skybox, escape_dirs[esc_idx])
-        esc_pixels = pixels[esc_idx]
-        image[esc_pixels[:, 1], esc_pixels[:, 0]] = colors + accumulated_disk[esc_idx]
-
-    # 被捕获的光线：黑色 + 累积吸积盘颜色
-    captured_mask = result_status == 2
-    if np.any(captured_mask):
-        cap_idx = np.where(captured_mask)[0]
-        cap_pixels = pixels[cap_idx]
-        image[cap_pixels[:, 1], cap_pixels[:, 0]] = accumulated_disk[cap_idx]
-
-    image = np.clip(image, 0, 1)
-
-    elapsed = time.time() - t0
-    n_esc = np.sum(result_status == 1)
-    n_cap = np.sum(result_status == 2)
-    print(f"Done: {n_esc} escaped, {n_cap} captured, {elapsed:.1f}s")
-    return image
 
 
 # ============================================================================
@@ -757,10 +589,84 @@ class TaichiRenderer:
 
     def _compile_kernels(self):
         ti = self.ti
+        width, height = self.width, self.height
         tex_w, tex_h = self.tex_w, self.tex_h
         dtex_w, dtex_h = self.dtex_w, self.dtex_h
         texture_field = self.texture_field
         disk_texture_field = self.disk_texture_field
+
+        g_cap = ti.cast(G_FACTOR_CAP, ti.f32)
+        lum_power = ti.cast(G_LUMINOSITY_POWER, ti.f32)
+        gain = ti.cast(G_BRIGHTNESS_GAIN, ti.f32)
+        alpha_gain = ti.cast(DISK_ALPHA_GAIN, ti.f32)
+
+        @ti.func
+        def apply_g_factor(base_color, hit_pos, hit_r, ray_dir_to_cam, cam_pos,
+                           r_inner, r_outer):
+            """
+            Taichi 版本的 g 因子调制（参照 starless Redshift 推导）
+            """
+            rs_f = ti.cast(RS, ti.f32)
+            r_obs = cam_pos.norm()
+            r_em = hit_pos.norm()
+            r_cyl = ti.sqrt(hit_pos[0] ** 2 + hit_pos[1] ** 2)
+            r_safe = ti.max(r_cyl, rs_f + 1e-3)
+
+            omega = ti.sqrt(0.5 / (r_safe ** 3 + 1e-6))
+            lorentz = ti.sqrt(ti.max(1.0 - rs_f / r_safe, 1e-6))
+            beta = ti.min(r_safe * omega / ti.max(lorentz, 1e-6), 0.99)
+            gamma = 1.0 / ti.sqrt(ti.max(1.0 - beta * beta, 1e-6))
+
+            v_hat = ti.Vector([-hit_pos[1], hit_pos[0], 0.0])
+            v_norm = v_hat.norm()
+            if v_norm > 1e-6:
+                v_hat = v_hat / v_norm
+            else:
+                v_hat = ti.Vector([0.0, 1.0, 0.0])
+
+            ray_hat = ray_dir_to_cam.normalized()
+            cos_theta = v_hat.dot(ray_hat)
+            denom = ti.max(1.0 - beta * cos_theta, 1e-3)
+            g_doppler = 1.0 / (gamma * denom)
+
+            grav_num = ti.sqrt(ti.max(1.0 - rs_f / ti.max(r_obs, rs_f + 1e-3), 1e-6))
+            grav_den = ti.sqrt(ti.max(1.0 - rs_f / ti.max(r_em, rs_f + 1e-3), 1e-6))
+            g_grav = grav_num / grav_den
+
+            g = ti.min(g_doppler * g_grav, g_cap)
+            intensity = ti.max(ti.pow(g, lum_power), 0.0)
+            brightness = gain * intensity / (1.0 + intensity / g_cap)
+
+            shift = ti.max(ti.min(g - 1.0, 2.0), -1.2)
+            pos_shift = ti.max(shift, 0.0)
+            neg_shift = ti.max(-shift, 0.0)
+
+            radial_span = ti.max(r_outer - r_inner, 1e-3)
+            radial_t = (ti.max(hit_r, r_inner) - r_inner) / radial_span
+            radial_t = ti.min(ti.max(radial_t, 0.0), 1.0)
+            radial_profile = ti.pow(
+                1.0 - radial_t,
+                ti.cast(DISK_RADIAL_BRIGHTNESS_POWER, ti.f32)
+            )
+            min_boost = ti.cast(DISK_RADIAL_BRIGHTNESS_MIN, ti.f32)
+            max_boost = ti.cast(DISK_RADIAL_BRIGHTNESS_MAX, ti.f32)
+            radial_boost = min_boost + (max_boost - min_boost) * radial_profile
+            brightness *= radial_boost
+            neg_lift = 0.28 * ti.pow(neg_shift, 0.85)
+            brightness *= ti.min(ti.max(1.05 + 0.18 * pos_shift - 0.08 * neg_shift + neg_lift, 0.5), 2.7)
+
+            red_boost = 1.0 + 0.35 * ti.pow(neg_shift, 0.75)
+            r_scale = ti.min(ti.max((1.0 + 0.6 * neg_shift - 0.25 * pos_shift) * red_boost, 0.25), 2.6)
+            g_scale = ti.min(ti.max(1.0 - 0.1 * pos_shift - 0.05 * neg_shift, 0.5), 1.25)
+            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.15 * neg_shift, 0.3), 2.7)
+
+            shifted = ti.Vector([
+                base_color[0] * r_scale,
+                base_color[1] * g_scale,
+                base_color[2] * b_scale,
+            ])
+            tint = ti.Vector([DISK_BASE_TINT[0], DISK_BASE_TINT[1], DISK_BASE_TINT[2]])
+            return ti.math.clamp(shifted * tint * brightness, 0.0, 10.0)
 
         @ti.func
         def compute_acceleration(pos, L2):
@@ -842,6 +748,7 @@ class TaichiRenderer:
 
             # 吸积盘倾斜角度（弧度）
             tilt_rad = disk_tilt * ti.math.pi / 180.0
+            min_fac = ti.cast(0.2, ti.f32)
 
             center = cp + cf * 1.0
             tl = center - cr * (pw * width / 2) + cu * (ph * height / 2)
@@ -850,6 +757,7 @@ class TaichiRenderer:
             r_cap = ti.cast(RS, ti.f32)
             r_esc = r_escape_field[None]
             max_iter = ti.cast(r_esc * 40 / h_base, ti.i32)
+            max_affine = r_esc * 40.0
 
             for i, j in image_field:
                 px_f = ti.cast(i, ti.f32)
@@ -865,14 +773,26 @@ class TaichiRenderer:
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
                 event_horizon_hit = False
                 accum_disk = ti.Vector([0.0, 0.0, 0.0])
+                disk_alpha_total = 0.0
                 step_count = 0
+                affine = 0.0
 
                 while step_count < max_iter:
                     old_pos = pos
                     old_z = pos[2]
                     old_y = pos[1]
                     r_cur = pos.norm()
-                    h = h_base * ti.min(r_cur / r_cap, max_fac)
+                    r_safe = ti.max(r_cur, r_cap + 1e-3)
+                    far_scale = ti.sqrt(r_safe / r_cap)
+                    if far_scale > max_fac:
+                        far_scale = max_fac
+                    near_damp = 1.0 / (1.0 + 2.0 * (ti.pow(r_cap / r_safe, 3)))
+                    dt_fac = far_scale * near_damp
+                    if dt_fac < min_fac:
+                        dt_fac = min_fac
+                    if dt_fac > max_fac:
+                        dt_fac = max_fac
+                    h = h_base * dt_fac
 
                     k1p = h * dir_
                     k1d = h * compute_acceleration(pos, L2_val)
@@ -887,11 +807,16 @@ class TaichiRenderer:
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6
 
                     r = new_pos.norm()
+                    affine += h
 
                     if r < r_cap:
                         event_horizon_hit = True
                         break
                     elif r > r_esc:
+                        escaped = True
+                        escape_dir = new_dir.normalized()
+                        break
+                    elif affine > max_affine:
                         escaped = True
                         escape_dir = new_dir.normalized()
                         break
@@ -904,7 +829,6 @@ class TaichiRenderer:
                     tan_t = ti.tan(tilt_rad)
                     f_old = old_z - old_y * tan_t
                     f_new = new_z - new_y * tan_t
-                    f_new = new_z - new_y * tan_t
                     if f_old * f_new < 0:
                         t_frac = f_old / (f_old - f_new + 1e-8)
                         hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
@@ -913,25 +837,19 @@ class TaichiRenderer:
                         if r_outer >= hit_r >= r_inner:
                             disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
-                            disk_alpha = disk_rgba[3]
+                            base_alpha = ti.min(disk_rgba[3], 0.999)
+                            disk_alpha = 1.0 - ti.pow(1.0 - base_alpha, alpha_gain)
 
-                            # 多普勒效应
-                            v_orb = ti.sqrt(0.5 / hit_r)
-                            phi = ti.atan2(hit_y, hit_x)
-                            vdx = -v_orb * ti.sin(phi)
-                            vdy = v_orb * ti.cos(phi)
-                            ray_d = dir_.normalized()
-                            vdot = vdx * ray_d[0] + vdy * ray_d[1]
-                            doppler = 1.0 / ti.max(1.0 - vdot, 0.1)
-                            brightness = ti.min((doppler * 0.7) ** 3, 8)
+                            hit_z = hit_y * ti.tan(tilt_rad)
+                            hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
+                            ray_to_cam = -dir_
+                            col_shifted = apply_g_factor(
+                                disk_col, hit_pos_vec, hit_r, ray_to_cam, cp, r_inner, r_outer
+                            )
 
-                            shift = doppler - 1.0
-                            r_col = disk_col[0] * (1.0 - shift * 0.6)
-                            g_col = disk_col[1] * (1.0 - ti.abs(shift) * 0.3)
-                            b_col = disk_col[2] * (1.0 + shift * 0.4)
-                            col_shifted = ti.Vector([ti.max(r_col, 0.0), ti.max(g_col, 0.0), ti.max(b_col, 0.0)])
-
-                            accum_disk += col_shifted * brightness * disk_alpha
+                            front_factor = 1.0 - disk_alpha_total
+                            accum_disk += col_shifted * disk_alpha * front_factor
+                            disk_alpha_total = 1.0 - front_factor * (1.0 - disk_alpha)
 
                     pos = new_pos
                     dir_ = new_dir
@@ -943,6 +861,8 @@ class TaichiRenderer:
                     bg_color = ti.Vector([0.0, 0.0, 0.0])
                 elif escaped:
                     bg_color = sample_skybox(escape_dir)
+
+                bg_color = bg_color * (1.0 - disk_alpha_total)
 
                 image_field[i, j] = bg_color
                 disk_layer_field[i, j] = ti.math.clamp(accum_disk, 0.0, 1.0)
@@ -1257,12 +1177,9 @@ def parse_args():
                         help=f"吸积盘外半径 (default: {R_DISK_OUTER_DEFAULT})")
     parser.add_argument("--disk_tilt", type=float, default=0.0,
                         help="吸积盘倾角 (度, default: 0)")
-    parser.add_argument("--framework", "-f", type=str, default="taichi",
-                        choices=["numpy", "taichi"],
-                        help="渲染框架: numpy 或 taichi (default: taichi)")
     parser.add_argument("--device", "-d", type=str, default="cpu",
                         choices=["cpu", "gpu"],
-                        help="Taichi 设备: cpu 或 gpu (default: cpu, 仅 taichi 框架有效)")
+                        help="Taichi 设备: cpu 或 gpu (default: cpu)")
     parser.add_argument("--video", action="store_true",
                         help="视频模式：渲染多帧并合成视频")
     parser.add_argument("--orbit", action="store_true",
@@ -1284,10 +1201,6 @@ if __name__ == "__main__":
     fov = args.fov % 180
 
     if args.video:
-        if args.framework != "taichi":
-            print("Error: Video mode only supports taichi framework")
-            exit(1)
-
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         disk_tex = load_disk_texture(args.disk_texture)
         if disk_tex is None:
@@ -1312,35 +1225,19 @@ if __name__ == "__main__":
             resume=args.resume
         )
     else:
-        if args.framework == "taichi":
-            img = render_taichi(
-                width=width,
-                height=height,
-                cam_pos=args.pov,
-                fov=fov,
-                step_size=args.step_size,
-                skybox_path=args.texture,
-                n_stars=args.n_stars,
-                r_max=args.r_max,
-                device=args.device,
-                disk_texture_path=args.disk_texture,
-                r_disk_inner=args.ar1,
-                r_disk_outer=args.ar2,
-                disk_tilt=args.disk_tilt,
-            )
-        else:
-            img = render_numpy(
-                width=width,
-                height=height,
-                cam_pos=args.pov,
-                fov=fov,
-                step_size=args.step_size,
-                skybox_path=args.texture,
-                n_stars=args.n_stars,
-                r_max=args.r_max,
-                disk_texture_path=args.disk_texture,
-                r_disk_inner=args.ar1,
-                r_disk_outer=args.ar2,
-            )
-
+        img = render_taichi(
+            width=width,
+            height=height,
+            cam_pos=args.pov,
+            fov=fov,
+            step_size=args.step_size,
+            skybox_path=args.texture,
+            n_stars=args.n_stars,
+            r_max=args.r_max,
+            device=args.device,
+            disk_texture_path=args.disk_texture,
+            r_disk_inner=args.ar1,
+            r_disk_outer=args.ar2,
+            disk_tilt=args.disk_tilt,
+        )
         save_image(img, args.output)
