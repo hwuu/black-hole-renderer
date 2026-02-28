@@ -619,7 +619,8 @@ class TaichiRenderer:
                  step_size=0.1, r_max=10.0, device="cpu",
                  r_disk_inner=R_DISK_INNER_DEFAULT,
                  r_disk_outer=R_DISK_OUTER_DEFAULT,
-                 disk_tilt=0.0):
+                 disk_tilt=0.0,
+                 lens_flare=False):
         import taichi as ti
         self.ti = ti
         self.width = width
@@ -629,6 +630,7 @@ class TaichiRenderer:
         self.r_disk_inner = r_disk_inner
         self.r_disk_outer = r_disk_outer
         self.disk_tilt = disk_tilt
+        self.lens_flare = lens_flare
 
         ti.init(arch=ti.cpu if device == "cpu" else ti.gpu)
 
@@ -957,6 +959,42 @@ class TaichiRenderer:
                 else:
                     bright_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
 
+            # 水平方向模糊
+            for i, j in blur_field:
+                sum_r = 0.0
+                sum_g = 0.0
+                sum_b = 0.0
+                weight_r = 0.0
+                weight_g = 0.0
+                weight_b = 0.0
+                
+                for dx in range(-28, 29):
+                    ni = i + dx
+                    if 0 <= ni < w:
+                        dist_sq = ti.cast(dx * dx, ti.f32)
+                        col = bright_field[ni, j]
+                        
+                        w_r = ti.exp(-dist_sq / 25.0)
+                        w_g = ti.exp(-dist_sq / 80.0)
+                        w_b = ti.exp(-dist_sq / 200.0)
+                        
+                        sum_r += col[0] * w_r
+                        sum_g += col[1] * w_g
+                        sum_b += col[2] * w_b
+                        weight_r += w_r
+                        weight_g += w_g
+                        weight_b += w_b
+                
+                if weight_r > 0.0:
+                    blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
+                else:
+                    blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+            
+            # 复制回 bright_field
+            for i, j in bright_field:
+                bright_field[i, j] = blur_field[i, j]
+            
+            # 垂直方向模糊
             for i, j in blur_field:
                 sum_r = 0.0
                 sum_g = 0.0
@@ -966,29 +1004,23 @@ class TaichiRenderer:
                 weight_b = 0.0
                 
                 for dy in range(-28, 29):
-                    for dx in range(-28, 29):
-                        ni = i + dy
-                        nj = j + dx
-                        if 0 <= ni < w and 0 <= nj < h:
-                            dist_sq = ti.cast(dx * dx + dy * dy, ti.f32)
-                            col = bright_field[ni, nj]
-                            
-                            # 红色：小模糊半径
-                            w_r = ti.exp(-dist_sq / 25.0)
-                            sum_r += col[0] * w_r
-                            weight_r += w_r
-                            
-                            # 绿色：中等模糊半径
-                            w_g = ti.exp(-dist_sq / 80.0)
-                            sum_g += col[1] * w_g
-                            weight_g += w_g
-                            
-                            # 蓝色：大模糊半径，明显色散
-                            w_b = ti.exp(-dist_sq / 200.0)
-                            sum_b += col[2] * w_b
-                            weight_b += w_b
+                    nj = j + dy
+                    if 0 <= nj < h:
+                        dist_sq = ti.cast(dy * dy, ti.f32)
+                        col = bright_field[i, nj]
+                        
+                        w_r = ti.exp(-dist_sq / 25.0)
+                        w_g = ti.exp(-dist_sq / 80.0)
+                        w_b = ti.exp(-dist_sq / 200.0)
+                        
+                        sum_r += col[0] * w_r
+                        sum_g += col[1] * w_g
+                        sum_b += col[2] * w_b
+                        weight_r += w_r
+                        weight_g += w_g
+                        weight_b += w_b
                 
-                if weight_r > 0.0 and weight_g > 0.0 and weight_b > 0.0:
+                if weight_r > 0.0:
                     blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
                 else:
                     blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
@@ -1092,13 +1124,121 @@ class TaichiRenderer:
         disk = self.disk_layer_field.to_numpy()
         disk_bloom = self.blur_field.to_numpy()
         final = np.clip(img + disk + disk_bloom, 0, 1)
+        
+        # Lens flare（CPU 实现）
+        if self.lens_flare:
+            final = self._apply_lens_flare(final, disk)
         return final.transpose(1, 0, 2)
+    
+    def _apply_lens_flare(self, final, disk):
+        """应用 lens flare 效果，final 和 disk 都是 (width, height, 3)"""
+        w, h, _ = final.shape
+        
+        # 找吸积盘亮度中心
+        disk_brightness = np.max(disk, axis=2)  # shape: (w, h)
+        total_brightness = np.sum(disk_brightness)
+        if total_brightness < 0.01:
+            return final
+        
+        x_coords, y_coords = np.mgrid[0:w, 0:h]  # shape: (w, h)
+        light_x = np.sum(x_coords * disk_brightness) / total_brightness
+        light_y = np.sum(y_coords * disk_brightness) / total_brightness
+        screen_cx, screen_cy = w / 2, h / 2
+        
+        intensity = min(total_brightness / (w * h * 0.3), 1.0) * 1.5
+        
+        flare = np.zeros((w, h, 3), dtype=np.float32)
+        
+        # 多个 ghost 光斑
+        for g in range(8):
+            t = (g + 1) * 0.15
+            ghost_x = light_x + (screen_cx - light_x) * t
+            ghost_y = light_y + (screen_cy - light_y) * t
+            ghost_size = 25 + g * 30
+            
+            dx = x_coords - ghost_x
+            dy = y_coords - ghost_y
+            dist = np.sqrt(dx**2 + dy**2)
+            
+            mask = dist < ghost_size
+            alpha = np.zeros((w, h), dtype=np.float32)
+            alpha[mask] = (1 - dist[mask] / ghost_size) ** 2 * (1 - g * 0.08) * intensity
+            
+            ghost_color = np.array([1.0, 0.9, 0.7])
+            for c in range(3):
+                flare[:, :, c] += alpha * ghost_color[c]
+        
+        # 多层环形光环（光圈衍射效果）
+        for ring_idx in range(3):
+            ring_t = 0.35 + ring_idx * 0.15
+            ring_x = light_x + (screen_cx - light_x) * ring_t
+            ring_y = light_y + (screen_cy - light_y) * ring_t
+            ring_r = 60 + ring_idx * 40
+            ring_w = 6 + ring_idx * 3
+            
+            dx = x_coords - ring_x
+            dy = y_coords - ring_y
+            dist = np.sqrt(dx**2 + dy**2)
+            ring_dist = np.abs(dist - ring_r)
+            ring_alpha = np.clip(1 - ring_dist / ring_w, 0, 1) ** 2 * 0.5 * intensity * (1 - ring_idx * 0.25)
+            
+            # 环的颜色略有差异，模拟色散
+            ring_colors = [
+                np.array([0.3, 0.4, 1.0]),   # 内环偏蓝
+                np.array([0.5, 0.5, 0.9]),   # 中环偏紫
+                np.array([0.7, 0.5, 0.8]),   # 外环偏暖
+            ]
+            for c in range(3):
+                flare[:, :, c] += ring_alpha * ring_colors[ring_idx][c]
+        
+        # 六边形光环（光圈叶片效果）
+        hex_t = 0.5
+        hex_x = light_x + (screen_cx - light_x) * hex_t
+        hex_y = light_y + (screen_cy - light_y) * hex_t
+        hex_r = 100
+        
+        dx = x_coords - hex_x
+        dy = y_coords - hex_y
+        angle = np.arctan2(dy, dx)
+        dist = np.sqrt(dx**2 + dy**2)
+        
+        # 六边形边缘检测
+        hex_edge = np.abs(np.mod(angle, np.pi/3) - np.pi/6)
+        hex_factor = np.clip(1 - hex_edge / 0.2, 0, 1)
+        ring_dist = np.abs(dist - hex_r)
+        ring_alpha = np.clip(1 - ring_dist / 15, 0, 1) ** 2 * hex_factor * 0.3 * intensity
+        
+        hex_color = np.array([0.6, 0.7, 1.0])
+        for c in range(3):
+            flare[:, :, c] += ring_alpha * hex_color[c]
+        
+        # 横向光斑条纹（星芒效果）
+        streak_len = min(w, h) * 0.4
+        streak_alpha = intensity * 0.3
+        
+        dx = x_coords - light_x
+        dy = y_coords - light_y
+        dist = np.sqrt(dx**2 + dy**2)
+        angle = np.arctan2(dy, dx)
+        
+        # 4 条主星芒
+        for main_angle in [0, np.pi/2, np.pi, 3*np.pi/2]:
+            angle_diff = np.abs(np.mod(angle - main_angle + np.pi, 2*np.pi) - np.pi)
+            streak_mask = angle_diff < 0.05
+            falloff = np.exp(-dist / streak_len)
+            
+            streak_color = np.array([1.0, 0.95, 0.9])
+            for c in range(3):
+                flare[:, :, c] += np.where(streak_mask, falloff * streak_alpha * streak_color[c], 0)
+        
+        return np.clip(final + flare, 0, 1)
 
 
 def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
                   n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
-                  r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0):
+                  r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
+                  lens_flare=False):
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
@@ -1111,7 +1251,8 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
         width, height, skybox, disk_tex,
         step_size=step_size, r_max=r_max, device=device,
         r_disk_inner=r_disk_inner, r_disk_outer=r_disk_outer,
-        disk_tilt=disk_tilt
+        disk_tilt=disk_tilt,
+        lens_flare=lens_flare
     )
 
     t0 = time.time()
@@ -1270,6 +1411,8 @@ def parse_args():
                         help=f"吸积盘外半径 (default: {R_DISK_OUTER_DEFAULT})")
     parser.add_argument("--disk_tilt", type=float, default=0.0,
                         help="吸积盘倾角 (度, default: 0)")
+    parser.add_argument("--lens_flare", action="store_true",
+                        help="启用 lens flare 效果 (default: 关闭)")
     parser.add_argument("--device", "-d", type=str, default="cpu",
                         choices=["cpu", "gpu"],
                         help="Taichi 设备: cpu 或 gpu (default: cpu)")
@@ -1303,7 +1446,8 @@ if __name__ == "__main__":
             width, height, skybox, disk_tex,
             step_size=args.step_size, r_max=args.r_max, device=args.device,
             r_disk_inner=args.ar1, r_disk_outer=args.ar2,
-            disk_tilt=args.disk_tilt
+            disk_tilt=args.disk_tilt,
+            lens_flare=args.lens_flare
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
@@ -1332,5 +1476,6 @@ if __name__ == "__main__":
             r_disk_inner=args.ar1,
             r_disk_outer=args.ar2,
             disk_tilt=args.disk_tilt,
+            lens_flare=args.lens_flare,
         )
         save_image(img, args.output)
