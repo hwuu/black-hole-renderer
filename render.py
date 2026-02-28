@@ -501,7 +501,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         r_length = min(r_length, 1.0 - r_start)
         r_end = r_start + r_length
 
-        arm_angle = phi_grid - base_angle + r_norm_grid * rotations * 2 * np.pi
+        arm_angle = phi_grid - base_angle - r_norm_grid * rotations * 2 * np.pi
 
         # 宽度随噪声变化
         width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
@@ -632,7 +632,7 @@ class TaichiRenderer:
         self.disk_tilt = disk_tilt
         self.lens_flare = lens_flare
 
-        ti.init(arch=ti.cpu if device == "cpu" else ti.gpu)
+        ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, offline_cache=False)
 
         tex_h, tex_w = skybox.shape[:2]
         dtex_h, dtex_w = disk_tex.shape[:2]
@@ -678,7 +678,7 @@ class TaichiRenderer:
 
         @ti.func
         def apply_g_factor(base_color, hit_pos, hit_r, ray_dir_to_cam, cam_pos,
-                           r_inner, r_outer):
+                           r_inner, r_outer, tilt_rad):
             """
             Taichi 版本的 g 因子调制（参照 starless Redshift 推导）
             """
@@ -693,7 +693,11 @@ class TaichiRenderer:
             beta = ti.min(r_safe * omega / ti.max(lorentz, 1e-6), 0.99)
             gamma = 1.0 / ti.sqrt(ti.max(1.0 - beta * beta, 1e-6))
 
-            v_hat = ti.Vector([-hit_pos[1], hit_pos[0], 0.0])
+            sin_t = ti.sin(tilt_rad)
+            cos_t = ti.cos(tilt_rad)
+            disk_normal = ti.Vector([0.0, -sin_t, cos_t])
+            r_hat = hit_pos.normalized()
+            v_hat = r_hat.cross(disk_normal)
             v_norm = v_hat.norm()
             if v_norm > 1e-6:
                 v_hat = v_hat / v_norm
@@ -728,15 +732,13 @@ class TaichiRenderer:
             max_boost = ti.cast(DISK_RADIAL_BRIGHTNESS_MAX, ti.f32)
             radial_boost = min_boost + (max_boost - min_boost) * radial_profile
             brightness *= radial_boost
-            neg_lift = 0.28 * ti.pow(neg_shift, 0.85)
-            brightness *= ti.min(ti.max(1.05 + 0.18 * pos_shift - 0.08 * neg_shift + neg_lift, 0.5), 2.7)
+            # 暂不调整多普勒亮度
 
-            # 蓝移 (g<1, neg_shift>0): b_scale 增大，r_scale 减小
-            # 红移 (g>1, pos_shift>0): r_scale 增大，b_scale 减小
-            red_boost = 1.0 + 0.35 * ti.pow(pos_shift, 0.75)
-            r_scale = ti.min(ti.max((1.0 + 0.6 * pos_shift - 0.25 * neg_shift) * red_boost, 0.25), 2.6)
+            # neg_shift>0 (蓝移): 偏红; pos_shift>0 (红移): 偏蓝
+            red_boost = 1.0 + 0.35 * ti.pow(neg_shift, 0.75)
+            r_scale = ti.min(ti.max((1.0 + 0.6 * neg_shift - 0.25 * pos_shift) * red_boost, 0.25), 2.6)
             g_scale = ti.min(ti.max(1.0 - 0.1 * pos_shift - 0.05 * neg_shift, 0.5), 1.25)
-            b_scale = ti.min(ti.max(1.05 + 0.3 * neg_shift - 0.15 * pos_shift, 0.3), 2.7)
+            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.15 * neg_shift, 0.3), 2.7)
 
             shifted = ti.Vector([
                 base_color[0] * r_scale,
@@ -922,7 +924,7 @@ class TaichiRenderer:
                             hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
                             ray_to_cam = -dir_
                             col_shifted = apply_g_factor(
-                                disk_col, hit_pos_vec, hit_r, ray_to_cam, cp, r_inner, r_outer
+                                disk_col, hit_pos_vec, hit_r, ray_to_cam, cp, r_inner, r_outer, tilt_rad
                             )
 
                             front_factor = 1.0 - disk_alpha_total
@@ -1376,8 +1378,10 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         os.remove(frame_path)
 
     writer.close()
-    os.remove(progress_file)
-    os.rmdir(temp_dir)
+    if os.path.exists(progress_file):
+        os.remove(progress_file)
+    import shutil
+    shutil.rmtree(temp_dir)
     print(f"Video saved: {output_path}")
 
 
