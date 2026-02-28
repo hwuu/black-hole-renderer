@@ -731,10 +731,12 @@ class TaichiRenderer:
             neg_lift = 0.28 * ti.pow(neg_shift, 0.85)
             brightness *= ti.min(ti.max(1.05 + 0.18 * pos_shift - 0.08 * neg_shift + neg_lift, 0.5), 2.7)
 
-            red_boost = 1.0 + 0.35 * ti.pow(neg_shift, 0.75)
-            r_scale = ti.min(ti.max((1.0 + 0.6 * neg_shift - 0.25 * pos_shift) * red_boost, 0.25), 2.6)
+            # 蓝移 (g<1, neg_shift>0): b_scale 增大，r_scale 减小
+            # 红移 (g>1, pos_shift>0): r_scale 增大，b_scale 减小
+            red_boost = 1.0 + 0.35 * ti.pow(pos_shift, 0.75)
+            r_scale = ti.min(ti.max((1.0 + 0.6 * pos_shift - 0.25 * neg_shift) * red_boost, 0.25), 2.6)
             g_scale = ti.min(ti.max(1.0 - 0.1 * pos_shift - 0.05 * neg_shift, 0.5), 1.25)
-            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.15 * neg_shift, 0.3), 2.7)
+            b_scale = ti.min(ti.max(1.05 + 0.3 * neg_shift - 0.15 * pos_shift, 0.3), 2.7)
 
             shifted = ti.Vector([
                 base_color[0] * r_scale,
