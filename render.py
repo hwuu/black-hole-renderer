@@ -947,6 +947,12 @@ class TaichiRenderer:
                 d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
                 d_dir_dx = ray_dir_x1 - ray_dir
 
+                # Y 方向微分
+                pixel_pos_y1 = tl + (px_f + 0.5) * pw * cr - (py_f + 1.5) * ph * cu
+                ray_dir_y1 = (pixel_pos_y1 - cp).normalized()
+                d_pos_dy = ti.Vector([0.0, 0.0, 0.0])
+                d_dir_dy = ray_dir_y1 - ray_dir
+
                 escaped = False
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
                 event_horizon_hit = False
@@ -956,6 +962,7 @@ class TaichiRenderer:
                 affine = 0.0
                 # 记录击中时的微分状态
                 hit_d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
+                hit_d_pos_dy = ti.Vector([0.0, 0.0, 0.0])
 
                 while step_count < max_iter:
                     old_pos = pos
@@ -987,7 +994,7 @@ class TaichiRenderer:
                     new_pos = pos + (k1p + 2 * k2p + 2 * k3p + k4p) / 6
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6
 
-                    # 微分光线 RK4（同步更新）
+                    # 微分光线 RK4（同步更新 X 方向）
                     k1p_dx = h * d_dir_dx
                     k1d_dx = h * compute_acc_jacobian(pos, d_pos_dx, L2_val)
                     k2p_dx = h * (d_dir_dx + 0.5 * k1d_dx)
@@ -999,6 +1006,19 @@ class TaichiRenderer:
 
                     new_d_pos_dx = d_pos_dx + (k1p_dx + 2 * k2p_dx + 2 * k3p_dx + k4p_dx) / 6
                     new_d_dir_dx = d_dir_dx + (k1d_dx + 2 * k2d_dx + 2 * k3d_dx + k4d_dx) / 6
+
+                    # 微分光线 RK4（同步更新 Y 方向）
+                    k1p_dy = h * d_dir_dy
+                    k1d_dy = h * compute_acc_jacobian(pos, d_pos_dy, L2_val)
+                    k2p_dy = h * (d_dir_dy + 0.5 * k1d_dy)
+                    k2d_dy = h * compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dy + 0.5 * k1p_dy, L2_val)
+                    k3p_dy = h * (d_dir_dy + 0.5 * k2d_dy)
+                    k3d_dy = h * compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dy + 0.5 * k2p_dy, L2_val)
+                    k4p_dy = h * (d_dir_dy + k3d_dy)
+                    k4d_dy = h * compute_acc_jacobian(pos + k3p, d_pos_dy + k3p_dy, L2_val)
+
+                    new_d_pos_dy = d_pos_dy + (k1p_dy + 2 * k2p_dy + 2 * k3p_dy + k4p_dy) / 6
+                    new_d_dir_dy = d_dir_dy + (k1d_dy + 2 * k2d_dy + 2 * k3d_dy + k4d_dy) / 6
 
                     r = new_pos.norm()
                     affine += h
@@ -1018,6 +1038,8 @@ class TaichiRenderer:
                     # 更新微分光线状态
                     d_pos_dx = new_d_pos_dx
                     d_dir_dx = new_d_dir_dx
+                    d_pos_dy = new_d_pos_dy
+                    d_dir_dy = new_d_dir_dy
 
                     new_z = new_pos[2]
                     new_y = new_pos[1]
@@ -1035,6 +1057,7 @@ class TaichiRenderer:
 
                         # 记录击中时的微分位置（用于计算纹理梯度）
                         hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
+                        hit_d_pos_dy = d_pos_dy + t_frac * (new_d_pos_dy - d_pos_dy)
 
                         if r_outer >= hit_r >= r_inner:
                             hit_z = hit_y * ti.tan(tilt_rad)
@@ -1062,9 +1085,17 @@ class TaichiRenderer:
                                 dudx = dphi_dx * dtex_w / (2.0 * ti.math.pi)
                                 dvdx = dr_dx * dtex_h / (r_outer - r_inner)
 
-                                # 计算梯度幅值用于 LOD
-                                # LOD = log2(grad_sq) * strength，grad_sq > 1 表示纹理变化超过 1 像素
-                                grad_sq = dudx * dudx + dvdx * dvdx
+                                # Y 方向梯度
+                                dr_dy = (hit_x * hit_d_pos_dy[0] + hit_y * hit_d_pos_dy[1]) / hit_r_cyl
+                                dphi_dy = (-hit_y * hit_d_pos_dy[0] + hit_x * hit_d_pos_dy[1]) / (hit_r_cyl ** 2 + 1e-6)
+                                dudy = dphi_dy * dtex_w / (2.0 * ti.math.pi)
+                                dvdy = dr_dy * dtex_h / (r_outer - r_inner)
+
+                                # 计算梯度幅值用于 LOD（取 X 和 Y 方向的最大值）
+                                grad_sq_x = dudx * dudx + dvdx * dvdx
+                                grad_sq_y = dudy * dudy + dvdy * dvdy
+                                grad_sq = ti.max(grad_sq_x, grad_sq_y)
+
                                 lod_diff = ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
                                 lod_diff = ti.min(ti.max(lod_diff, 0.0), 3.0)
 

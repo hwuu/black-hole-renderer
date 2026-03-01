@@ -505,20 +505,27 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
 
 2. RK4 积分时同步追踪微分光线：
    - 主光线: pos, dir_
-   - 微分光线: d_pos_dx, d_dir_dx
+- 微分光线: d_pos_dx, d_dir_dx, d_pos_dy, d_dir_dy（X 和 Y 两个方向）
    
    微分光线的加速度需要计算雅可比矩阵：
    d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
 
-3. 击中吸积盘时计算纹理梯度：
-   dr/dpixel = (hit_x * d_pos_dx[0] + hit_y * d_pos_dx[1]) / r
-   dphi/dpixel = (-hit_y * d_pos_dx[0] + hit_x * d_pos_dx[1]) / r²
+3. 击中吸积盘时计算纹理梯度（X 和 Y 两个方向）：
+   # X 方向
+   dr/dpixel_x = (hit_x * d_pos_dx[0] + hit_y * d_pos_dx[1]) / r
+   dphi/dpixel_x = (-hit_y * d_pos_dx[0] + hit_x * d_pos_dx[1]) / r²
    
-   dudx = dphi * dtex_w / (2π)
-   dvdx = dr * dtex_h / (r_outer - r_inner)
+   # Y 方向
+   dr/dpixel_y = (hit_x * d_pos_dy[0] + hit_y * d_pos_dy[1]) / r
+   dphi/dpixel_y = (-hit_y * d_pos_dy[0] + hit_x * d_pos_dy[1]) / r²
+   
+   dudx = dphi_x * dtex_w / (2π)
+   dvdx = dr_x * dtex_h / (r_outer - r_inner)
+   dudy = dphi_y * dtex_w / (2π)
+   dvdy = dr_y * dtex_h / (r_outer - r_inner)
 
-4. 根据梯度幅值选择 LOD：
-   grad_sq = dudx² + dvdx²
+4. 根据梯度幅值选择 LOD（取两个方向的最大值）：
+   grad_sq = max(dudx² + dvdx², dudy² + dvdy²)
    LOD = log₂(grad_sq) * strength
    LOD = clamp(LOD, 0, 3)
    
@@ -541,8 +548,9 @@ base_tex → 2x2 avg → level 1 → 2x2 avg → level 2 → ...
 #### 效果
 
 - 有效减少远端吸积盘的摩尔纹
+- 同时追踪 X 和 Y 方向的压缩，更全面
 - 强度可调，适应不同分辨率
-- 性能开销约 1.5x
+- 性能开销约 2x
 
 ---
 
@@ -554,6 +562,8 @@ base_tex → 2x2 avg → level 1 → 2x2 avg → level 2 → ...
 - Schwarzschild, K. (1916). "Über das Gravitationsfeld eines Massenpunktes nach der Einsteinschen Theorie"
 
 ---
+
+- v5.16 (2026-03-01): 抗锯齿增加 Y 方向微分追踪，全面检测摩尔纹；添加视频高质量编码提示
 
 - v5.15 (2026-03-01): 新增抗锯齿功能（Ray Differentials + Mipmap LOD），添加 --anti_alias 和 --aa_strength 参数
 - v5.13 (2026-03-01): 修正多普勒效应和悬臂方向；盘旋转改为顺时针（v_hat = r_hat × n）；颜色调整为蓝移偏红、红移偏蓝
