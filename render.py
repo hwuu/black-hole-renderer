@@ -1395,7 +1395,7 @@ class TaichiRenderer:
         return np.clip(final + flare, 0, 1)
 
 
-def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
+def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
                   n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
                   r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
@@ -1634,7 +1634,7 @@ if __name__ == "__main__":
             resume=args.resume
         )
     else:
-        img = render_taichi(
+        img = render_image(
             width=width,
             height=height,
             cam_pos=args.pov,
