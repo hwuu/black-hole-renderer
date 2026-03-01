@@ -875,16 +875,16 @@ class TaichiRenderer:
                 phi += 2 * ti.math.pi
             while phi >= 2 * ti.math.pi:
                 phi -= 2 * ti.math.pi
-            
+
             lod_i = ti.cast(ti.min(ti.max(lod, 0.0), ti.cast(num_mip_levels - 1, ti.f32)), ti.i32)
-            
+
             # 根据 lod 计算实际纹理尺寸
             tex_w_lod = ti.cast(dtex_w, ti.f32) / ti.pow(2.0, ti.cast(lod_i, ti.f32))
             tex_h_lod = ti.cast(dtex_h, ti.f32) / ti.pow(2.0, ti.cast(lod_i, ti.f32))
-            
+
             u = phi / (2 * ti.math.pi) * tex_w_lod
             v = (r - r_inner) / (r_outer - r_inner) * tex_h_lod
-            
+
             u0 = ti.cast(ti.floor(u), ti.i32)
             v0 = ti.cast(ti.floor(v), ti.i32)
             fu = u - ti.cast(u0, ti.f32)
@@ -1032,15 +1032,15 @@ class TaichiRenderer:
                         hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
                         hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
                         hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
-                        
+
                         # 记录击中时的微分位置（用于计算纹理梯度）
                         hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
-                        
+
                         if r_outer >= hit_r >= r_inner:
                             hit_z = hit_y * ti.tan(tilt_rad)
                             hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
                             ray_to_cam = -dir_
-                            
+
                             # 根据抗锯齿模式选择采样方式
                             disk_rgba = ti.Vector([0.0, 0.0, 0.0, 0.0])
                             if anti_alias_mode == 0:
@@ -1051,25 +1051,25 @@ class TaichiRenderer:
                                 # 计算击中点处的纹理坐标梯度
                                 # 纹理坐标: u = phi/(2pi) * dtex_w, v = (r-r_inner)/(r_outer-r_inner) * dtex_h
                                 hit_r_cyl = ti.sqrt(hit_x ** 2 + hit_y ** 2 + 1e-6)
-                                
+
                                 # du/dpixel_x 和 dv/dpixel_x
                                 # r 对 d_pos_dx 的导数
                                 dr_dx = (hit_x * hit_d_pos_dx[0] + hit_y * hit_d_pos_dx[1]) / hit_r_cyl
                                 # phi 对 d_pos_dx 的导数
                                 dphi_dx = (-hit_y * hit_d_pos_dx[0] + hit_x * hit_d_pos_dx[1]) / (hit_r_cyl ** 2 + 1e-6)
-                                
+
                                 # 纹理坐标梯度
                                 dudx = dphi_dx * dtex_w / (2.0 * ti.math.pi)
                                 dvdx = dr_dx * dtex_h / (r_outer - r_inner)
-                                
+
                                 # 计算梯度幅值用于 LOD
                                 # LOD = log2(grad_sq) * strength，grad_sq > 1 表示纹理变化超过 1 像素
                                 grad_sq = dudx * dudx + dvdx * dvdx
                                 lod_diff = ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
                                 lod_diff = ti.min(ti.max(lod_diff, 0.0), 3.0)
-                                
+
                                 disk_rgba = sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod_diff)
-                            
+
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
                             base_alpha = ti.min(disk_rgba[3], 0.999)
                             disk_alpha = 1.0 - ti.pow(1.0 - base_alpha, alpha_gain)
@@ -1123,18 +1123,18 @@ class TaichiRenderer:
                 weight_r = 0.0
                 weight_g = 0.0
                 weight_b = 0.0
-                
+
                 dx = -kernel_radius
                 while dx <= kernel_radius:
                     ni = i + dx
                     if 0 <= ni < w:
                         dist_sq = ti.cast(dx * dx, ti.f32)
                         col = bright_field[ni, j]
-                        
+
                         w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
                         w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
                         w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
-                        
+
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
                         sum_b += col[2] * w_b
@@ -1142,16 +1142,16 @@ class TaichiRenderer:
                         weight_g += w_g
                         weight_b += w_b
                     dx += 1
-                
+
                 if weight_r > 0.0:
                     blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
                 else:
                     blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
-            
+
             # 复制回 bright_field
             for i, j in bright_field:
                 bright_field[i, j] = blur_field[i, j]
-            
+
             # 垂直方向模糊（sigma 按 sigma_scale 缩放）
             for i, j in blur_field:
                 sum_r = 0.0
@@ -1160,18 +1160,18 @@ class TaichiRenderer:
                 weight_r = 0.0
                 weight_g = 0.0
                 weight_b = 0.0
-                
+
                 dy = -kernel_radius
                 while dy <= kernel_radius:
                     nj = j + dy
                     if 0 <= nj < h:
                         dist_sq = ti.cast(dy * dy, ti.f32)
                         col = bright_field[i, nj]
-                        
+
                         w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
                         w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
                         w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
-                        
+
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
                         sum_b += col[2] * w_b
@@ -1179,7 +1179,7 @@ class TaichiRenderer:
                         weight_g += w_g
                         weight_b += w_b
                     dy += 1
-                
+
                 if weight_r > 0.0:
                     blur_field[i, j] = ti.Vector([sum_r / weight_r, sum_g / weight_g, sum_b / weight_b])
                 else:
@@ -1286,50 +1286,50 @@ class TaichiRenderer:
         disk = self.disk_layer_field.to_numpy()
         disk_bloom = self.blur_field.to_numpy()
         final = np.clip(img + disk + disk_bloom, 0, 1)
-        
+
         # Lens flare（CPU 实现）
         if self.lens_flare:
             final = self._apply_lens_flare(final, disk)
         return final.transpose(1, 0, 2)
-    
+
     def _apply_lens_flare(self, final, disk):
         """应用 lens flare 效果，final 和 disk 都是 (width, height, 3)"""
         w, h, _ = final.shape
-        
+
         # 找吸积盘亮度中心
         disk_brightness = np.max(disk, axis=2)  # shape: (w, h)
         total_brightness = np.sum(disk_brightness)
         if total_brightness < 0.01:
             return final
-        
+
         x_coords, y_coords = np.mgrid[0:w, 0:h]  # shape: (w, h)
         light_x = np.sum(x_coords * disk_brightness) / total_brightness
         light_y = np.sum(y_coords * disk_brightness) / total_brightness
         screen_cx, screen_cy = w / 2, h / 2
-        
+
         intensity = min(total_brightness / (w * h * 0.3), 1.0) * 1.5
-        
+
         flare = np.zeros((w, h, 3), dtype=np.float32)
-        
+
         # 多个 ghost 光斑
         for g in range(8):
             t = (g + 1) * 0.15
             ghost_x = light_x + (screen_cx - light_x) * t
             ghost_y = light_y + (screen_cy - light_y) * t
             ghost_size = 25 + g * 30
-            
+
             dx = x_coords - ghost_x
             dy = y_coords - ghost_y
             dist = np.sqrt(dx**2 + dy**2)
-            
+
             mask = dist < ghost_size
             alpha = np.zeros((w, h), dtype=np.float32)
             alpha[mask] = (1 - dist[mask] / ghost_size) ** 2 * (1 - g * 0.08) * intensity
-            
+
             ghost_color = np.array([1.0, 0.9, 0.7])
             for c in range(3):
                 flare[:, :, c] += alpha * ghost_color[c]
-        
+
         # 多层环形光环（光圈衍射效果）
         for ring_idx in range(3):
             ring_t = 0.35 + ring_idx * 0.15
@@ -1337,13 +1337,13 @@ class TaichiRenderer:
             ring_y = light_y + (screen_cy - light_y) * ring_t
             ring_r = 60 + ring_idx * 40
             ring_w = 6 + ring_idx * 3
-            
+
             dx = x_coords - ring_x
             dy = y_coords - ring_y
             dist = np.sqrt(dx**2 + dy**2)
             ring_dist = np.abs(dist - ring_r)
             ring_alpha = np.clip(1 - ring_dist / ring_w, 0, 1) ** 2 * 0.5 * intensity * (1 - ring_idx * 0.25)
-            
+
             # 环的颜色略有差异，模拟色散
             ring_colors = [
                 np.array([0.3, 0.4, 1.0]),   # 内环偏蓝
@@ -1352,47 +1352,47 @@ class TaichiRenderer:
             ]
             for c in range(3):
                 flare[:, :, c] += ring_alpha * ring_colors[ring_idx][c]
-        
+
         # 六边形光环（光圈叶片效果）
         hex_t = 0.5
         hex_x = light_x + (screen_cx - light_x) * hex_t
         hex_y = light_y + (screen_cy - light_y) * hex_t
         hex_r = 100
-        
+
         dx = x_coords - hex_x
         dy = y_coords - hex_y
         angle = np.arctan2(dy, dx)
         dist = np.sqrt(dx**2 + dy**2)
-        
+
         # 六边形边缘检测
         hex_edge = np.abs(np.mod(angle, np.pi/3) - np.pi/6)
         hex_factor = np.clip(1 - hex_edge / 0.2, 0, 1)
         ring_dist = np.abs(dist - hex_r)
         ring_alpha = np.clip(1 - ring_dist / 15, 0, 1) ** 2 * hex_factor * 0.3 * intensity
-        
+
         hex_color = np.array([0.6, 0.7, 1.0])
         for c in range(3):
             flare[:, :, c] += ring_alpha * hex_color[c]
-        
+
         # 横向光斑条纹（星芒效果）
         streak_len = min(w, h) * 0.4
         streak_alpha = intensity * 0.3
-        
+
         dx = x_coords - light_x
         dy = y_coords - light_y
         dist = np.sqrt(dx**2 + dy**2)
         angle = np.arctan2(dy, dx)
-        
+
         # 4 条主星芒
         for main_angle in [0, np.pi/2, np.pi, 3*np.pi/2]:
             angle_diff = np.abs(np.mod(angle - main_angle + np.pi, 2*np.pi) - np.pi)
             streak_mask = angle_diff < 0.05
             falloff = np.exp(-dist / streak_len)
-            
+
             streak_color = np.array([1.0, 0.95, 0.9])
             for c in range(3):
                 flare[:, :, c] += np.where(streak_mask, falloff * streak_alpha * streak_color[c], 0)
-        
+
         return np.clip(final + flare, 0, 1)
 
 
@@ -1539,12 +1539,13 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         frame_path = os.path.join(temp_dir, f"frame_{frame:04d}.png")
         img = iio.imread(frame_path)
         writer.write_frame(img)
-        os.remove(frame_path)
-
-    writer.close()
+        ## 逐帧写入后删除临时文件以节省空间
+        #os.remove(frame_path)
 
     if os.path.exists(progress_file):
         os.remove(progress_file)
+    print(f"\n提示：如果视频有摩尔纹，可手动用 ffmpeg 重新编码更高质量：")
+    print(f"  ffmpeg -framerate {fps} -i {temp_dir}/frame_%04d.png -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p {output_path}")
     import shutil
     shutil.rmtree(temp_dir)
     print(f"Video saved: {output_path}")
