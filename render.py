@@ -941,9 +941,11 @@ class TaichiRenderer:
                 L2_val = dir_.cross(pos).norm() ** 2
 
                 # Ray differentials（x 方向）
-                # 初始偏移：像素 x 增加 1，方向偏移 cam_right * pixel_width
+                # 更精确：计算相邻像素的方向差
+                pixel_pos_x1 = tl + (px_f + 1.5) * pw * cr - (py_f + 0.5) * ph * cu
+                ray_dir_x1 = (pixel_pos_x1 - cp).normalized()
                 d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
-                d_dir_dx = cr * pw
+                d_dir_dx = ray_dir_x1 - ray_dir
 
                 escaped = False
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
@@ -1032,7 +1034,6 @@ class TaichiRenderer:
                         hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
                         
                         # 记录击中时的微分位置（用于计算纹理梯度）
-                        hit_d_pos_dx = old_pos + t_frac * (new_pos - old_pos)
                         hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
                         
                         if r_outer >= hit_r >= r_inner:
@@ -1062,9 +1063,9 @@ class TaichiRenderer:
                                 dvdx = dr_dx * dtex_h / (r_outer - r_inner)
                                 
                                 # 计算梯度幅值用于 LOD
+                                # LOD = log2(grad_sq) * strength，grad_sq > 1 表示纹理变化超过 1 像素
                                 grad_sq = dudx * dudx + dvdx * dvdx
-                                # LOD = log2(grad) * strength，限制在 0-3
-                                lod_diff = 0.5 * ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
+                                lod_diff = ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
                                 lod_diff = ti.min(ti.max(lod_diff, 0.0), 3.0)
                                 
                                 disk_rgba = sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod_diff)

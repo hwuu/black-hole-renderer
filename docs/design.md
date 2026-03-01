@@ -501,7 +501,7 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
 ```
 1. 光线初始化时，同时初始化微分状态：
    - d_pos_dx: 位置对屏幕 x 的导数（初始为 0）
-   - d_dir_dx: 方向对屏幕 x 的导数（初始为 cam_right * pixel_width）
+   - d_dir_dx: 相邻像素方向差 = ray_dir(x+1) - ray_dir(x)（精确计算）
 
 2. RK4 积分时同步追踪微分光线：
    - 主光线: pos, dir_
@@ -519,8 +519,10 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
 
 4. 根据梯度幅值选择 LOD：
    grad_sq = dudx² + dvdx²
-   LOD = log₂(grad) * strength
+   LOD = log₂(grad_sq) * strength
    LOD = clamp(LOD, 0, 3)
+   
+   说明：当 grad_sq > 1 时，纹理变化超过 1 像素，需要更高 LOD
 
 5. 从 mipmap 金字塔采样对应层级
 ```
