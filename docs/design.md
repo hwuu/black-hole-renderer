@@ -477,6 +477,71 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
 
 正值表示前端翘起，负值表示后端翘起。
 
+### 6.7 摩尔纹（Aliasing）问题 ✅
+
+#### 问题描述
+
+摩尔纹（Moire pattern）是黑洞吸积盘渲染中的**经典问题**，本质是**高频周期性纹理在极端引力透镜压缩下的欠采样混叠**。
+
+吸积盘远端被黑洞引力场压缩到接近事件视界的薄环中，纹理频率远超像素奈奎斯特极限，导致高频信号失真。
+
+#### 技术方案对比
+
+| 方案 | 描述 | 优点 | 缺点 |
+|------|------|------|------|
+| **Ray Differentials** | 追踪光线微分，计算纹理梯度，动态选择 LOD | 物理正确，效果最好 | 计算量大（约 3x） |
+| **自适应超采样** | 高频区域增加采样密度 | 质量高 | 需要 TAA 累积多帧 |
+| **预过滤纹理** | 纹理生成时预模糊高频区域 | 简单快速 | 物理上不准确 |
+| **改变纹理设计** | 避免纯周期性纹理 | 根治 | 需要重新设计纹理 |
+
+本项目采用 **Ray Differentials** 方案，参考《星际穿越》渲染团队（DNEG）的实现。
+
+#### 实现细节
+
+```
+1. 光线初始化时，同时初始化微分状态：
+   - d_pos_dx: 位置对屏幕 x 的导数（初始为 0）
+   - d_dir_dx: 方向对屏幕 x 的导数（初始为 cam_right * pixel_width）
+
+2. RK4 积分时同步追踪微分光线：
+   - 主光线: pos, dir_
+   - 微分光线: d_pos_dx, d_dir_dx
+   
+   微分光线的加速度需要计算雅可比矩阵：
+   d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
+
+3. 击中吸积盘时计算纹理梯度：
+   dr/dpixel = (hit_x * d_pos_dx[0] + hit_y * d_pos_dx[1]) / r
+   dphi/dpixel = (-hit_y * d_pos_dx[0] + hit_x * d_pos_dx[1]) / r²
+   
+   dudx = dphi * dtex_w / (2π)
+   dvdx = dr * dtex_h / (r_outer - r_inner)
+
+4. 根据梯度幅值选择 LOD：
+   grad_sq = dudx² + dvdx²
+   LOD = log₂(grad) * strength
+   LOD = clamp(LOD, 0, 3)
+
+5. 从 mipmap 金字塔采样对应层级
+```
+
+**Mipmap 生成**：
+```
+base_tex → 2x2 avg → level 1 → 2x2 avg → level 2 → ...
+```
+
+**参数**：
+| 参数 | 默认值 | CLI | 说明 |
+|------|--------|-----|------|
+| anti_alias | disabled | `--anti_alias` | 算法开关：disabled/lod_radius |
+| aa_strength | 1.0 | `--aa_strength` | 抗锯齿强度，>1 更模糊 |
+
+#### 效果
+
+- 有效减少远端吸积盘的摩尔纹
+- 强度可调，适应不同分辨率
+- 性能开销约 1.5x
+
 ---
 
 ## 7. 参考资料
@@ -488,7 +553,7 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.2):
 
 ---
 
-- v5.14 (2026-03-01): Bloom 蓝色光晕增强（σ² 从 200 增大到 1600），卷积范围和 sigma 按输出分辨率动态缩放
+- v5.15 (2026-03-01): 新增抗锯齿功能（Ray Differentials + Mipmap LOD），添加 --anti_alias 和 --aa_strength 参数
 - v5.13 (2026-03-01): 修正多普勒效应和悬臂方向；盘旋转改为顺时针（v_hat = r_hat × n）；颜色调整为蓝移偏红、红移偏蓝
 - v5.12 (2026-02-28): 新增 lens flare 效果（ghost 光斑、多层环形、六边形光环、星芒，默认关闭，--lens_flare 开启）；Bloom 优化为分离式 1D 卷积，性能提升 18 倍
 - v5.11 (2026-02-28): Bloom 加入色散效果（RGB 三通道不同高斯半径），模拟真实镜头的蓝紫边缘光晕

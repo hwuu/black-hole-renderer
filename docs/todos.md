@@ -40,3 +40,16 @@ for i in range(n_ghosts):
 
 ### 优先级
 中 — 视觉提升明显，但需跑性能测试
+
+---
+
+## 代码重构：统一 TaichiRenderer 调用
+
+### 背景
+- `render_taichi()` 函数封装了 `TaichiRenderer` 的创建和渲染
+- `render_video()` 直接使用 `TaichiRenderer`，代码重复
+- 新增参数（如 `anti_alias`, `aa_strength`）需要在两处都添加
+
+### 任务
+- 合并 `render_video()` 中的 `TaichiRenderer` 创建逻辑
+- 让 `render_video()` 也使用 `render_taichi()` 或统一的封装函数

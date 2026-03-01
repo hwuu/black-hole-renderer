@@ -446,6 +446,21 @@ def _blend_azimuthal_seam(tex, seam_width=64):
     return tex_blended
 
 
+def generate_disk_mipmaps(base_tex, levels=4):
+    """生成吸积盘纹理的 mipmap 金字塔"""
+    mips = [base_tex.copy()]
+    for _ in range(levels):
+        h, w = mips[-1].shape[:2]
+        if h < 2 or w < 2:
+            break
+        new_h, new_w = h // 2, w // 2
+        down = np.zeros((new_h, new_w, 4), dtype=np.float32)
+        down = (mips[-1][0::2, 0::2] + mips[-1][1::2, 0::2] +
+                mips[-1][0::2, 1::2] + mips[-1][1::2, 1::2]) / 4.0
+        mips.append(down.astype(np.float32))
+    return mips
+
+
 def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5):
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
@@ -620,7 +635,9 @@ class TaichiRenderer:
                  r_disk_inner=R_DISK_INNER_DEFAULT,
                  r_disk_outer=R_DISK_OUTER_DEFAULT,
                  disk_tilt=0.0,
-                 lens_flare=False):
+                 lens_flare=False,
+                 anti_alias="disabled",
+                 aa_strength=1.0):
         import taichi as ti
         self.ti = ti
         self.width = width
@@ -631,6 +648,8 @@ class TaichiRenderer:
         self.r_disk_outer = r_disk_outer
         self.disk_tilt = disk_tilt
         self.lens_flare = lens_flare
+        self.anti_alias = anti_alias
+        self.aa_strength = aa_strength
 
         ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, offline_cache=False)
 
@@ -646,6 +665,22 @@ class TaichiRenderer:
 
         self.disk_texture_field = ti.Vector.field(4, dtype=ti.f32, shape=(dtex_h, dtex_w))
         self.disk_texture_field.from_numpy(disk_tex)
+
+        # Mipmap 纹理（始终生成，用于抗锯齿）
+        mips = generate_disk_mipmaps(disk_tex, levels=4)
+        self.num_mip_levels = len(mips)
+        # 所有 mipmap 填充到相同尺寸
+        max_h = max(m.shape[0] for m in mips)
+        max_w = max(m.shape[1] for m in mips)
+        self.disk_mips_field = ti.Vector.field(4, dtype=ti.f32, shape=(self.num_mip_levels, max_h, max_w))
+        # 逐级填充
+        for i, m in enumerate(mips):
+            h, w = m.shape[:2]
+            temp_field = ti.Vector.field(4, dtype=ti.f32, shape=(h, w))
+            temp_field.from_numpy(m)
+            for y in range(h):
+                for x in range(w):
+                    self.disk_mips_field[i, y, x] = temp_field[y, x]
 
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.disk_layer_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
@@ -670,6 +705,10 @@ class TaichiRenderer:
         dtex_w, dtex_h = self.dtex_w, self.dtex_h
         texture_field = self.texture_field
         disk_texture_field = self.disk_texture_field
+        disk_mips_field = self.disk_mips_field
+        num_mip_levels = self.num_mip_levels
+        anti_alias_mode = 0 if self.anti_alias == "disabled" else 1
+        aa_strength = self.aa_strength
 
         g_cap = ti.cast(G_FACTOR_CAP, ti.f32)
         lum_power = ti.cast(G_LUMINOSITY_POWER, ti.f32)
@@ -756,6 +795,20 @@ class TaichiRenderer:
             return -1.5 * L2 / r5 * pos
 
         @ti.func
+        def compute_acc_jacobian(pos, d_pos, L2):
+            """计算加速度对位置的偏导数作用在 d_pos 上
+            acc = -1.5 * L2 / r^5 * pos
+            d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
+            """
+            r2 = pos.dot(pos)
+            r = ti.sqrt(r2)
+            r5 = r2 * r2 * r
+            r7 = r5 * r2
+            factor = -1.5 * L2 / r5
+            proj = pos.dot(d_pos) / r2
+            return factor * (d_pos - 5.0 * pos * proj)
+
+        @ti.func
         def sample_skybox(d):
             x, y, z = d[0], d[1], d[2]
             theta = ti.acos(ti.min(ti.max(z, -1.0), 1.0))
@@ -811,6 +864,44 @@ class TaichiRenderer:
                     c01 * (1 - fu) * fv +
                     c11 * fu * fv)
 
+        @ti.func
+        def sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod):
+            """带 mipmap 的纹理采样"""
+            r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
+            phi = ti.atan2(hit_y, hit_x)
+            omega = ti.sqrt(0.5 / (r + 0.01))
+            phi = phi + t_offset * omega
+            while phi < 0:
+                phi += 2 * ti.math.pi
+            while phi >= 2 * ti.math.pi:
+                phi -= 2 * ti.math.pi
+            
+            lod_i = ti.cast(ti.min(ti.max(lod, 0.0), ti.cast(num_mip_levels - 1, ti.f32)), ti.i32)
+            
+            # 根据 lod 计算实际纹理尺寸
+            tex_w_lod = ti.cast(dtex_w, ti.f32) / ti.pow(2.0, ti.cast(lod_i, ti.f32))
+            tex_h_lod = ti.cast(dtex_h, ti.f32) / ti.pow(2.0, ti.cast(lod_i, ti.f32))
+            
+            u = phi / (2 * ti.math.pi) * tex_w_lod
+            v = (r - r_inner) / (r_outer - r_inner) * tex_h_lod
+            
+            u0 = ti.cast(ti.floor(u), ti.i32)
+            v0 = ti.cast(ti.floor(v), ti.i32)
+            fu = u - ti.cast(u0, ti.f32)
+            fv = v - ti.cast(v0, ti.f32)
+            u0_w = ti.cast(u0 % ti.cast(tex_w_lod, ti.i32), ti.i32)
+            u1_w = ti.cast((u0 + 1) % ti.cast(tex_w_lod, ti.i32), ti.i32)
+            v0_h = ti.min(ti.max(v0, 0), ti.cast(tex_h_lod - 1, ti.i32))
+            v1_h = ti.min(ti.max(v0 + 1, 0), ti.cast(tex_h_lod - 1, ti.i32))
+            c00 = disk_mips_field[lod_i, v0_h, u0_w]
+            c10 = disk_mips_field[lod_i, v0_h, u1_w]
+            c01 = disk_mips_field[lod_i, v1_h, u0_w]
+            c11 = disk_mips_field[lod_i, v1_h, u1_w]
+            return (c00 * (1 - fu) * (1 - fv) +
+                    c10 * fu * (1 - fv) +
+                    c01 * (1 - fu) * fv +
+                    c11 * fu * fv)
+
         @ti.kernel
         def render_kernel(image_field: ti.template(), disk_layer_field: ti.template(),
                           cam_pos_field: ti.template(), cam_right_field: ti.template(),
@@ -849,6 +940,11 @@ class TaichiRenderer:
                 dir_ = ray_dir
                 L2_val = dir_.cross(pos).norm() ** 2
 
+                # Ray differentials（x 方向）
+                # 初始偏移：像素 x 增加 1，方向偏移 cam_right * pixel_width
+                d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
+                d_dir_dx = cr * pw
+
                 escaped = False
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
                 event_horizon_hit = False
@@ -856,6 +952,8 @@ class TaichiRenderer:
                 disk_alpha_total = 0.0
                 step_count = 0
                 affine = 0.0
+                # 记录击中时的微分状态
+                hit_d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
 
                 while step_count < max_iter:
                     old_pos = pos
@@ -874,6 +972,7 @@ class TaichiRenderer:
                         dt_fac = max_fac
                     h = h_base * dt_fac
 
+                    # 主光线 RK4
                     k1p = h * dir_
                     k1d = h * compute_acceleration(pos, L2_val)
                     k2p = h * (dir_ + 0.5 * k1d)
@@ -885,6 +984,19 @@ class TaichiRenderer:
 
                     new_pos = pos + (k1p + 2 * k2p + 2 * k3p + k4p) / 6
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6
+
+                    # 微分光线 RK4（同步更新）
+                    k1p_dx = h * d_dir_dx
+                    k1d_dx = h * compute_acc_jacobian(pos, d_pos_dx, L2_val)
+                    k2p_dx = h * (d_dir_dx + 0.5 * k1d_dx)
+                    k2d_dx = h * compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dx + 0.5 * k1p_dx, L2_val)
+                    k3p_dx = h * (d_dir_dx + 0.5 * k2d_dx)
+                    k3d_dx = h * compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dx + 0.5 * k2p_dx, L2_val)
+                    k4p_dx = h * (d_dir_dx + k3d_dx)
+                    k4d_dx = h * compute_acc_jacobian(pos + k3p, d_pos_dx + k3p_dx, L2_val)
+
+                    new_d_pos_dx = d_pos_dx + (k1p_dx + 2 * k2p_dx + 2 * k3p_dx + k4p_dx) / 6
+                    new_d_dir_dx = d_dir_dx + (k1d_dx + 2 * k2d_dx + 2 * k3d_dx + k4d_dx) / 6
 
                     r = new_pos.norm()
                     affine += h
@@ -901,6 +1013,10 @@ class TaichiRenderer:
                         escape_dir = new_dir.normalized()
                         break
 
+                    # 更新微分光线状态
+                    d_pos_dx = new_d_pos_dx
+                    d_dir_dx = new_d_dir_dx
+
                     new_z = new_pos[2]
                     new_y = new_pos[1]
 
@@ -914,15 +1030,49 @@ class TaichiRenderer:
                         hit_x = old_pos[0] + t_frac * (new_pos[0] - old_pos[0])
                         hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
                         hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
+                        
+                        # 记录击中时的微分位置（用于计算纹理梯度）
+                        hit_d_pos_dx = old_pos + t_frac * (new_pos - old_pos)
+                        hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
+                        
                         if r_outer >= hit_r >= r_inner:
-                            disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
+                            hit_z = hit_y * ti.tan(tilt_rad)
+                            hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
+                            ray_to_cam = -dir_
+                            
+                            # 根据抗锯齿模式选择采样方式
+                            disk_rgba = ti.Vector([0.0, 0.0, 0.0, 0.0])
+                            if anti_alias_mode == 0:
+                                # disabled: 直接采样
+                                disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
+                            else:
+                                # ray_differentials: 根据光线微分计算纹理梯度
+                                # 计算击中点处的纹理坐标梯度
+                                # 纹理坐标: u = phi/(2pi) * dtex_w, v = (r-r_inner)/(r_outer-r_inner) * dtex_h
+                                hit_r_cyl = ti.sqrt(hit_x ** 2 + hit_y ** 2 + 1e-6)
+                                
+                                # du/dpixel_x 和 dv/dpixel_x
+                                # r 对 d_pos_dx 的导数
+                                dr_dx = (hit_x * hit_d_pos_dx[0] + hit_y * hit_d_pos_dx[1]) / hit_r_cyl
+                                # phi 对 d_pos_dx 的导数
+                                dphi_dx = (-hit_y * hit_d_pos_dx[0] + hit_x * hit_d_pos_dx[1]) / (hit_r_cyl ** 2 + 1e-6)
+                                
+                                # 纹理坐标梯度
+                                dudx = dphi_dx * dtex_w / (2.0 * ti.math.pi)
+                                dvdx = dr_dx * dtex_h / (r_outer - r_inner)
+                                
+                                # 计算梯度幅值用于 LOD
+                                grad_sq = dudx * dudx + dvdx * dvdx
+                                # LOD = log2(grad) * strength，限制在 0-3
+                                lod_diff = 0.5 * ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
+                                lod_diff = ti.min(ti.max(lod_diff, 0.0), 3.0)
+                                
+                                disk_rgba = sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod_diff)
+                            
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
                             base_alpha = ti.min(disk_rgba[3], 0.999)
                             disk_alpha = 1.0 - ti.pow(1.0 - base_alpha, alpha_gain)
 
-                            hit_z = hit_y * ti.tan(tilt_rad)
-                            hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
-                            ray_to_cam = -dir_
                             col_shifted = apply_g_factor(
                                 disk_col, hit_pos_vec, hit_r, ray_to_cam, cp, r_inner, r_outer, tilt_rad
                             )
@@ -1249,7 +1399,7 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
                   n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
                   r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
-                  lens_flare=False):
+                  lens_flare=False, anti_alias="disabled", aa_strength=1.0):
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
@@ -1263,7 +1413,9 @@ def render_taichi(width, height, cam_pos, fov, step_size, skybox_path=None,
         step_size=step_size, r_max=r_max, device=device,
         r_disk_inner=r_disk_inner, r_disk_outer=r_disk_outer,
         disk_tilt=disk_tilt,
-        lens_flare=lens_flare
+        lens_flare=lens_flare,
+        anti_alias=anti_alias,
+        aa_strength=aa_strength
     )
 
     t0 = time.time()
@@ -1426,6 +1578,11 @@ def parse_args():
                         help="吸积盘倾角 (度, default: 0)")
     parser.add_argument("--lens_flare", action="store_true",
                         help="启用 lens flare 效果 (default: 关闭)")
+    parser.add_argument("--anti_alias", type=str, default="disabled",
+                        choices=["disabled", "lod_radius"],
+                        help="抗锯齿算法: disabled(关闭), lod_radius(基于半径的启发式LOD) (default: disabled)")
+    parser.add_argument("--aa_strength", type=float, default=1.0,
+                        help="抗锯齿强度，乘以 LOD 值。>1 更模糊(更强抗锯齿)，<1 更清晰。范围 0.5-2.0 (default: 1.0)")
     parser.add_argument("--device", "-d", type=str, default="cpu",
                         choices=["cpu", "gpu"],
                         help="Taichi 设备: cpu 或 gpu (default: cpu)")
@@ -1460,7 +1617,9 @@ if __name__ == "__main__":
             step_size=args.step_size, r_max=args.r_max, device=args.device,
             r_disk_inner=args.ar1, r_disk_outer=args.ar2,
             disk_tilt=args.disk_tilt,
-            lens_flare=args.lens_flare
+            lens_flare=args.lens_flare,
+            anti_alias=args.anti_alias,
+            aa_strength=args.aa_strength
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
@@ -1490,5 +1649,7 @@ if __name__ == "__main__":
             r_disk_outer=args.ar2,
             disk_tilt=args.disk_tilt,
             lens_flare=args.lens_flare,
+            anti_alias=args.anti_alias,
+            aa_strength=args.aa_strength,
         )
         save_image(img, args.output)
