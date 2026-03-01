@@ -33,7 +33,7 @@ EPS = 1e-6
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
 G_FACTOR_CAP = 6
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
-G_LUMINOSITY_POWER = 6
+G_LUMINOSITY_POWER = 3
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
 G_BRIGHTNESS_GAIN = 0.6
 
@@ -42,10 +42,10 @@ G_BRIGHTNESS_GAIN = 0.6
 DISK_ALPHA_GAIN = 1.5
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
 DISK_BASE_TINT = (1.1, 0.92, 0.75)
-# DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3，此处默认 12 便于放大对比）
+# DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
 DISK_RADIAL_BRIGHTNESS_POWER = 3
 # 半径亮度增益的下限/上限，避免指数爆炸
-DISK_RADIAL_BRIGHTNESS_MIN = 0.2
+DISK_RADIAL_BRIGHTNESS_MIN = 0.4
 DISK_RADIAL_BRIGHTNESS_MAX = 16.0
 
 # ============================================================================
@@ -461,11 +461,12 @@ def generate_disk_mipmaps(base_tex, levels=4):
     return mips
 
 
-def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5):
+def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True):
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
     - n_phi: 角度方向分辨率（对应 0-2π）
     - n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
+    - enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
     返回 (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
     """
     rng = np.random.default_rng(seed)
@@ -475,6 +476,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
 
     r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
+    disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
 
     # ----- 温度剖面（Novikov-Thorne power law）-----
     T = (1 - np.sqrt(r_inner / np.maximum(r_vals, r_inner + 1e-3))) ** 0.25
@@ -486,8 +488,8 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     temperature_field = np.clip(T * (0.8 + 0.3 * temp_noise), 0, 1)
 
     # ----- 密度场 -----
-    # 1) 大尺度螺旋臂（8-15条，2-3条从中心开始，其余从随机位置开始，每条2-5圈）
-    n_arms = rng.integers(8, 16)
+    # 1) 螺旋臂（2-4条，物理上吸积盘的旋臂是瞬态的，持续数天-数年，1-3条更符合物理）
+    n_arms = rng.integers(2, 5)
     n_from_center = rng.integers(2, 4)
     spiral = np.zeros((n_r, n_phi), dtype=np.float32)
 
@@ -508,9 +510,9 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
                 base_angle = (base_angle + 0.5) % (2 * np.pi)
         used_angles.append(base_angle)
 
-        rotations = rng.uniform(2.0, 5.0)
-        base_width = rng.uniform(0.1, 0.2)
-        intensity = rng.uniform(0.6, 1.0)
+        rotations = rng.uniform(2.5, 5.0)
+        base_width = rng.uniform(0.2, 0.4)
+        intensity = rng.uniform(0.5, 0.9)
 
         r_length = rotations / 6.0 * (1.0 - r_start)
         r_length = min(r_length, 1.0 - r_start)
@@ -528,8 +530,12 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         mask = (r_norm_grid >= r_start) & (r_norm_grid <= r_end)
         arm_val = np.where(mask, arm_val, 0)
 
-        # 强度随噪声变化（断断续续）
-        intensity_mod = 0.3 + 0.7 * (arm_noise ** 0.5)
+        # 强度随噪声变化（断断续续，模拟吸积盘旋臂的瞬态和不稳定特性）
+        intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.2)
+        # 额外的高频破碎：在某些位置完全断开，增加破碎感
+        break_noise = _tileable_noise((n_r, n_phi), rng, freq_u=12, freq_v=6)
+        break_mask = break_noise > 0.5
+        intensity_mod = np.where(break_mask, intensity_mod * 0.05, intensity_mod)
 
         fade_in = np.clip((r_norm_grid - r_start) / 0.08, 0, 1)
         fade_out = np.clip((r_end - r_norm_grid) / 0.08, 0, 1)
@@ -539,18 +545,24 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
     spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
 
-    # 2) 高频云雾（不用 FBM，直接高频）
-    turbulence = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
+    # 2) 云雾（FBM 生成更细致的团块结构）
+    turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
+    turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
+    turbulence_fine = _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40)
+    turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
+    turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
+    turbulence = 0.1 * turbulence_coarse + 0.2 * turbulence_mid + 0.3 * turbulence_fine + 0.25 * turbulence_extra + 0.15 * turbulence_ultra
 
-    # 3) 角方向弧形结构（破碎结构）- 沿 phi 方向的弧
-    arc_count = rng.integers(10, 25)
+    # 3) Filaments（细丝）- 模拟 Kelvin-Helmholtz 不稳定性，内圈更密集更短，外圈更长更稀疏
+    arc_count = int(rng.uniform(40, 80) * disk_area)
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
     for _ in range(arc_count):
         arc_phi_start = rng.uniform(0, 2 * np.pi)
-        arc_phi_length = rng.uniform(0.15, 0.4)
-        arc_r = rng.uniform(0.1, 0.9)
-        arc_r_width = rng.uniform(0.015, 0.04)
-        arc_intensity = rng.uniform(0.4, 1.0)
+        r_rand = rng.uniform(0, 1)
+        arc_r = 0.1 + r_rand ** 0.7 * 0.85
+        arc_phi_length = 0.15 + (1 - arc_r) * 0.3 + rng.uniform(0, 0.2)
+        arc_r_width = 0.001 + (1 - arc_r) * 0.004 + rng.uniform(0, 0.002)
+        arc_intensity = 0.4 + (1 - arc_r) * 0.4 + rng.uniform(0, 0.2)
 
         arc_kappa = 1.0 / (arc_phi_length ** 2) * 1.5
 
@@ -563,15 +575,40 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         arcs += arc_val
     arcs = np.clip(arcs, 0, 1)
 
-    # 4) 多个温度热点（弧形，高斯径向）
-    hotspot_count = rng.integers(15, 35)
+    # 5) Rayleigh-Taylor 不稳定性（ISCO 附近的尖峰和团块）
+    # RT 不稳定性发生在内边界，向外延伸产生"手指"状结构
+    rt_spikes = np.zeros((n_r, n_phi), dtype=np.float32)
+    rt_count = int(rng.uniform(12, 24) * disk_area * 0.5)
+    for _ in range(rt_count):
+        rt_phi = rng.uniform(0, 2 * np.pi)
+        rt_r_base = rng.uniform(0.01, 0.08)
+        rt_phi_width = rng.uniform(0.1, 0.25)
+        rt_r_length = rng.uniform(0.05, 0.15)
+        rt_intensity = rng.uniform(0.6, 1.0)
+
+        rt_phi_kappa = 1.0 / (rt_phi_width ** 2) * 1.5
+        rt_val = np.exp(rt_phi_kappa * (np.cos(phi_grid - rt_phi) - 1))
+
+        rt_r_diff = r_norm_grid - rt_r_base
+        r_fade_out = np.clip(rt_r_length * 2 - rt_r_diff, 0, 1)
+        r_fade_in = np.clip((r_norm_grid - rt_r_base) / (rt_r_length * 0.3), 0, 1)
+        rt_r_profile = np.exp(-0.5 * (rt_r_diff / (rt_r_length * 0.4)) ** 2) * r_fade_out * r_fade_in
+
+        rt_val *= rt_r_profile * rt_intensity
+        rt_spikes += rt_val
+
+    rt_spikes = np.clip(rt_spikes, 0, 1)
+
+    # 4) 温度热点（内圈更密集更亮，模拟磁重联等活动）
+    hotspot_count = int(rng.uniform(25, 45) * disk_area)
     hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
     for _ in range(hotspot_count):
         h_phi = rng.uniform(0, 2 * np.pi)
-        h_r = rng.uniform(0.1, 0.9)
+        r_rand = rng.uniform(0, 1)
+        h_r = 0.1 + r_rand ** 0.6 * 0.85
         h_phi_width = rng.uniform(0.08, 0.2)
-        h_r_width = rng.uniform(0.01, 0.03)
-        h_intensity = rng.uniform(0.4, 1.0)
+        h_r_width = 0.005 + (1 - h_r) * 0.01 + rng.uniform(0, 0.005)
+        h_intensity = 0.3 + (1 - h_r) * 0.6 + rng.uniform(0, 0.1)
 
         h_kappa = 1.0 / (h_phi_width ** 2) * 1.5
 
@@ -588,7 +625,8 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     az_hotspot = np.clip(0.6 * az_wave + 0.4 * az_noise, 0, 1) ** 1.2
 
     # 组合密度
-    density = 0.1 + 0.3 * spiral + 0.3 * turbulence + 0.2 * hotspot + 0.1 * arcs
+    rt_weight = 0.15 if enable_rt else 0.0
+    density = 0.1 + 0.2 * spiral + 0.35 * turbulence + 0.15 * hotspot + 0.1 * arcs + rt_weight * rt_spikes
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -777,7 +815,7 @@ class TaichiRenderer:
             red_boost = 1.0 + 0.35 * ti.pow(neg_shift, 0.75)
             r_scale = ti.min(ti.max((1.0 + 0.6 * neg_shift - 0.25 * pos_shift) * red_boost, 0.25), 2.6)
             g_scale = ti.min(ti.max(1.0 - 0.1 * pos_shift - 0.05 * neg_shift, 0.5), 1.25)
-            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.15 * neg_shift, 0.3), 2.7)
+            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.25 * neg_shift, 0.3), 2.7)
 
             shifted = ti.Vector([
                 base_color[0] * r_scale,
@@ -1164,7 +1202,7 @@ class TaichiRenderer:
 
                         w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
                         w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
-                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (3000.0 * sigma_scale))
 
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
@@ -1573,12 +1611,12 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         ## 逐帧写入后删除临时文件以节省空间
         #os.remove(frame_path)
 
-    if os.path.exists(progress_file):
-        os.remove(progress_file)
+    #if os.path.exists(progress_file):
+    #    os.remove(progress_file)
     print(f"\n提示：如果视频有摩尔纹，可手动用 ffmpeg 重新编码更高质量：")
     print(f"  ffmpeg -framerate {fps} -i {temp_dir}/frame_%04d.png -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p {output_path}")
-    import shutil
-    shutil.rmtree(temp_dir)
+    #import shutil
+    #shutil.rmtree(temp_dir)
     print(f"Video saved: {output_path}")
 
 
