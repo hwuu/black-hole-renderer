@@ -1528,6 +1528,10 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
     print(f"\nAll frames rendered in {total_elapsed/60:.1f} min")
 
     print(f"Assembling video: {output_path} ({fps} fps, {n_frames/fps:.0f}s)...")
+    # 注意：如果需要更高质量的视频（减少摩尔纹），可以：
+    # 1. 使用 ffmpeg 直接编码：ffmpeg -framerate {fps} -i frame_%04d.png -c:v libx264 -crf 18 -preset slow output.mp4
+    # 2. 或安装 imageio-ffmpeg 并使用更高质量的编码参数
+    import imageio.v3 as iio
     writer = iio.imopen(output_path, "w", plugin="pyav")
     writer.init_video_stream("libx264", fps=fps)
 
@@ -1538,6 +1542,7 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         os.remove(frame_path)
 
     writer.close()
+
     if os.path.exists(progress_file):
         os.remove(progress_file)
     import shutil
