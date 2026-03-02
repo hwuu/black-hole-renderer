@@ -39,14 +39,36 @@ G_BRIGHTNESS_GAIN = 1.2
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
-DISK_ALPHA_GAIN = 1.5
+DISK_ALPHA_GAIN = 3
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
 DISK_BASE_TINT = (1.05, 0.95, 0.88)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 1
+DISK_RADIAL_BRIGHTNESS_POWER = 1.5
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.4
 DISK_RADIAL_BRIGHTNESS_MAX = 4.0
+# 吸积盘温度对比度（>1 更强调内热外冷）
+DISK_THERMAL_CONTRAST = 1.6
+# 吸积盘整体色温偏移：>1 更暖，<1 更冷
+DISK_TEMPERATURE_BIAS = 1.0
+
+# —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
+# 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
+SKY_STAR_BRIGHTNESS_MIN = 0.03
+# 恒星最高亮度，推荐 0.8~1.0（默认 1.0）
+SKY_STAR_BRIGHTNESS_MAX = 1.0
+# 亮度增益倍数，推荐 1.0~3.0（默认 1.8），整体提亮星点
+SKY_STAR_BRIGHTNESS_GAIN = 1.8
+# 颜色饱和度，推荐 0.0~1.0（默认 0.3），0=纯白 1=全黑体色
+SKY_STAR_COLOR_SATURATION = 0.3
+# 恒星高斯 blob 最小半径（像素），推荐 0.3~0.8（默认 0.5）
+SKY_STAR_SIZE_MIN = 0.5
+# 恒星高斯 blob 最大半径（像素），推荐 1.0~2.5（默认 1.7）
+SKY_STAR_SIZE_MAX = 1.7
+# 银河弥漫光强度，推荐 0.01~0.15（默认 0.10）
+SKY_MILKY_WAY_GLOW = 0.10
+# 银心额外增亮强度，推荐 0.01~0.10（默认 0.08）
+SKY_GALACTIC_CENTER_GLOW = 0.08
 
 # ============================================================================
 # 公共模块：相机
@@ -148,9 +170,29 @@ def make_all_rays(width, height, cam_pos, cam_right, cam_up, cam_forward, pixel_
 # 公共模块：天空盒
 # ============================================================================
 
+def _blackbody_rgb(T):
+    """色温(K) -> RGB，基于 Tanner Helland 近似"""
+    t = T / 100.0
+    r = np.where(t <= 66, 1.0,
+                 np.clip(1.292936 * np.power(np.maximum(t - 60, 1e-6),
+                         -0.1332047592), 0, 1))
+    g = np.where(t <= 66,
+                 np.clip(0.390082 * np.log(np.maximum(t, 1e-6)) - 0.631841, 0, 1),
+                 np.clip(1.129891 * np.power(np.maximum(t - 60, 1e-6),
+                         -0.0755148492), 0, 1))
+    b = np.where(t >= 66, 1.0,
+            np.where(t <= 19, 0.0,
+                 np.clip(0.543207 * np.log(np.maximum(t - 10, 1e-6))
+                         - 1.19625, 0, 1)))
+    return np.stack([r, g, b], axis=-1).astype(np.float32)
+
+
 def generate_skybox(tex_w=2048, tex_h=1024, seed=42, n_stars=6000):
     """
     程序化生成天空盒纹理（等距柱状投影）
+
+    特性：银道面密度增强、幂律亮度分布、黑体色温连续映射、
+    银河弥漫光、水平方向无缝 wrap。
 
     参数:
         tex_w: 纹理宽度
@@ -162,34 +204,119 @@ def generate_skybox(tex_w=2048, tex_h=1024, seed=42, n_stars=6000):
         texture: (tex_h, tex_w, 3) float32 RGB 纹理，值域 [0, 1]
     """
     rng = np.random.default_rng(seed)
-    texture = np.full((tex_h, tex_w, 3), 0.005, dtype=np.float32)  # 深蓝底色
+    texture = np.full((tex_h, tex_w, 3), 0.003, dtype=np.float32)
 
     # 星云：低频噪声上采样
     neb_h, neb_w = tex_h // 16, tex_w // 16
-    nebula_small = rng.random((neb_h, neb_w, 3)).astype(np.float32) * 0.08
+    nebula_small = rng.random((neb_h, neb_w, 3)).astype(np.float32) * 0.06
     nebula = np.array(Image.fromarray(
         (nebula_small * 255).astype(np.uint8)
-    ).resize((tex_w, tex_h), Image.Resampling.BILINEAR)) / 255.0 * 0.06
+    ).resize((tex_w, tex_h), Image.Resampling.BILINEAR)) / 255.0 * 0.04
     texture += nebula
 
-    # 恒星：高斯 blob
-    z = rng.uniform(-1, 1, n_stars)
-    phi_s = rng.uniform(0, 2 * np.pi, n_stars)
-    theta_s = np.arccos(np.clip(z, -1, 1))
+    # --- 银道面参数 ---
+    gal_incl = np.radians(62.87)       # 银道面对赤道面倾角
+    gal_ra_center = np.radians(266.4)  # 银心 RA
+    gal_dec_center = np.radians(-28.9) # 银心 Dec
+
+    # --- 恒星位置：拒绝采样实现银道面密度增强 ---
+    stars_phi = []
+    stars_theta = []
+    n_generated = 0
+    batch = n_stars * 3
+    while n_generated < n_stars:
+        z = rng.uniform(-1, 1, batch)
+        phi = rng.uniform(0, 2 * np.pi, batch)
+        theta = np.arccos(np.clip(z, -1, 1))
+        dec = np.pi / 2 - theta
+
+        # 银纬 b
+        sin_b = (np.sin(dec) * np.cos(gal_incl)
+                 - np.cos(dec) * np.sin(gal_incl)
+                 * np.sin(phi - gal_ra_center))
+        b = np.arcsin(np.clip(sin_b, -1, 1))
+
+        # 银道面高斯增强 + 银心方向额外增强
+        prob = 0.15 + 0.85 * np.exp(-0.5 * (b / np.radians(8)) ** 2)
+        cos_dist = (np.sin(dec) * np.sin(gal_dec_center)
+                    + np.cos(dec) * np.cos(gal_dec_center)
+                    * np.cos(phi - gal_ra_center))
+        ang_dist = np.arccos(np.clip(cos_dist, -1, 1))
+        prob += 0.3 * np.exp(-0.5 * (ang_dist / np.radians(20)) ** 2)
+        prob = prob / prob.max()
+
+        accept = rng.random(batch) < prob
+        need = n_stars - n_generated
+        stars_phi.extend(phi[accept][:need])
+        stars_theta.extend(theta[accept][:need])
+        n_generated = len(stars_phi)
+
+    phi_s = np.array(stars_phi[:n_stars])
+    theta_s = np.array(stars_theta[:n_stars])
 
     cx = (phi_s / (2 * np.pi) * tex_w).astype(np.float32)
     cy = (theta_s / np.pi * tex_h).astype(np.float32)
 
-    brightness = rng.uniform(0.3, 1.0, n_stars).astype(np.float32)
-    sigma = rng.uniform(0.6, 1.5, n_stars).astype(np.float32)
+    # --- Salpeter IMF 采样：dN/dM ∝ M^(-2.35) ---
+    # 质量范围 [0.08, 50] 太阳质量，逆变换采样
+    # 分配随机距离后按视星等截断，模拟观测选择效应
+    alpha = 2.35
+    m_lo, m_hi = 0.08, 50.0
+    oversample = n_stars * 30
+    u_mass = rng.random(oversample)
+    mass_all = (m_lo ** (1 - alpha) + u_mass
+                * (m_hi ** (1 - alpha) - m_lo ** (1 - alpha))
+                ) ** (1 / (1 - alpha))
 
-    # 颜色分布：55% 白色、25% 蓝色、20% 暖色
-    temp = rng.uniform(0, 1, n_stars)
-    colors = np.ones((n_stars, 3), dtype=np.float32)
-    colors[temp < 0.25] = [0.6, 0.7, 1.0]  # 蓝色
-    colors[(temp >= 0.25) & (temp < 0.45)] = [1.0, 0.9, 0.7]  # 暖色
+    # 主序星质量-光度关系：L ∝ M^a（Duric 2004）
+    lum_exp = np.where(mass_all < 0.43, 2.3,
+              np.where(mass_all < 2.0, 4.0,
+              np.where(mass_all < 55.0, 3.5, 1.0)))
+    luminosity_all = np.power(mass_all, lum_exp)
 
-    # 高斯 blob 渲染
+    # 绝对星等
+    abs_mag = -2.5 * np.log10(luminosity_all + 1e-30) + 4.83  # 太阳 M=4.83
+
+    # 随机距离（pc），银河系恒星典型分布
+    dist_all = rng.exponential(scale=200.0, size=oversample)
+    dist_all = np.clip(dist_all, 1.0, 5000.0)
+
+    # 视星等 = 绝对星等 + 5*log10(d/10)
+    app_mag = abs_mag + 5.0 * np.log10(dist_all / 10.0)
+
+    # 视星等截断：肉眼极限 ~6.5，望远镜可到 ~10
+    mag_cutoff = 8.0
+    visible = app_mag <= mag_cutoff
+    vis_idx = np.where(visible)[0]
+    if len(vis_idx) >= n_stars:
+        idx = rng.choice(vis_idx, size=n_stars, replace=False)
+    else:
+        # 不够则取最亮的
+        idx = np.argsort(app_mag)[:n_stars]
+    mass = mass_all[idx]
+    app_mag_sel = app_mag[idx]
+
+    # 视星等 → 亮度（对数压缩到可见范围）
+    mag_norm = (app_mag_sel - app_mag_sel.min()) / (
+        app_mag_sel.max() - app_mag_sel.min() + 1e-30)
+    brightness = (SKY_STAR_BRIGHTNESS_MAX
+                  - (SKY_STAR_BRIGHTNESS_MAX - SKY_STAR_BRIGHTNESS_MIN)
+                  * mag_norm).astype(np.float32)  # 亮星 mag 小 → brightness 大
+    brightness = np.clip(brightness * SKY_STAR_BRIGHTNESS_GAIN, 0, 1)
+    sigma = (SKY_STAR_SIZE_MIN
+             + (SKY_STAR_SIZE_MAX - SKY_STAR_SIZE_MIN)
+             * brightness).astype(np.float32)
+
+    # --- 主序星质量-温度关系 + Planck 黑体 RGB ---
+    # T_eff ≈ 5778 * M^0.57 K（主序星经验关系）
+    temp_K = 5778.0 * np.power(mass, 0.57)
+    temp_K = np.clip(temp_K, 2000, 50000)
+    colors = _blackbody_rgb(temp_K)
+    # 降低饱和度：向白色混合，模拟肉眼观感
+    white = np.ones_like(colors)
+    colors = SKY_STAR_COLOR_SATURATION * colors + (1 - SKY_STAR_COLOR_SATURATION) * white
+
+    # --- 高斯 blob 渲染（水平 wrap）---
     R = 4
     offsets = np.arange(-R, R + 1, dtype=np.float32)
     dy_grid, dx_grid = np.meshgrid(offsets, offsets, indexing='ij')
@@ -211,6 +338,43 @@ def generate_skybox(tex_w=2048, tex_h=1024, seed=42, n_stars=6000):
     contributions = flat_colors * flat_vals[:, None]
 
     np.add.at(texture, (flat_y, flat_x), contributions)
+
+    # --- 银河弥漫光（含旋臂结构）---
+    v_grid = np.linspace(0, np.pi, tex_h)
+    u_grid = np.linspace(0, 2 * np.pi, tex_w)
+    uu, vv = np.meshgrid(u_grid, v_grid)
+    dec_grid = np.pi / 2 - vv
+
+    # 赤道坐标 → 银道坐标
+    sin_b_grid = (np.sin(dec_grid) * np.cos(gal_incl)
+                  - np.cos(dec_grid) * np.sin(gal_incl)
+                  * np.sin(uu - gal_ra_center))
+    b_grid = np.arcsin(np.clip(sin_b_grid, -1, 1))
+
+    cos_b = np.cos(b_grid)
+    sin_l_cos_b = (np.cos(dec_grid) * np.cos(gal_incl)
+                   * np.sin(uu - gal_ra_center)
+                   + np.sin(dec_grid) * np.sin(gal_incl))
+    cos_l_cos_b = np.cos(dec_grid) * np.cos(uu - gal_ra_center)
+    l_grid = np.arctan2(sin_l_cos_b, cos_l_cos_b)  # 银经 [-π, π]
+
+    # 银道面基础辉光
+    milky_way = SKY_MILKY_WAY_GLOW * np.exp(-0.5 * (b_grid / np.radians(6)) ** 2)
+
+    # 银心增亮（l≈0, b≈0）
+    center_dist2 = l_grid ** 2 + b_grid ** 2
+    milky_way += SKY_GALACTIC_CENTER_GLOW * np.exp(
+        -0.5 * center_dist2 / np.radians(15) ** 2)
+
+    # 旋臂调制：4 条主旋臂在银经方向的投影
+    # 从太阳视角看，旋臂在银经上近似等间距分布，用正弦调制模拟明暗交替
+    arm_pattern = 0.4 + 0.6 * (0.5 + 0.5 * np.cos(4 * l_grid + np.radians(30)))
+    # 旋臂只在银道面附近有效
+    arm_mask = np.exp(-0.5 * (b_grid / np.radians(8)) ** 2)
+    milky_way *= (1.0 - arm_mask) + arm_mask * arm_pattern
+
+    texture += milky_way[:, :, None] * np.array([1.0, 0.95, 0.85])
+
     return np.clip(texture, 0, 1)
 
 
@@ -643,9 +807,21 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # ----- 颜色（温度 -> 颜色映射）-----
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
     hot_bias = np.clip(temp_aniso, 0, 1)
-    r_ch = np.clip(hot_bias ** 0.40 * (0.95 + 0.25 * hotspot), 0, 1)
-    g_ch = np.clip(hot_bias ** 0.52 * (0.72 + 0.15 * turbulence), 0, 1)
-    b_ch = np.clip(hot_bias ** 0.68 * (0.50 + 0.18 * (1 - hotspot)), 0, 1)
+    radial_ratio = np.clip(r_norm_grid, 0, 1)
+    contrast = float(DISK_THERMAL_CONTRAST)
+    temp_bias = float(DISK_TEMPERATURE_BIAS)
+    inner_bias = (1.0 - radial_ratio) ** (0.85 * contrast)
+    outer_bias = radial_ratio ** (0.85 * contrast)
+    cool_tint = np.clip((0.7 + 0.3 * inner_bias) / temp_bias, 0.2, 2.0)
+    warm_tint = np.clip((0.45 + 0.55 * outer_bias) * temp_bias, 0.2, 2.0)
+
+    red_exp = max(0.16, 0.24 / contrast)
+    green_exp = max(0.28, 0.4 / contrast)
+    blue_exp = min(1.5, 0.9 * contrast + 0.2)
+
+    r_ch = np.clip(hot_bias ** red_exp * (0.78 + 0.35 * hotspot) * warm_tint, 0, 1)
+    b_ch = np.clip(hot_bias ** blue_exp * (0.35 + 0.28 * (1 - hotspot)) * (cool_tint + 0.05), 0, 1)
+    g_ch = np.clip(0.55 * r_ch + 0.45 * b_ch, 0, 1)
 
     brightness_scale = 0.25
     tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
