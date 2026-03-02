@@ -33,24 +33,20 @@ EPS = 1e-6
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
 G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
-G_LUMINOSITY_POWER = 2.2
+G_LUMINOSITY_POWER = 4
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 1.2
+G_BRIGHTNESS_GAIN = 0.5
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
-DISK_ALPHA_GAIN = 3
+DISK_ALPHA_GAIN = 6
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
-DISK_BASE_TINT = (1.05, 0.95, 0.88)
+DISK_BASE_TINT = (1.05, 0.95, 1)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 1.5
+DISK_RADIAL_BRIGHTNESS_POWER = 3
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.4
 DISK_RADIAL_BRIGHTNESS_MAX = 4.0
-# 吸积盘温度对比度（>1 更强调内热外冷）
-DISK_THERMAL_CONTRAST = 1.6
-# 吸积盘整体色温偏移：>1 更暖，<1 更冷
-DISK_TEMPERATURE_BIAS = 1.0
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -642,14 +638,17 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
     disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
 
-    # ----- 温度剖面（Novikov-Thorne power law）-----
-    T = (1 - np.sqrt(r_inner / np.maximum(r_vals, r_inner + 1e-3))) ** 0.25
-    T /= np.max(T)
-
+    # ----- 温度基底（内热外冷 + 噪声扰动）-----
+    # 先生成径向递减的基底，再叠加轻微噪声，最终数值控制在 0~0.45
+    radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
     temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
     temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
     temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
-    temperature_field = np.clip(T * (0.8 + 0.3 * temp_noise), 0, 1)
+    temp_base = np.clip(radial_decay * (0.85 + 0.15 * temp_noise), 0, 1)
+    temp_base *= 0.25
+
+    # 各结构的温度贡献将在下面的循环中累积
+    temp_struct = np.zeros((n_r, n_phi), dtype=np.float32)
 
     # ----- 密度场 -----
     # 1) 螺旋臂（2-4条，物理上吸积盘的旋臂是瞬态的，持续数天-数年，1-3条更符合物理）
@@ -677,6 +676,8 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         rotations = rng.uniform(2.5, 5.0)
         base_width = rng.uniform(0.2, 0.4)
         intensity = rng.uniform(0.5, 0.9)
+        # 每条臂的温度增量（密度波压缩加热）
+        arm_delta_T = rng.uniform(0.1, 0.3)
 
         r_length = rotations / 6.0 * (1.0 - r_start)
         r_length = min(r_length, 1.0 - r_start)
@@ -707,23 +708,41 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
         spiral += arm_val
 
+        # 温度贡献：密度波压缩加热
+        temp_struct += arm_val * arm_delta_T
+
     spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
 
-    # 2) 云雾（多频弧线叠加 + 像素级噪声增加絮状质感）
+    # 2) 云雾（多频弧线叠加 + 开普勒剪切扭曲 + 像素级噪声增加絮状质感）
+    # 开普勒剪切：内圈角速度快、外圈慢，φ 坐标偏移量 ∝ r^(-1.5)
+    # 用剪切后的 φ 坐标采样噪声，拉出方向性丝状结构
+    shear_strength = rng.uniform(3.0, 6.0)  # 剪切强度
+    kep_shear = shear_strength * (1.0 / np.maximum(r_norm_grid, 0.05) ** 1.5 - 1.0)
+    # 归一化到像素偏移量
+    kep_shift_pixels = (kep_shear / (2 * np.pi) * n_phi).astype(int)
+
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
     turbulence_fine = _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40)
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
+
+    # 对中低频层应用剪切扭曲（高频层保持原位，避免过度模糊）
+    for layer in [turbulence_coarse, turbulence_mid, turbulence_fine]:
+        for ri in range(n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+
     # 像素级高频噪声：直接用随机值，模拟未分辨的细小团块
     pixel_noise = rng.random((n_r, n_phi)).astype(np.float32)
     pixel_noise = (pixel_noise - 0.5) * 2  # [-1, 1]
     turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
                   + 0.25 * turbulence_fine + 0.22 * turbulence_extra
                   + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
+    # 湍流剪切带来少量粘滞加热，保证所有半径都存在结构温度上限
+    temp_struct += 0.05 * np.clip(turbulence, 0, 1)
 
     # 3) Filaments（细丝）- 模拟 Kelvin-Helmholtz 不稳定性，内圈更密集更短，外圈更长更稀疏
-    arc_count = int(rng.uniform(40, 80) * disk_area)
+    arc_count = int(rng.uniform(50, 100) * disk_area)
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
     for _ in range(arc_count):
         arc_phi_start = rng.uniform(0, 2 * np.pi)
@@ -732,6 +751,8 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         arc_phi_length = 0.15 + (1 - arc_r) * 0.3 + rng.uniform(0, 0.2)
         arc_r_width = 0.001 + (1 - arc_r) * 0.004 + rng.uniform(0, 0.002)
         arc_intensity = 0.4 + (1 - arc_r) * 0.4 + rng.uniform(0, 0.2)
+        # 每条 filament 的温度增量（剪切摩擦加热）
+        arc_delta_T = rng.uniform(0.05, 0.15)
 
         arc_kappa = 1.0 / (arc_phi_length ** 2) * 1.5
 
@@ -742,6 +763,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         arc_val *= arc_intensity
 
         arcs += arc_val
+        temp_struct += arc_val * arc_delta_T
     arcs = np.clip(arcs, 0, 1)
 
     # 5) Rayleigh-Taylor 不稳定性（ISCO 附近的尖峰和团块）
@@ -754,6 +776,8 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         rt_phi_width = rng.uniform(0.1, 0.25)
         rt_r_length = rng.uniform(0.05, 0.15)
         rt_intensity = rng.uniform(0.6, 1.0)
+        # RT spike 温度增量（ISCO 附近高温物质）
+        rt_delta_T = rng.uniform(0.3, 1.0)
 
         rt_phi_kappa = 1.0 / (rt_phi_width ** 2) * 1.5
         rt_val = np.exp(rt_phi_kappa * (np.cos(phi_grid - rt_phi) - 1))
@@ -765,18 +789,21 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
         rt_val *= rt_r_profile * rt_intensity
         rt_spikes += rt_val
+        temp_struct += rt_val * rt_delta_T
 
     rt_spikes = np.clip(rt_spikes, 0, 1)
 
     # 4) 温度热点（内圈更密集更亮，模拟磁重联等活动）
-    hotspot_count = int(rng.uniform(25, 45) * disk_area)
+    hotspot_count = int(rng.uniform(20, 35) * disk_area)
     hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
-    for _ in range(hotspot_count):
+    # 幂律分布温度增量：小耀斑多、大爆发少
+    hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)  # [0.5, 3.0]，偏向低值
+    for hi in range(hotspot_count):
         h_phi = rng.uniform(0, 2 * np.pi)
         r_rand = rng.uniform(0, 1)
         h_r = 0.1 + r_rand ** 0.6 * 0.85
-        h_phi_width = rng.uniform(0.08, 0.2)
-        h_r_width = 0.005 + (1 - h_r) * 0.01 + rng.uniform(0, 0.005)
+        h_phi_width = rng.uniform(0.04, 0.12)
+        h_r_width = 0.003 + (1 - h_r) * 0.006 + rng.uniform(0, 0.003)
         h_intensity = 0.3 + (1 - h_r) * 0.6 + rng.uniform(0, 0.1)
 
         h_kappa = 1.0 / (h_phi_width ** 2) * 1.5
@@ -784,6 +811,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         r_diff = r_norm_grid - h_r
         h_val = np.exp(h_kappa * (np.cos(phi_grid - h_phi) - 1)) * np.exp(-0.5 * (r_diff / h_r_width) ** 2)
         hotspot += h_intensity * h_val
+        temp_struct += h_val * h_intensity * hotspot_delta_Ts[hi]
     hotspot = np.clip(hotspot, 0, 1)
 
     # 5) 方位热点（低频正弦 + 噪声，自转流动感）
@@ -795,7 +823,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
-    density = 0.08 + 0.18 * spiral + 0.42 * turbulence + 0.14 * hotspot + 0.08 * arcs + rt_weight * rt_spikes
+    density = 0.05 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -804,31 +832,43 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 归一化
     density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
 
-    # ----- 颜色（温度 -> 颜色映射）-----
+    # ----- 合成温度场（取 max，非相加）-----
+    # temp_struct 先按 95 分位缩放到 0~1，再与基底比较
+    if np.any(temp_struct > 0):
+        struct_scale = np.percentile(temp_struct[temp_struct > 0], 95)
+        temp_struct_scaled = temp_struct / (struct_scale + 1e-6)
+    else:
+        temp_struct_scaled = temp_struct
+    temp_struct_scaled = np.clip(temp_struct_scaled * 0.8, 0, 1.2)
+
+    # 基底在每个半径上不得高于该半径的结构温度（使用 P70 作为典型上限）
+    struct_max_per_r = np.max(temp_struct_scaled, axis=1)
+    struct_p70_per_r = np.quantile(temp_struct_scaled, 0.7, axis=1)
+    struct_ceiling = np.maximum(struct_p70_per_r, 0.05)
+    temp_base = np.minimum(temp_base, struct_ceiling[:, None])
+    temp_base = np.minimum(temp_base, struct_max_per_r[:, None])
+
+    temperature_field = np.clip(np.maximum(temp_base, temp_struct_scaled), 0, 1)
+
+    # ----- 颜色（温度 -> 黑体辐射 RGB）-----
+    # 温度场 [0,1] 映射到视觉色温范围
+    # 低温 1200K（暗红）→ 高温 7000K（白偏黄），不超过白色
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
-    hot_bias = np.clip(temp_aniso, 0, 1)
-    radial_ratio = np.clip(r_norm_grid, 0, 1)
-    contrast = float(DISK_THERMAL_CONTRAST)
-    temp_bias = float(DISK_TEMPERATURE_BIAS)
-    inner_bias = (1.0 - radial_ratio) ** (0.85 * contrast)
-    outer_bias = radial_ratio ** (0.85 * contrast)
-    cool_tint = np.clip((0.7 + 0.3 * inner_bias) / temp_bias, 0.2, 2.0)
-    warm_tint = np.clip((0.45 + 0.55 * outer_bias) * temp_bias, 0.2, 2.0)
+    T_min, T_max = 1200.0, 7000.0
+    T_K = T_min + temp_aniso * (T_max - T_min)
+    bb_color = _blackbody_rgb(T_K)  # (n_r, n_phi, 3)
+    # 高温端钳制：确保 R >= B，避免蓝色偏移（真正的白热不偏蓝）
+    bb_color[:, :, 2] = np.minimum(bb_color[:, :, 2], bb_color[:, :, 0])
 
-    red_exp = max(0.16, 0.24 / contrast)
-    green_exp = max(0.28, 0.4 / contrast)
-    blue_exp = min(1.5, 0.9 * contrast + 0.2)
+    # RGB = 黑体色 × 亮度（温度驱动），alpha = 密度（不透明度）
+    # 亮度用 sqrt 而非 T^2/T^4，保留低温区可见的红/橙色
+    luminosity = np.clip(np.sqrt(temp_aniso), 0, 1)
 
-    r_ch = np.clip(hot_bias ** red_exp * (0.78 + 0.35 * hotspot) * warm_tint, 0, 1)
-    b_ch = np.clip(hot_bias ** blue_exp * (0.35 + 0.28 * (1 - hotspot)) * (cool_tint + 0.05), 0, 1)
-    g_ch = np.clip(0.55 * r_ch + 0.45 * b_ch, 0, 1)
-
-    brightness_scale = 0.25
     tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
-    tex[:, :, 0] = np.clip(r_ch * density * 6.0 * brightness_scale, 0, 1)
-    tex[:, :, 1] = np.clip(g_ch * density * 6.0 * brightness_scale, 0, 1)
-    tex[:, :, 2] = np.clip(b_ch * density * 6.0 * brightness_scale, 0, 1)
-    tex[:, :, 3] = np.clip(density * brightness_scale, 0, 1)
+    tex[:, :, 0] = np.clip(bb_color[:, :, 0] * luminosity, 0, 1)
+    tex[:, :, 1] = np.clip(bb_color[:, :, 1] * luminosity, 0, 1)
+    tex[:, :, 2] = np.clip(bb_color[:, :, 2] * luminosity, 0, 1)
+    tex[:, :, 3] = np.clip(density, 0, 1)  # alpha 只由面密度决定
 
     return tex
 
