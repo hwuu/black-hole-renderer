@@ -31,22 +31,22 @@ EPS = 1e-6
 
 # —— g 因子着色相关 —— 影响吸积盘自身的亮度/颜色，背景天空不受这些参数影响。
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
-G_FACTOR_CAP = 6
+G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
-G_LUMINOSITY_POWER = 3
+G_LUMINOSITY_POWER = 2.2
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.6
+G_BRIGHTNESS_GAIN = 1.2
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
 DISK_ALPHA_GAIN = 1.5
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
-DISK_BASE_TINT = (1.1, 0.92, 0.75)
+DISK_BASE_TINT = (1.05, 0.95, 0.88)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 3
+DISK_RADIAL_BRIGHTNESS_POWER = 1
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.4
-DISK_RADIAL_BRIGHTNESS_MAX = 16.0
+DISK_RADIAL_BRIGHTNESS_MAX = 4.0
 
 # ============================================================================
 # 公共模块：相机
@@ -545,13 +545,18 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
     spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
 
-    # 2) 云雾（FBM 生成更细致的团块结构）
+    # 2) 云雾（多频弧线叠加 + 像素级噪声增加絮状质感）
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
     turbulence_fine = _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40)
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
-    turbulence = 0.1 * turbulence_coarse + 0.2 * turbulence_mid + 0.3 * turbulence_fine + 0.25 * turbulence_extra + 0.15 * turbulence_ultra
+    # 像素级高频噪声：直接用随机值，模拟未分辨的细小团块
+    pixel_noise = rng.random((n_r, n_phi)).astype(np.float32)
+    pixel_noise = (pixel_noise - 0.5) * 2  # [-1, 1]
+    turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
+                  + 0.25 * turbulence_fine + 0.22 * turbulence_extra
+                  + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
 
     # 3) Filaments（细丝）- 模拟 Kelvin-Helmholtz 不稳定性，内圈更密集更短，外圈更长更稀疏
     arc_count = int(rng.uniform(40, 80) * disk_area)
@@ -626,7 +631,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
-    density = 0.1 + 0.2 * spiral + 0.35 * turbulence + 0.15 * hotspot + 0.1 * arcs + rt_weight * rt_spikes
+    density = 0.08 + 0.18 * spiral + 0.42 * turbulence + 0.14 * hotspot + 0.08 * arcs + rt_weight * rt_spikes
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -638,9 +643,9 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # ----- 颜色（温度 -> 颜色映射）-----
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
     hot_bias = np.clip(temp_aniso, 0, 1)
-    r_ch = np.clip(hot_bias ** 0.38 * (0.95 + 0.25 * hotspot), 0, 1)
-    g_ch = np.clip(hot_bias ** 0.55 * (0.7 + 0.15 * turbulence), 0, 1)
-    b_ch = np.clip(hot_bias ** 0.85 * (0.38 + 0.18 * (1 - hotspot)), 0, 1)
+    r_ch = np.clip(hot_bias ** 0.40 * (0.95 + 0.25 * hotspot), 0, 1)
+    g_ch = np.clip(hot_bias ** 0.52 * (0.72 + 0.15 * turbulence), 0, 1)
+    b_ch = np.clip(hot_bias ** 0.68 * (0.50 + 0.18 * (1 - hotspot)), 0, 1)
 
     brightness_scale = 0.25
     tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
@@ -762,8 +767,7 @@ class TaichiRenderer:
             rs_f = ti.cast(RS, ti.f32)
             r_obs = cam_pos.norm()
             r_em = hit_pos.norm()
-            r_cyl = ti.sqrt(hit_pos[0] ** 2 + hit_pos[1] ** 2)
-            r_safe = ti.max(r_cyl, rs_f + 1e-3)
+            r_safe = ti.max(r_em, rs_f + 1e-3)
 
             omega = ti.sqrt(0.5 / (r_safe ** 3 + 1e-6))
             lorentz = ti.sqrt(ti.max(1.0 - rs_f / r_safe, 1e-6))
@@ -794,10 +798,6 @@ class TaichiRenderer:
             intensity = ti.max(ti.pow(g, lum_power), 0.0)
             brightness = gain * intensity / (1.0 + intensity / g_cap)
 
-            shift = ti.max(ti.min(g - 1.0, 2.0), -1.2)
-            pos_shift = ti.max(shift, 0.0)
-            neg_shift = ti.max(-shift, 0.0)
-
             radial_span = ti.max(r_outer - r_inner, 1e-3)
             radial_t = (ti.max(hit_r, r_inner) - r_inner) / radial_span
             radial_t = ti.min(ti.max(radial_t, 0.0), 1.0)
@@ -809,13 +809,23 @@ class TaichiRenderer:
             max_boost = ti.cast(DISK_RADIAL_BRIGHTNESS_MAX, ti.f32)
             radial_boost = min_boost + (max_boost - min_boost) * radial_profile
             brightness *= radial_boost
-            # 暂不调整多普勒亮度
 
-            # neg_shift>0 (蓝移): 偏红; pos_shift>0 (红移): 偏蓝
-            red_boost = 1.0 + 0.35 * ti.pow(neg_shift, 0.75)
-            r_scale = ti.min(ti.max((1.0 + 0.6 * neg_shift - 0.25 * pos_shift) * red_boost, 0.25), 2.6)
-            g_scale = ti.min(ti.max(1.0 - 0.1 * pos_shift - 0.05 * neg_shift, 0.5), 1.25)
-            b_scale = ti.min(ti.max(1.05 + 0.3 * pos_shift - 0.25 * neg_shift, 0.3), 2.7)
+            # 黑体辐射颜色偏移（Wien 近似）
+            # B(λ, gT)/B(λ, T) ≈ exp(x(1 - 1/g))，x = hc/(λkT)
+            # 基准温度 ~10000K，代表波长 R=650nm G=530nm B=460nm
+            # x_R = 0.01439/(650e-9*10000) ≈ 2.21
+            # x_G = 0.01439/(530e-9*10000) ≈ 2.72
+            # x_B = 0.01439/(460e-9*10000) ≈ 3.13
+            g_safe = ti.max(g, 0.1)
+            wien_arg = 1.0 - 1.0 / g_safe
+            r_scale = ti.exp(2.21 * wien_arg)
+            g_scale = ti.exp(2.72 * wien_arg)
+            b_scale = ti.exp(3.13 * wien_arg)
+            # 归一化：让绿色通道保持不变，只看相对偏移
+            norm = g_scale
+            r_scale = ti.min(r_scale / norm, 3.0)
+            g_scale = 1.0
+            b_scale = ti.min(b_scale / norm, 3.0)
 
             shifted = ti.Vector([
                 base_color[0] * r_scale,
@@ -1001,6 +1011,7 @@ class TaichiRenderer:
                 # 记录击中时的微分状态
                 hit_d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
                 hit_d_pos_dy = ti.Vector([0.0, 0.0, 0.0])
+                tan_t = ti.tan(tilt_rad)
 
                 while step_count < max_iter:
                     old_pos = pos
@@ -1084,7 +1095,6 @@ class TaichiRenderer:
 
                     # 吸积盘检测：穿过倾斜平面 z = y * tan(tilt)
                     # 平面方程: z - y * tan_t = 0
-                    tan_t = ti.tan(tilt_rad)
                     f_old = old_z - old_y * tan_t
                     f_new = new_z - new_y * tan_t
                     if f_old * f_new < 0:
@@ -1098,7 +1108,7 @@ class TaichiRenderer:
                         hit_d_pos_dy = d_pos_dy + t_frac * (new_d_pos_dy - d_pos_dy)
 
                         if r_outer >= hit_r >= r_inner:
-                            hit_z = hit_y * ti.tan(tilt_rad)
+                            hit_z = hit_y * tan_t
                             hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
                             ray_to_cam = -dir_
 
@@ -1202,7 +1212,7 @@ class TaichiRenderer:
 
                         w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
                         w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
-                        w_b = ti.exp(-dist_sq / (3000.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
 
                         sum_r += col[0] * w_r
                         sum_g += col[1] * w_g
@@ -1264,7 +1274,7 @@ class TaichiRenderer:
         def lens_flare_kernel(image_field: ti.template(),
                               disk_center_x: ti.f32, disk_center_y: ti.f32,
                               screen_center_x: ti.f32, screen_center_y: ti.f32,
-                              intensity: ti.f32):
+                              intensity: ti.f32, scale: ti.f32):
             w = ti.cast(image_field.shape[0], ti.i32)
             h = ti.cast(image_field.shape[1], ti.i32)
 
@@ -1282,7 +1292,7 @@ class TaichiRenderer:
                     gdx = ti.cast(i, ti.f32) - ghost_x
                     gdy = ti.cast(j, ti.f32) - ghost_y
                     gdist = ti.sqrt(gdx * gdx + gdy * gdy)
-                    gsize = ti.cast(20 + g * 15, ti.f32)
+                    gsize = ti.cast(20 + g * 15, ti.f32) * scale
                     if gdist < gsize:
                         galpha = (1.0 - gdist / gsize) * (1.0 - ti.cast(g, ti.f32) * 0.12) * 0.4
                         ghost_col = ti.Vector([1.0, 0.9, 0.7]) * galpha
@@ -1294,8 +1304,8 @@ class TaichiRenderer:
                 rdx = ti.cast(i, ti.f32) - ring_x
                 rdy = ti.cast(j, ti.f32) - ring_y
                 rdist = ti.sqrt(rdx * rdx + rdy * rdy)
-                ring_r = 80.0
-                ring_w = 8.0
+                ring_r = 80.0 * scale
+                ring_w = 8.0 * scale
                 ring_alpha = 0.0
                 if ti.abs(rdist - ring_r) < ring_w:
                     ring_alpha = (1.0 - ti.abs(rdist - ring_r) / ring_w) * 0.15
@@ -1364,6 +1374,8 @@ class TaichiRenderer:
     def _apply_lens_flare(self, final, disk):
         """应用 lens flare 效果，final 和 disk 都是 (width, height, 3)"""
         w, h, _ = final.shape
+        # 分辨率缩放因子（基准 SD 360p）
+        scale = min(w, h) / 360.0
 
         # 找吸积盘亮度中心
         disk_brightness = np.max(disk, axis=2)  # shape: (w, h)
@@ -1385,7 +1397,7 @@ class TaichiRenderer:
             t = (g + 1) * 0.15
             ghost_x = light_x + (screen_cx - light_x) * t
             ghost_y = light_y + (screen_cy - light_y) * t
-            ghost_size = 25 + g * 30
+            ghost_size = (25 + g * 30) * scale
 
             dx = x_coords - ghost_x
             dy = y_coords - ghost_y
@@ -1404,8 +1416,8 @@ class TaichiRenderer:
             ring_t = 0.35 + ring_idx * 0.15
             ring_x = light_x + (screen_cx - light_x) * ring_t
             ring_y = light_y + (screen_cy - light_y) * ring_t
-            ring_r = 60 + ring_idx * 40
-            ring_w = 6 + ring_idx * 3
+            ring_r = (60 + ring_idx * 40) * scale
+            ring_w = (6 + ring_idx * 3) * scale
 
             dx = x_coords - ring_x
             dy = y_coords - ring_y
@@ -1426,7 +1438,7 @@ class TaichiRenderer:
         hex_t = 0.5
         hex_x = light_x + (screen_cx - light_x) * hex_t
         hex_y = light_y + (screen_cy - light_y) * hex_t
-        hex_r = 100
+        hex_r = 100 * scale
 
         dx = x_coords - hex_x
         dy = y_coords - hex_y
@@ -1437,7 +1449,7 @@ class TaichiRenderer:
         hex_edge = np.abs(np.mod(angle, np.pi/3) - np.pi/6)
         hex_factor = np.clip(1 - hex_edge / 0.2, 0, 1)
         ring_dist = np.abs(dist - hex_r)
-        ring_alpha = np.clip(1 - ring_dist / 15, 0, 1) ** 2 * hex_factor * 0.3 * intensity
+        ring_alpha = np.clip(1 - ring_dist / (15 * scale), 0, 1) ** 2 * hex_factor * 0.3 * intensity
 
         hex_color = np.array([0.6, 0.7, 1.0])
         for c in range(3):
