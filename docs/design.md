@@ -587,6 +587,9 @@ base_tex → 2x2 avg → level 1 → 2x2 avg → level 2 → ...
 
 ---
 
+- v5.21 (2026-03-03): 优化吸积盘模拟：螺旋臂 8-15 条 → 2-4 条（符合物理瞬态特征）；添加 Rayleigh-Taylor 不稳定性（ISCO 附近尖峰）；云雾湍流增加多层 FBM 高频噪声（8-400 频率）；filaments/hotspots 按盘面积缩放，径向内密外疏；base 密度 0.2
+- v5.20 (2026-03-03): 吸积盘湍流扰动：对 density 和 temp_struct 同时应用多频噪声调制（借鉴 turbulence 的 5 层结构 + 剪切），边缘呈现絮状破碎感；内圈保持较高亮度（radial_preserve）
+- v5.19 (2026-03-03): 吸积盘温度 T_max 上调至 10000K（原来 7000K），density base 上调至 0.15；蓝色 bloom sigma 上调至 3000
 - v5.18 (2026-03-02): 温度基底改为单调递减并加半径分位夹紧；结构温度按 P95 归一 + P70 上限；check_texture 新增密度预览
 - v5.17 (2026-03-02): 温度场结构化叠加（各结构独立温度贡献，hotspot 幂律分布）；云雾开普勒剪切扭曲；filament 数量翻倍
 

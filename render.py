@@ -823,7 +823,29 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
-    density = 0.05 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
+    
+    # 湍流扰动：借鉴 turbulence 的多频 + 剪切结构，对密度和温度场同时调制
+    disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
+    disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
+    disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
+    disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
+    # 对低频层应用剪切扭曲
+    for layer in [disturb_coarse, disturb_mid]:
+        for ri in range(n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+    # 像素级噪声
+    disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
+    # 组合：0.05-1.0 极端扰动，内圈扰动较弱以保持亮度
+    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine 
+                   + 0.30 * disturb_extra + 0.20 * disturb_pixel)
+    disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
+    # 内圈保持较高亮度，外圈扰动更强
+    radial_preserve = 0.6 + 0.4 * r_norm_grid
+    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
+    
+    density *= disturb_mod
+    temp_struct *= disturb_mod
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -854,7 +876,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 温度场 [0,1] 映射到视觉色温范围
     # 低温 1200K（暗红）→ 高温 7000K（白偏黄），不超过白色
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
-    T_min, T_max = 1200.0, 7000.0
+    T_min, T_max = 1200.0, 10000.0
     T_K = T_min + temp_aniso * (T_max - T_min)
     bb_color = _blackbody_rgb(T_K)  # (n_r, n_phi, 3)
     # 高温端钳制：确保 R >= B，避免蓝色偏移（真正的白热不偏蓝）

@@ -1,5 +1,81 @@
 # TODO List
 
+## 吸积盘结构湍流扰动 + 温度调整
+
+### 问题
+
+1. **温度偏低**：用外部纹理渲染时，吸积环整体温度偏低
+2. **结构太光滑**：filament、hotspot、arms 的边缘是光滑的高斯，缺少湍流扰动
+
+### 当前代码分析
+
+```
+密度场:
+  density = base + spiral + turbulence + hotspot + arcs + rt_spikes
+  
+温度场:
+  temp_struct = sum(结构 × 温度增量)
+  temperature_field = max(temp_base, temp_struct_scaled)
+  
+最终输出:
+  RGB = 黑体色 × sqrt(temperature)
+  Alpha = density
+```
+
+**问题所在**：
+- `turbulence` 已是噪声场，但 `spiral/arc/hotspot` 结构本身是光滑高斯
+- 结构的**密度轮廓**光滑，**温度增量**也光滑
+- 物理上，湍流应该同时扰动密度分布和温度分布
+
+### 方案
+
+#### 1. 温度调整
+
+| 参数 | 当前值 | 目标值 | 说明 |
+|------|--------|--------|------|
+| T_max | 7000K | 10000K | 提高高温端上限 |
+| density base | 0.05 | 0.10 | 增加基础密度 |
+
+#### 2. 湍流扰动实现
+
+**方法 A：强度调制**（推荐，实现简单）
+
+```python
+# 生成扰动噪声（与结构同频率）
+disturb_noise = _fbm_noise((n_r, n_phi), rng, octaves=3, persistence=0.5, base_scale=8, wrap_u=True)
+disturb_mod = 0.4 + 0.6 * disturb_noise  # 0.4-1.0
+
+# 对密度场调制
+density = (base + 0.22*spiral + ...) * disturb_mod
+
+# 对温度场调制
+temp_struct = temp_struct * disturb_mod
+```
+
+**方法 B：坐标扰动**（更物理，实现复杂）
+
+用噪声偏移采样坐标，使结构边缘被"拉扯"成不规则形状。暂不采用，因为：
+- 实现复杂度高
+- 需要仔细处理边界条件
+- 可能引入采样伪影
+
+### 实施步骤
+
+1. [x] 分析当前代码结构
+2. [x] 调整温度参数（T_max → 10000K，density base → 0.15）
+3. [x] 生成扰动噪声 disturb_noise（多频 + 剪切，借鉴 turbulence 结构）
+4. [x] 对 density 和 temp_struct 应用扰动调制
+5. [x] 运行 check_texture.py 验证效果
+6. [x] 用外部纹理渲染验证整体效果
+
+### 预期效果
+
+- 结构边缘不再光滑，呈现絮状破碎感
+- 整体温度提升，视觉效果更亮更热
+- 保持物理合理性（湍流同时影响密度和温度）
+
+---
+
 ## 镜头光晕/光斑效果
 
 ### 背景
