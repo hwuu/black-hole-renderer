@@ -36,7 +36,7 @@ G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 4
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.6
+G_BRIGHTNESS_GAIN = 0.38
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -685,24 +685,24 @@ def _generate_arcs_taichi(n_r, n_phi, arc_data):
     """
     import taichi as ti
     ti.init(arch=ti.cpu, offline_cache=False)
-    
+
     n_arcs = arc_data.shape[0]
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
-    
+
     phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
     r_norm = np.linspace(0, 1, n_r)
     phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
-    
+
     arcs_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
     phi_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
     r_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    
+
     phi_grid_field.from_numpy(phi_grid.astype(np.float32))
     r_grid_field.from_numpy(r_norm_grid.astype(np.float32))
-    
+
     arc_data_field = ti.field(dtype=ti.f32, shape=(n_arcs, 5))
     arc_data_field.from_numpy(arc_data.astype(np.float32))
-    
+
     @ti.kernel
     def compute_arcs():
         for i, j in ti.ndrange(n_r, n_phi):
@@ -715,17 +715,17 @@ def _generate_arcs_taichi(n_r, n_phi, arc_data):
                 phi_len = arc_data_field[k, 2]
                 r_width = arc_data_field[k, 3]
                 intensity = arc_data_field[k, 4]
-                
+
                 kappa = 1.0 / (phi_len * phi_len + 1e-6) * 1.5
                 arc_val = ti.exp(kappa * (ti.cos(phi_val - phi_start) - 1.0))
-                
+
                 r_diff = r_val - arc_r
                 arc_val *= ti.exp(-0.5 * (r_diff * r_diff) / (r_width * r_width + 1e-6))
                 arc_val *= intensity
-                
+
                 total += arc_val
             arcs_field[i, j] = ti.min(total, 1.0)
-    
+
     compute_arcs()
     arcs = arcs_field.to_numpy()
     ti.reset()
@@ -738,24 +738,24 @@ def _generate_hotspots_taichi(n_r, n_phi, hotspot_data):
     """
     import taichi as ti
     ti.init(arch=ti.cpu, offline_cache=False)
-    
+
     n_hotspots = hotspot_data.shape[0]
     hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
-    
+
     phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
     r_norm = np.linspace(0, 1, n_r)
     phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
-    
+
     hotspot_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
     phi_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
     r_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    
+
     phi_grid_field.from_numpy(phi_grid.astype(np.float32))
     r_grid_field.from_numpy(r_norm_grid.astype(np.float32))
-    
+
     hotspot_data_field = ti.field(dtype=ti.f32, shape=(n_hotspots, 5))
     hotspot_data_field.from_numpy(hotspot_data.astype(np.float32))
-    
+
     @ti.kernel
     def compute_hotspots():
         for i, j in ti.ndrange(n_r, n_phi):
@@ -768,17 +768,17 @@ def _generate_hotspots_taichi(n_r, n_phi, hotspot_data):
                 h_phi_w = hotspot_data_field[k, 2]
                 h_r_w = hotspot_data_field[k, 3]
                 intensity = hotspot_data_field[k, 4]
-                
+
                 kappa = 1.0 / (h_phi_w * h_phi_w + 1e-6) * 1.5
                 h_val = ti.exp(kappa * (ti.cos(phi_val - h_phi) - 1.0))
-                
+
                 r_diff = r_val - h_r
                 h_val *= ti.exp(-0.5 * (r_diff * r_diff) / (h_r_w * h_r_w + 1e-6))
                 h_val *= intensity
-                
+
                 total += h_val
             hotspot_field[i, j] = ti.min(total, 1.0)
-    
+
     compute_hotspots()
     hotspot = hotspot_field.to_numpy()
     ti.reset()
@@ -905,76 +905,101 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 湍流剪切带来少量粘滞加热，保证所有半径都存在结构温度上限
     temp_struct += 0.05 * np.clip(turbulence, 0, 1)
 
-    # 3) Filaments（细丝）- Taichi 加速
+    # 3) Filaments（细丝）- NumPy 向量化分批计算
     arc_count = int(rng.uniform(50, 100) * disk_area)
-    
+    batch_size = 100
+
     arc_phi_starts = rng.uniform(0, 2 * np.pi, arc_count)
     r_rands = rng.uniform(0, 1, arc_count)
     arc_rs = 0.1 + r_rands ** 0.7 * 0.85
     arc_phi_lengths = 0.15 + (1 - arc_rs) * 0.3 + rng.uniform(0, 0.2, arc_count)
     arc_r_widths = 0.001 + (1 - arc_rs) * 0.004 + rng.uniform(0, 0.002, arc_count)
     arc_intensities = 0.4 + (1 - arc_rs) * 0.4 + rng.uniform(0, 0.2, arc_count)
-    arc_delta_Ts = rng.uniform(0.05, 0.15, arc_count)
-    
-    arc_data = np.stack([arc_rs, arc_phi_starts, arc_phi_lengths, arc_r_widths, arc_intensities], axis=1)
-    print(f"Generating {arc_count} filaments with Taichi...")
-    arcs = _generate_arcs_taichi(n_r, n_phi, arc_data)
-    
-    for i in range(arc_count):
-        r_diff = r_norm_grid - arc_rs[i]
-        arc_val = np.exp(1.0 / (arc_phi_lengths[i] ** 2) * 1.5 * (np.cos(phi_grid - arc_phi_starts[i]) - 1))
-        arc_val *= np.exp(-0.5 * (r_diff / arc_r_widths[i]) ** 2)
-        arc_val *= arc_intensities[i]
-        temp_struct += arc_val * arc_delta_Ts[i]
+
+    print(f"Generating {arc_count} filaments...")
+    arcs = np.zeros((n_r, n_phi), dtype=np.float32)
+    batch_size = 400
+
+    for batch_start in tqdm(range(0, arc_count, batch_size), desc="Filaments", leave=False):
+        batch_end = min(batch_start + batch_size, arc_count)
+
+        p_starts = arc_phi_starts[batch_start:batch_end, None, None]
+        rs = arc_rs[batch_start:batch_end, None, None]
+        p_lens = arc_phi_lengths[batch_start:batch_end, None, None]
+        r_wids = arc_r_widths[batch_start:batch_end, None, None]
+        ints = arc_intensities[batch_start:batch_end, None, None]
+
+        kappa = 1.0 / (p_lens ** 2) * 1.5
+        arc_batch = np.exp(kappa * (np.cos(phi_grid[None, :, :] - p_starts) - 1.0))
+        r_diff = r_norm_grid[None, :, :] - rs
+        arc_batch *= np.exp(-0.5 * (r_diff / r_wids) ** 2)
+        arc_batch *= ints
+
+        arcs += np.sum(arc_batch, axis=0)
+
+    arcs = np.clip(arcs, 0, 1)
+    temp_struct += 0.08 * arcs  # 简化温度贡献
 
 # 5) Rayleigh-Taylor 不稳定性（保持原有逻辑，但不使用 batch_size）
     rt_spikes = np.zeros((n_r, n_phi), dtype=np.float32)
     rt_count = int(rng.uniform(12, 24) * disk_area * 0.5)
-    
+
     rt_phis = rng.uniform(0, 2 * np.pi, rt_count)
     rt_r_bases = rng.uniform(0.01, 0.08, rt_count)
     rt_phi_widths = rng.uniform(0.1, 0.25, rt_count)
     rt_r_lengths = rng.uniform(0.05, 0.15, rt_count)
     rt_intensities = rng.uniform(0.6, 1.0, rt_count)
     rt_delta_Ts = rng.uniform(0.3, 1.0, rt_count)
-    
+
     for i in range(rt_count):
         rt_phi_kappa = 1.0 / (rt_phi_widths[i] ** 2) * 1.5
         rt_val = np.exp(rt_phi_kappa * (np.cos(phi_grid - rt_phis[i]) - 1))
-        
+
         rt_r_diff = r_norm_grid - rt_r_bases[i]
         r_fade_out = np.clip(rt_r_lengths[i] * 2 - rt_r_diff, 0, 1)
         r_fade_in = np.clip((r_norm_grid - rt_r_bases[i]) / (rt_r_lengths[i] * 0.3), 0, 1)
         rt_r_profile = np.exp(-0.5 * (rt_r_diff / (rt_r_lengths[i] * 0.4)) ** 2) * r_fade_out * r_fade_in
-        
+
         rt_val *= rt_r_profile * rt_intensities[i]
         rt_spikes += rt_val
         temp_struct += rt_val * rt_delta_Ts[i]
-    
+
     rt_spikes = np.clip(rt_spikes, 0, 1)
 
-    # 4) 温度热点 - Taichi 加速
+    # 4) 温度热点 - NumPy 向量化分批计算
     hotspot_count = int(rng.uniform(20, 35) * disk_area)
     hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)
-    
+
     h_phis = rng.uniform(0, 2 * np.pi, hotspot_count)
     r_rands = rng.uniform(0, 1, hotspot_count)
     h_rs = 0.1 + r_rands ** 0.6 * 0.85
     h_phi_widths = rng.uniform(0.04, 0.12, hotspot_count)
     h_r_widths = 0.003 + (1 - h_rs) * 0.006 + rng.uniform(0, 0.003, hotspot_count)
     h_intensities = 0.3 + (1 - h_rs) * 0.6 + rng.uniform(0, 0.1, hotspot_count)
-    
-    hotspot_data = np.stack([h_rs, h_phis, h_phi_widths, h_r_widths, h_intensities], axis=1)
-    print(f"Generating {hotspot_count} hotspots with Taichi...")
-    hotspot = _generate_hotspots_taichi(n_r, n_phi, hotspot_data)
-    
-    for i in range(hotspot_count):
-        r_diff = r_norm_grid - h_rs[i]
-        h_val = np.exp(1.0 / (h_phi_widths[i] ** 2) * 1.5 * (np.cos(phi_grid - h_phis[i]) - 1))
-        h_val *= np.exp(-0.5 * (r_diff / h_r_widths[i]) ** 2)
-        temp_struct += h_val * h_intensities[i] * hotspot_delta_Ts[i]
-    
+
+    print(f"Generating {hotspot_count} hotspots...")
+    hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
+    batch_size = 400
+
+    for batch_start in tqdm(range(0, hotspot_count, batch_size), desc="Hotspots", leave=False):
+        batch_end = min(batch_start + batch_size, hotspot_count)
+
+        h_ps = h_phis[batch_start:batch_end, None, None]
+        hs = h_rs[batch_start:batch_end, None, None]
+        hp_ws = h_phi_widths[batch_start:batch_end, None, None]
+        hr_ws = h_r_widths[batch_start:batch_end, None, None]
+        h_ints = h_intensities[batch_start:batch_end, None, None]
+
+        kappa = 1.0 / (hp_ws ** 2) * 1.5
+        h_batch = np.exp(kappa * (np.cos(phi_grid[None, :, :] - h_ps) - 1.0))
+        r_diff = r_norm_grid[None, :, :] - hs
+        h_batch *= np.exp(-0.5 * (r_diff / hr_ws) ** 2)
+        h_batch *= h_ints
+
+        hotspot += np.sum(h_batch, axis=0)
+
     hotspot = np.clip(hotspot, 0, 1)
+    temp_struct += 0.12 * hotspot  # 简化温度贡献
 
     # 5) 方位热点（低频正弦 + 噪声，自转流动感）
     az_freq = rng.integers(2, 5)
