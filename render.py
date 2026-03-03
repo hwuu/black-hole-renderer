@@ -35,7 +35,7 @@ G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 4
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.5
+G_BRIGHTNESS_GAIN = 0.8
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -45,8 +45,8 @@ DISK_BASE_TINT = (1.05, 0.95, 1)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
 DISK_RADIAL_BRIGHTNESS_POWER = 3
 # 半径亮度增益的下限/上限，避免指数爆炸
-DISK_RADIAL_BRIGHTNESS_MIN = 0.4
-DISK_RADIAL_BRIGHTNESS_MAX = 4.0
+DISK_RADIAL_BRIGHTNESS_MIN = 0
+DISK_RADIAL_BRIGHTNESS_MAX = 32.0
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -621,27 +621,57 @@ def generate_disk_mipmaps(base_tex, levels=4):
     return mips
 
 
-def load_cached_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, force=False):
+def compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_outer, rs=1.0):
+    """
+    根据相机参数计算吸积盘纹理分辨率。
+    n_phi: 基于视角覆盖的角分辨率，每个像素约 1 个 phi 样本
+    n_r: 基于径向覆盖的分辨率，每个径向单位约 0.5 个样本
+    """
+    import math
+    camera_distance = math.sqrt(cam_pos[0]**2 + cam_pos[1]**2 + cam_pos[2]**2)
+    
+    disk_angular_radius = math.atan(r_outer / camera_distance)
+    disk_angular_extent = 2 * disk_angular_radius
+    screen_fraction = fov * math.pi / 180.0
+    
+    n_phi = int(width * (disk_angular_extent / screen_fraction))
+    n_r = int(height * (disk_angular_radius / screen_fraction) * 0.5)
+    
+    n_phi = max(256, n_phi)
+    n_r = max(128, n_r)
+    
+    n_phi = n_phi + (16 - n_phi % 16) % 16
+    n_r = n_r + (16 - n_r % 16) % 16
+    
+    return n_phi, n_r
+
+
+def load_cached_disk_texture(width=None, height=None, cam_pos=None, fov=None,
+                               seed=42, r_inner=2.0, r_outer=3.5, force=False):
     """
     加载或生成吸积盘纹理（带缓存）。
-    - n_phi: 角度方向分辨率
-    - n_r: 径向方向分辨率
+    - width, height, cam_pos, fov: 用于计算纹理分辨率
     - seed: 随机种子
     - r_inner, r_outer: 吸积盘内外半径
     - force: 强制重新生成，忽略缓存
     返回 (n_r, n_phi, 4) float32
     """
+    if width and height and cam_pos and fov:
+        n_phi, n_r = compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_outer)
+    else:
+        n_phi, n_r = 1024, 512
+
     cache_dir = "output/.disk_texture_cache"
-    cache_key = f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}.npy"
+    cache_key = f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}_{n_phi}x{n_r}.npy"
     cache_path = os.path.join(cache_dir, cache_key)
-    
+
     if not force and os.path.exists(cache_path):
         print(f"Loading cached disk texture: {cache_key}")
         return np.load(cache_path)
-    
-    print(f"Generating disk texture: r_inner={r_inner}, r_outer={r_outer}, seed={seed}")
+
+    print(f"Generating disk texture: r_inner={r_inner}, r_outer={r_outer}, seed={seed}, n_phi={n_phi}, n_r={n_r}")
     tex = generate_disk_texture(n_phi=n_phi, n_r=n_r, seed=seed, r_inner=r_inner, r_outer=r_outer)
-    
+
     os.makedirs(cache_dir, exist_ok=True)
     np.save(cache_path, tex)
     print(f"Cached to: {cache_path}")
@@ -851,7 +881,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
     density = 0.15 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
-    
+
     # 湍流扰动：借鉴 turbulence 的多频 + 剪切结构，对密度和温度场同时调制
     disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
@@ -864,13 +894,13 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 像素级噪声
     disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
     # 组合：0.05-1.0 极端扰动，内圈扰动较弱以保持亮度
-    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine 
+    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
                    + 0.30 * disturb_extra + 0.20 * disturb_pixel)
     disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
     # 内圈保持较高亮度，外圈扰动更强
     radial_preserve = 0.6 + 0.4 * r_norm_grid
     disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
-    
+
     density *= disturb_mod
     temp_struct *= disturb_mod
 
@@ -1754,7 +1784,8 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
     skybox, tex_h, tex_w = load_or_generate_skybox(skybox_path, tex_w, tex_h, n_stars)
     disk_tex = load_disk_texture(disk_texture_path)
     if disk_tex is None:
-        disk_tex = load_cached_disk_texture(r_inner=r_disk_inner, r_outer=r_disk_outer,
+        disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=cam_pos, fov=fov,
+                                            r_inner=r_disk_inner, r_outer=r_disk_outer,
                                             seed=42, force=force_regenerate_disk_texture)
 
     renderer = TaichiRenderer(
@@ -1967,7 +1998,8 @@ if __name__ == "__main__":
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         disk_tex = load_disk_texture(args.disk_texture)
         if disk_tex is None:
-            disk_tex = load_cached_disk_texture(r_inner=args.ar1, r_outer=args.ar2,
+            disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
+                                                r_inner=args.ar1, r_outer=args.ar2,
                                                 seed=42,
                                                 force=args.force_regenerate_disk_texture)
 
