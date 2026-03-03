@@ -47,7 +47,7 @@ DISK_BASE_TINT = (1.05, 0.95, 1)
 DISK_RADIAL_BRIGHTNESS_POWER = 1.5
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.2
-DISK_RADIAL_BRIGHTNESS_MAX = 16
+DISK_RADIAL_BRIGHTNESS_MAX = 12
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -1143,11 +1143,14 @@ class TaichiRenderer:
         max_h = max(m.shape[0] for m in mips)
         max_w = max(m.shape[1] for m in mips)
         self.disk_mips_field = ti.Vector.field(4, dtype=ti.f32, shape=(self.num_mip_levels, max_h, max_w))
-# 逐级填充（优化：按行批量写入，减少 Python 循环开销）
+# 逐级填充（优化：使用 from_numpy 批量写入）
         for i, m in enumerate(mips):
             h, w = m.shape[:2]
+            temp_field = ti.Vector.field(4, dtype=ti.f32, shape=(h, w))
+            temp_field.from_numpy(m)
             for y in range(h):
-                self.disk_mips_field[i, y, 0:w] = m[y]
+                for x in range(w):
+                    self.disk_mips_field[i, y, x] = temp_field[y, x]
 
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.disk_layer_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
