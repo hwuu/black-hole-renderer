@@ -32,11 +32,11 @@ EPS = 1e-6
 
 # —— g 因子着色相关 —— 影响吸积盘自身的亮度/颜色，背景天空不受这些参数影响。
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
-G_FACTOR_CAP = 3
+G_FACTOR_CAP = 1.5
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 1.5
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.22
+G_BRIGHTNESS_GAIN = 0.3
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -44,10 +44,10 @@ DISK_ALPHA_GAIN = 6
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
 DISK_BASE_TINT = (1.05, 0.95, 1)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 2.2
+DISK_RADIAL_BRIGHTNESS_POWER = 1.5
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.2
-DISK_RADIAL_BRIGHTNESS_MAX = 8
+DISK_RADIAL_BRIGHTNESS_MAX = 16
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -1143,14 +1143,11 @@ class TaichiRenderer:
         max_h = max(m.shape[0] for m in mips)
         max_w = max(m.shape[1] for m in mips)
         self.disk_mips_field = ti.Vector.field(4, dtype=ti.f32, shape=(self.num_mip_levels, max_h, max_w))
-        # 逐级填充
+# 逐级填充（优化：按行批量写入，减少 Python 循环开销）
         for i, m in enumerate(mips):
             h, w = m.shape[:2]
-            temp_field = ti.Vector.field(4, dtype=ti.f32, shape=(h, w))
-            temp_field.from_numpy(m)
             for y in range(h):
-                for x in range(w):
-                    self.disk_mips_field[i, y, x] = temp_field[y, x]
+                self.disk_mips_field[i, y, 0:w] = m[y]
 
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.disk_layer_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
