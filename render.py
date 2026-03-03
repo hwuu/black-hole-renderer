@@ -621,6 +621,34 @@ def generate_disk_mipmaps(base_tex, levels=4):
     return mips
 
 
+def load_cached_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True, force=False):
+    """
+    加载或生成吸积盘纹理（带缓存）。
+    - n_phi: 角度方向分辨率
+    - n_r: 径向方向分辨率
+    - seed: 随机种子
+    - r_inner, r_outer: 吸积盘内外半径
+    - enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
+    - force: 强制重新生成，忽略缓存
+    返回 (n_r, n_phi, 4) float32
+    """
+    cache_dir = "output/.accretion_disk_cache"
+    cache_key = f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}_{enable_rt}.npy"
+    cache_path = os.path.join(cache_dir, cache_key)
+    
+    if not force and os.path.exists(cache_path):
+        print(f"Loading cached disk texture: {cache_key}")
+        return np.load(cache_path)
+    
+    print(f"Generating disk texture: r_inner={r_inner}, r_outer={r_outer}, seed={seed}, enable_rt={enable_rt}")
+    tex = generate_disk_texture(n_phi=n_phi, n_r=n_r, seed=seed, r_inner=r_inner, r_outer=r_outer, enable_rt=enable_rt)
+    
+    os.makedirs(cache_dir, exist_ok=True)
+    np.save(cache_path, tex)
+    print(f"Cached to: {cache_path}")
+    return tex
+
+
 def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True):
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
@@ -1719,14 +1747,16 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
                   n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
                   r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
-                  lens_flare=False, anti_alias="disabled", aa_strength=1.0):
+                  lens_flare=False, anti_alias="disabled", aa_strength=1.0,
+                  force_rerender_disk=False):
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
     skybox, tex_h, tex_w = load_or_generate_skybox(skybox_path, tex_w, tex_h, n_stars)
     disk_tex = load_disk_texture(disk_texture_path)
     if disk_tex is None:
-        disk_tex = generate_disk_texture()
+        disk_tex = load_cached_disk_texture(r_inner=r_disk_inner, r_outer=r_disk_outer,
+                                            seed=42, enable_rt=True, force=force_rerender_disk)
 
     renderer = TaichiRenderer(
         width, height, skybox, disk_tex,
@@ -1896,6 +1926,8 @@ def parse_args():
                         help="程序天空盒恒星数 (default: 6000)")
     parser.add_argument("--disk_texture", type=str, default=None,
                         help="吸积盘纹理路径 (default: 程序生成)")
+    parser.add_argument("--force_rerender_accretion_disk", action="store_true",
+                        help="强制重新生成吸积盘纹理，忽略缓存 (default: 关闭)")
     parser.add_argument("--ar1", type=float, default=R_DISK_INNER_DEFAULT,
                         help=f"吸积盘内半径 (default: {R_DISK_INNER_DEFAULT})")
     parser.add_argument("--ar2", type=float, default=R_DISK_OUTER_DEFAULT,
@@ -1936,7 +1968,9 @@ if __name__ == "__main__":
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         disk_tex = load_disk_texture(args.disk_texture)
         if disk_tex is None:
-            disk_tex = generate_disk_texture()
+            disk_tex = load_cached_disk_texture(r_inner=args.ar1, r_outer=args.ar2,
+                                                seed=42, enable_rt=True,
+                                                force=args.force_rerender_accretion_disk)
 
         renderer = TaichiRenderer(
             width, height, skybox, disk_tex,
@@ -1977,5 +2011,6 @@ if __name__ == "__main__":
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
             aa_strength=args.aa_strength,
+            force_rerender_disk=args.force_rerender_accretion_disk,
         )
         save_image(img, args.output)

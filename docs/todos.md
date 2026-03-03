@@ -1,5 +1,53 @@
 # TODO List
 
+## 吸积盘纹理缓存
+
+### 需求
+吸积盘渲染太花时间（~30-130秒），添加缓存机制：
+1. 基于 CLI 参数（ar1, ar2, seed）生成缓存 key
+2. 参数相同且缓存命中时直接加载，避免重复生成
+3. 新增 `--force_rerender_accretion_disk` 开关，强制重新渲染并更新缓存
+
+### 设计
+
+**缓存目录**: `output/.accretion_disk_cache/`
+
+**缓存 key 生成**:
+```python
+def get_disk_cache_key(r_inner, r_outer, seed, enable_rt=True):
+    return f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}_{enable_rt}.npy"
+```
+
+**缓存查找逻辑**:
+```python
+def load_cached_disk_texture(r_inner, r_outer, seed, enable_rt=True, force=False):
+    cache_dir = "output/accretion_disk_cache"
+    cache_key = get_disk_cache_key(r_inner, r_outer, seed, enable_rt)
+    cache_path = os.path.join(cache_dir, cache_key)
+    
+    if not force and os.path.exists(cache_path):
+        print(f"Loading cached disk texture: {cache_key}")
+        return np.load(cache_path)
+    
+    # 生成并缓存
+    tex = generate_disk_texture(r_inner=r_inner, r_outer=r_outer, seed=seed, enable_rt=enable_rt)
+    os.makedirs(cache_dir, exist_ok=True)
+    np.save(cache_path, tex)
+    return tex
+```
+
+**CLI 参数**:
+- `--force_rerender_accretion_disk`: 强制重新生成吸积盘纹理（默认 False）
+
+### 实施步骤
+
+1. [x] 在 `generate_disk_texture` 附近添加 `load_cached_disk_texture` 函数
+2. [x] 在 CLI 参数中添加 `--force_rerender_accretion_disk`
+3. [x] 修改 `render_image` 函数使用缓存加载
+4. [x] 验证缓存命中/未命中逻辑正确
+
+---
+
 ## 吸积盘结构湍流扰动 + 温度调整
 
 ### 问题
