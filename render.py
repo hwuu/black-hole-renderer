@@ -34,9 +34,9 @@ EPS = 1e-6
 # g 因子亮度压缩的软上限，推荐 0.5~6（默认 3.0），值越小盘面整体越暗
 G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
-G_LUMINOSITY_POWER = 4
+G_LUMINOSITY_POWER = 1.5
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.38
+G_BRIGHTNESS_GAIN = 0.22
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -44,10 +44,10 @@ DISK_ALPHA_GAIN = 6
 # DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
 DISK_BASE_TINT = (1.05, 0.95, 1)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 3
+DISK_RADIAL_BRIGHTNESS_POWER = 2.2
 # 半径亮度增益的下限/上限，避免指数爆炸
-DISK_RADIAL_BRIGHTNESS_MIN = 0
-DISK_RADIAL_BRIGHTNESS_MAX = 32.0
+DISK_RADIAL_BRIGHTNESS_MIN = 0.2
+DISK_RADIAL_BRIGHTNESS_MAX = 8
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -1105,7 +1105,8 @@ class TaichiRenderer:
                  disk_tilt=0.0,
                  lens_flare=False,
                  anti_alias="disabled",
-                 aa_strength=1.0):
+                 aa_strength=1.0,
+                 ignore_taichi_cache=False):
         import taichi as ti
         self.ti = ti
         self.width = width
@@ -1119,7 +1120,8 @@ class TaichiRenderer:
         self.anti_alias = anti_alias
         self.aa_strength = aa_strength
 
-        ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, offline_cache=False)
+        use_cache = not ignore_taichi_cache
+        ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, offline_cache=use_cache)
 
         tex_h, tex_w = skybox.shape[:2]
         dtex_h, dtex_w = disk_tex.shape[:2]
@@ -1907,7 +1909,7 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
                   disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
                   r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
                   lens_flare=False, anti_alias="disabled", aa_strength=1.0,
-                  force_regenerate_disk_texture=False):
+                  force_regenerate_disk_texture=False, ignore_taichi_cache=False):
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
@@ -1925,7 +1927,8 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
         disk_tilt=disk_tilt,
         lens_flare=lens_flare,
         anti_alias=anti_alias,
-        aa_strength=aa_strength
+        aa_strength=aa_strength,
+        ignore_taichi_cache=ignore_taichi_cache
     )
 
     t0 = time.time()
@@ -2104,6 +2107,8 @@ def parse_args():
     parser.add_argument("--device", "-d", type=str, default="cpu",
                         choices=["cpu", "gpu"],
                         help="Taichi 设备: cpu 或 gpu (default: cpu)")
+    parser.add_argument("--ignore_taichi_cache", action="store_true",
+                        help="忽略 Taichi 离线缓存，强制重新编译 kernel (default: 关闭)")
     parser.add_argument("--video", action="store_true",
                         help="视频模式：渲染多帧并合成视频")
     parser.add_argument("--orbit", action="store_true",
@@ -2140,7 +2145,8 @@ if __name__ == "__main__":
             disk_tilt=args.disk_tilt,
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
-            aa_strength=args.aa_strength
+            aa_strength=args.aa_strength,
+            ignore_taichi_cache=args.ignore_taichi_cache
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
@@ -2173,5 +2179,6 @@ if __name__ == "__main__":
             anti_alias=args.anti_alias,
             aa_strength=args.aa_strength,
             force_regenerate_disk_texture=args.force_regenerate_disk_texture,
+            ignore_taichi_cache=args.ignore_taichi_cache,
         )
         save_image(img, args.output)

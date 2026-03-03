@@ -1,0 +1,5 @@
+numpy>=1.24
+pillow>=10.0
+taichi>=1.6
+imageio>=2.25
+tqdm>=4.65

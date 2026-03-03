@@ -6,15 +6,16 @@
 
 - **物理正确**：基于史瓦西度规的零测地线方程，正确模拟引力透镜
 - **吸积盘渲染**：温度剖面纹理、多普勒效应（亮度+颜色偏移）、FBM噪声絮状结构、边缘软化
-- **镜头效果**：分离式 Bloom（只对吸积盘泛光）
+- **镜头效果**：分离式 Bloom + 色散（RGB不同模糊半径）、镜头光晕（可选）
 - **可调倾角**：支持吸积盘倾斜角度
+- **抗锯齿**：Ray differentials + Mipmap LOD，减少摩尔纹
 - **高性能**：Taichi 并行框架，1080p 渲染 < 2s
 - **视频生成**：支持环绕视频、断点续传
 
 ## 安装
 
 ```bash
-pip install numpy pillow taichi imageio
+pip install -r requirements.txt
 ```
 
 ## 使用
@@ -64,6 +65,11 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--ar2` | 吸积盘外半径 | 3.5 rs |
 | `--disk_tilt` | 吸积盘倾角（度） | 0 |
 | `--step_size`, `-s` | 积分步长 | 0.1 |
+| `--r_max` | 逃逸半径 | 10 |
+| `--n_stars` | 天空盒恒星数量 | 6000 |
+| `--anti_alias` | 抗锯齿模式: disabled/lod_radius | disabled |
+| `--aa_strength` | 抗锯齿强度 | 1.0 |
+| `--lens_flare` | 开启镜头光晕效果 | - |
 | `--output`, `-o` | 输出文件路径 | output/blackhole.png |
 | `--device`, `-d` | Taichi 设备: cpu/gpu | cpu |
 
@@ -73,6 +79,8 @@ python render.py --video --orbit --resume -o output/demo.mp4
 |------|------|--------|
 | `--video` | 开启视频模式 | - |
 | `--orbit` | 相机围绕原点旋转 | - |
+| `--orbit_radius` | 轨道半径 | 8.0 |
+| `--orbit_z` | 轨道高度 | 0.5 |
 | `--n_frames` | 视频帧数 | 3600 |
 | `--fps` | 视频帧率 | 36 |
 | `--resume` | 从断点恢复 | - |
