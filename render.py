@@ -20,6 +20,7 @@ import os
 import time
 import argparse
 import hashlib
+from tqdm import tqdm
 
 # ============================================================================
 # 公共常量
@@ -35,7 +36,7 @@ G_FACTOR_CAP = 3
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 4
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.8
+G_BRIGHTNESS_GAIN = 0.6
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -629,20 +630,20 @@ def compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_oute
     """
     import math
     camera_distance = math.sqrt(cam_pos[0]**2 + cam_pos[1]**2 + cam_pos[2]**2)
-    
+
     disk_angular_radius = math.atan(r_outer / camera_distance)
     disk_angular_extent = 2 * disk_angular_radius
     screen_fraction = fov * math.pi / 180.0
-    
+
     n_phi = int(width * (disk_angular_extent / screen_fraction))
     n_r = int(height * (disk_angular_radius / screen_fraction) * 0.5)
-    
+
     n_phi = max(256, n_phi)
     n_r = max(128, n_r)
-    
+
     n_phi = n_phi + (16 - n_phi % 16) % 16
     n_r = n_r + (16 - n_r % 16) % 16
-    
+
     return n_phi, n_r
 
 
@@ -717,7 +718,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
 
     used_angles = []
-    for arm_idx in range(n_arms):
+    for arm_idx in tqdm(range(n_arms), desc="Spiral arms", leave=False):
         if arm_idx < n_from_center:
             r_start = 0.0
             base_angle = arm_idx * 2 * np.pi / n_from_center
@@ -798,77 +799,90 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     # 湍流剪切带来少量粘滞加热，保证所有半径都存在结构温度上限
     temp_struct += 0.05 * np.clip(turbulence, 0, 1)
 
-    # 3) Filaments（细丝）- 模拟 Kelvin-Helmholtz 不稳定性，内圈更密集更短，外圈更长更稀疏
+    # 3) Filaments（细丝）- 向量化计算
     arc_count = int(rng.uniform(50, 100) * disk_area)
+    batch_size = 200
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
-    for _ in range(arc_count):
-        arc_phi_start = rng.uniform(0, 2 * np.pi)
-        r_rand = rng.uniform(0, 1)
-        arc_r = 0.1 + r_rand ** 0.7 * 0.85
-        arc_phi_length = 0.15 + (1 - arc_r) * 0.3 + rng.uniform(0, 0.2)
-        arc_r_width = 0.001 + (1 - arc_r) * 0.004 + rng.uniform(0, 0.002)
-        arc_intensity = 0.4 + (1 - arc_r) * 0.4 + rng.uniform(0, 0.2)
-        # 每条 filament 的温度增量（剪切摩擦加热）
-        arc_delta_T = rng.uniform(0.05, 0.15)
-
-        arc_kappa = 1.0 / (arc_phi_length ** 2) * 1.5
-
-        r_diff = r_norm_grid - arc_r
-
-        arc_val = np.exp(arc_kappa * (np.cos(phi_grid - arc_phi_start) - 1))
-        arc_val *= np.exp(-0.5 * (r_diff / arc_r_width) ** 2)
-        arc_val *= arc_intensity
-
-        arcs += arc_val
-        temp_struct += arc_val * arc_delta_T
+    
+    for batch_start in range(0, arc_count, batch_size):
+        batch_end = min(batch_start + batch_size, arc_count)
+        batch_n = batch_end - batch_start
+        
+        arc_phi_starts = rng.uniform(0, 2 * np.pi, batch_n)
+        r_rands = rng.uniform(0, 1, batch_n)
+        arc_rs = 0.1 + r_rands ** 0.7 * 0.85
+        arc_phi_lengths = 0.15 + (1 - arc_rs) * 0.3 + rng.uniform(0, 0.2, batch_n)
+        arc_r_widths = 0.001 + (1 - arc_rs) * 0.004 + rng.uniform(0, 0.002, batch_n)
+        arc_intensities = 0.4 + (1 - arc_rs) * 0.4 + rng.uniform(0, 0.2, batch_n)
+        arc_delta_Ts = rng.uniform(0.05, 0.15, batch_n)
+        
+        for i in range(batch_n):
+            arc_kappa = 1.0 / (arc_phi_lengths[i] ** 2) * 1.5
+            arc_val = np.exp(arc_kappa * (np.cos(phi_grid - arc_phi_starts[i]) - 1))
+            r_diff = r_norm_grid - arc_rs[i]
+            arc_val *= np.exp(-0.5 * (r_diff / arc_r_widths[i]) ** 2)
+            arc_val *= arc_intensities[i]
+            
+            arcs += arc_val
+            temp_struct += arc_val * arc_delta_Ts[i]
+    
     arcs = np.clip(arcs, 0, 1)
 
-    # 5) Rayleigh-Taylor 不稳定性（ISCO 附近的尖峰和团块）
-    # RT 不稳定性发生在内边界，向外延伸产生"手指"状结构
+# 5) Rayleigh-Taylor 不稳定性（向量化计算）
     rt_spikes = np.zeros((n_r, n_phi), dtype=np.float32)
     rt_count = int(rng.uniform(12, 24) * disk_area * 0.5)
-    for _ in range(rt_count):
-        rt_phi = rng.uniform(0, 2 * np.pi)
-        rt_r_base = rng.uniform(0.01, 0.08)
-        rt_phi_width = rng.uniform(0.1, 0.25)
-        rt_r_length = rng.uniform(0.05, 0.15)
-        rt_intensity = rng.uniform(0.6, 1.0)
-        # RT spike 温度增量（ISCO 附近高温物质）
-        rt_delta_T = rng.uniform(0.3, 1.0)
-
-        rt_phi_kappa = 1.0 / (rt_phi_width ** 2) * 1.5
-        rt_val = np.exp(rt_phi_kappa * (np.cos(phi_grid - rt_phi) - 1))
-
-        rt_r_diff = r_norm_grid - rt_r_base
-        r_fade_out = np.clip(rt_r_length * 2 - rt_r_diff, 0, 1)
-        r_fade_in = np.clip((r_norm_grid - rt_r_base) / (rt_r_length * 0.3), 0, 1)
-        rt_r_profile = np.exp(-0.5 * (rt_r_diff / (rt_r_length * 0.4)) ** 2) * r_fade_out * r_fade_in
-
-        rt_val *= rt_r_profile * rt_intensity
-        rt_spikes += rt_val
-        temp_struct += rt_val * rt_delta_T
-
+    
+    for batch_start in range(0, rt_count, batch_size):
+        batch_end = min(batch_start + batch_size, rt_count)
+        batch_n = batch_end - batch_start
+        
+        rt_phis = rng.uniform(0, 2 * np.pi, batch_n)
+        rt_r_bases = rng.uniform(0.01, 0.08, batch_n)
+        rt_phi_widths = rng.uniform(0.1, 0.25, batch_n)
+        rt_r_lengths = rng.uniform(0.05, 0.15, batch_n)
+        rt_intensities = rng.uniform(0.6, 1.0, batch_n)
+        rt_delta_Ts = rng.uniform(0.3, 1.0, batch_n)
+        
+        for i in range(batch_n):
+            rt_phi_kappa = 1.0 / (rt_phi_widths[i] ** 2) * 1.5
+            rt_val = np.exp(rt_phi_kappa * (np.cos(phi_grid - rt_phis[i]) - 1))
+            
+            rt_r_diff = r_norm_grid - rt_r_bases[i]
+            r_fade_out = np.clip(rt_r_lengths[i] * 2 - rt_r_diff, 0, 1)
+            r_fade_in = np.clip((r_norm_grid - rt_r_bases[i]) / (rt_r_lengths[i] * 0.3), 0, 1)
+            rt_r_profile = np.exp(-0.5 * (rt_r_diff / (rt_r_lengths[i] * 0.4)) ** 2) * r_fade_out * r_fade_in
+            
+            rt_val *= rt_r_profile * rt_intensities[i]
+            rt_spikes += rt_val
+            temp_struct += rt_val * rt_delta_Ts[i]
+    
     rt_spikes = np.clip(rt_spikes, 0, 1)
 
-    # 4) 温度热点（内圈更密集更亮，模拟磁重联等活动）
+    # 4) 温度热点（向量化计算）
     hotspot_count = int(rng.uniform(20, 35) * disk_area)
     hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
-    # 幂律分布温度增量：小耀斑多、大爆发少
-    hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)  # [0.5, 3.0]，偏向低值
-    for hi in range(hotspot_count):
-        h_phi = rng.uniform(0, 2 * np.pi)
-        r_rand = rng.uniform(0, 1)
-        h_r = 0.1 + r_rand ** 0.6 * 0.85
-        h_phi_width = rng.uniform(0.04, 0.12)
-        h_r_width = 0.003 + (1 - h_r) * 0.006 + rng.uniform(0, 0.003)
-        h_intensity = 0.3 + (1 - h_r) * 0.6 + rng.uniform(0, 0.1)
-
-        h_kappa = 1.0 / (h_phi_width ** 2) * 1.5
-
-        r_diff = r_norm_grid - h_r
-        h_val = np.exp(h_kappa * (np.cos(phi_grid - h_phi) - 1)) * np.exp(-0.5 * (r_diff / h_r_width) ** 2)
-        hotspot += h_intensity * h_val
-        temp_struct += h_val * h_intensity * hotspot_delta_Ts[hi]
+    hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)
+    
+    for batch_start in range(0, hotspot_count, batch_size):
+        batch_end = min(batch_start + batch_size, hotspot_count)
+        batch_n = batch_end - batch_start
+        
+        h_phis = rng.uniform(0, 2 * np.pi, batch_n)
+        r_rands = rng.uniform(0, 1, batch_n)
+        h_rs = 0.1 + r_rands ** 0.6 * 0.85
+        h_phi_widths = rng.uniform(0.04, 0.12, batch_n)
+        h_r_widths = 0.003 + (1 - h_rs) * 0.006 + rng.uniform(0, 0.003, batch_n)
+        h_intensities = 0.3 + (1 - h_rs) * 0.6 + rng.uniform(0, 0.1, batch_n)
+        
+        for i in range(batch_n):
+            h_kappa = 1.0 / (h_phi_widths[i] ** 2) * 1.5
+            r_diff = r_norm_grid - h_rs[i]
+            h_val = np.exp(h_kappa * (np.cos(phi_grid - h_phis[i]) - 1))
+            h_val *= np.exp(-0.5 * (r_diff / h_r_widths[i]) ** 2)
+            
+            hotspot += h_intensities[i] * h_val
+            temp_struct += h_val * h_intensities[i] * hotspot_delta_Ts[batch_start + i]
+    
     hotspot = np.clip(hotspot, 0, 1)
 
     # 5) 方位热点（低频正弦 + 噪声，自转流动感）
