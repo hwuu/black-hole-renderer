@@ -36,7 +36,7 @@ G_FACTOR_CAP = 1.5
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 1.5
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.3
+G_BRIGHTNESS_GAIN = 0.22
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
@@ -1143,14 +1143,13 @@ class TaichiRenderer:
         max_h = max(m.shape[0] for m in mips)
         max_w = max(m.shape[1] for m in mips)
         self.disk_mips_field = ti.Vector.field(4, dtype=ti.f32, shape=(self.num_mip_levels, max_h, max_w))
-# 逐级填充（优化：使用 from_numpy 批量写入）
+
+        # 逐级填充（用 numpy 预处理后一次性写入，避免逐像素循环）
+        mips_padded = np.zeros((len(mips), max_h, max_w, 4), dtype=np.float32)
         for i, m in enumerate(mips):
             h, w = m.shape[:2]
-            temp_field = ti.Vector.field(4, dtype=ti.f32, shape=(h, w))
-            temp_field.from_numpy(m)
-            for y in range(h):
-                for x in range(w):
-                    self.disk_mips_field[i, y, x] = temp_field[y, x]
+            mips_padded[i, :h, :w] = m
+        self.disk_mips_field.from_numpy(mips_padded)
 
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.disk_layer_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))

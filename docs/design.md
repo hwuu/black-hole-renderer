@@ -587,6 +587,7 @@ base_tex → 2x2 avg → level 1 → 2x2 avg → level 2 → ...
 
 ---
 
+- v5.22 (2026-03-03): 优化 Taichi 初始化速度：mipmap 填充改为 numpy 预处理后一次性写入（从 400+ 秒降到 0.2 秒）
 - v5.21 (2026-03-03): 优化吸积盘模拟：螺旋臂 8-15 条 → 2-4 条（符合物理瞬态特征）；添加 Rayleigh-Taylor 不稳定性（ISCO 附近尖峰）；云雾湍流增加多层 FBM 高频噪声（8-400 频率）；filaments/hotspots 按盘面积缩放，径向内密外疏；base 密度 0.2
 - v5.20 (2026-03-03): 吸积盘湍流扰动：对 density 和 temp_struct 同时应用多频噪声调制（借鉴 turbulence 的 5 层结构 + 剪切），边缘呈现絮状破碎感；内圈保持较高亮度（radial_preserve）
 - v5.19 (2026-03-03): 吸积盘温度 T_max 上调至 10000K（原来 7000K），density base 上调至 0.15；蓝色 bloom sigma 上调至 3000
