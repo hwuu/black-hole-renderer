@@ -7,9 +7,7 @@ Schwarzschild 黑洞光线追踪渲染器
 基于广义相对论的史瓦西度规，使用笛卡尔等效形式的光线方程：
     d²x/dλ² = -1.5 * L² * x / r⁵
 
-支持两种渲染框架：
-- numpy: 纯 NumPy 实现，compact 算法
-- taichi: Taichi 框架（CPU/GPU），while_loop 算法
+基于 Taichi 框架的并行渲染器（支持 CPU/GPU）
 
 Reference: https://github.com/JaeHyunLee94/BlackHoleRendering
 """
@@ -108,59 +106,6 @@ def build_camera(cam_pos, fov_deg, width, height):
     return cam_pos, cam_right, cam_up, cam_forward, pixel_width, pixel_height
 
 
-def make_all_rays(width, height, cam_pos, cam_right, cam_up, cam_forward, pixel_width, pixel_height):
-    """
-    为所有像素生成光线（位置、方向、角动量平方）
-
-    参数:
-        width: 图像宽度
-        height: 图像高度
-        cam_pos: 相机位置
-        cam_right: 相机右向量
-        cam_up: 相机上向量
-        cam_forward: 相机前向量（指向目标）
-        pixel_width: 像素宽度（世界坐标）
-        pixel_height: 像素高度（世界坐标）
-
-    返回:
-        (positions, velocities, L2, pixel_coords)
-        - positions: (N, 3) 光线起始位置
-        - velocities: (N, 3) 光线方向单位向量
-        - L2: (N,) 角动量平方（守恒量）
-        - pixel_coords: (N, 2) 像素坐标 (x, y)
-    """
-    py, px = np.mgrid[0:height, 0:width]
-    px = px.ravel().astype(np.float64)
-    py = py.ravel().astype(np.float64)
-
-    # 计算图像平面左上角位置
-    image_plane_center = cam_pos + cam_forward * 1.0
-    top_left = (image_plane_center
-                - cam_right * (pixel_width * width / 2)
-                + cam_up * (pixel_height * height / 2))
-
-    # 计算每个像素在图像平面上的位置
-    pixel_pos_x = top_left[0] + (px + 0.5) * pixel_width * cam_right[0] - (py + 0.5) * pixel_height * cam_up[0]
-    pixel_pos_y = top_left[1] + (px + 0.5) * pixel_width * cam_right[1] - (py + 0.5) * pixel_height * cam_up[1]
-    pixel_pos_z = top_left[2] + (px + 0.5) * pixel_width * cam_right[2] - (py + 0.5) * pixel_height * cam_up[2]
-
-    pixel_pos = np.column_stack([pixel_pos_x, pixel_pos_y, pixel_pos_z])
-
-    # 光线方向：从相机指向像素
-    dirs = pixel_pos - cam_pos
-    norms = np.linalg.norm(dirs, axis=1, keepdims=True)
-    dirs /= norms
-
-    N = len(px)
-    positions = np.tile(cam_pos, (N, 1))  # 所有光线从相机位置出发
-    velocities = dirs  # 单位方向向量
-
-    # 计算角动量平方 L² = |v × x|²（守恒量）
-    cross = np.cross(velocities, positions)
-    L2 = np.sum(cross * cross, axis=1)
-
-    pixel_coords = np.column_stack([px.astype(int), py.astype(int)])
-    return positions, velocities, L2, pixel_coords
 
 
 # ============================================================================
@@ -493,42 +438,6 @@ def load_disk_texture(path):
     return None
 
 
-def sample_disk_texture(texture, x, y, r_inner, r_outer):
-    """
-    双线性插值采样吸积盘纹理（NumPy 批量版）
-    返回 (N, 4) RGBA
-
-    UV 映射（对齐 JaeHyunLee94）：
-      u = phi / (2*pi)           — 方位角 → 纹理宽度
-      v = (r - r_inner) / (r_outer - r_inner) — 径向 → 纹理高度
-    """
-    r = np.sqrt(x**2 + y**2)
-    phi = np.arctan2(y, x)
-    phi = np.where(phi < 0, phi + 2 * np.pi, phi)
-
-    tex_h, tex_w = texture.shape[:2]
-    u = phi / (2 * np.pi) * tex_w
-    v = (r - r_inner) / (r_outer - r_inner) * tex_h
-
-    u0 = np.floor(u).astype(int)
-    v0 = np.floor(v).astype(int)
-    fu = (u - u0)[:, None]
-    fv = (v - v0)[:, None]
-
-    u0_w = u0 % tex_w
-    u1_w = (u0 + 1) % tex_w
-    v0_h = np.clip(v0, 0, tex_h - 1)
-    v1_h = np.clip(v0 + 1, 0, tex_h - 1)
-
-    c00 = texture[v0_h, u0_w]
-    c10 = texture[v0_h, u1_w]
-    c01 = texture[v1_h, u0_w]
-    c11 = texture[v1_h, u1_w]
-
-    return (c00 * (1 - fu) * (1 - fv) +
-            c10 * fu * (1 - fv) +
-            c01 * (1 - fu) * fv +
-            c11 * fu * fv)
 
 
 def _tileable_noise(shape, rng, freq_u=6, freq_v=6):
@@ -679,148 +588,17 @@ def load_cached_disk_texture(width=None, height=None, cam_pos=None, fov=None,
     return tex
 
 
-def _generate_arcs_taichi(n_r, n_phi, arc_data):
-    """Taichi 加速的 filaments 生成
-    arc_data: (n_arcs, 5) array [arc_r, arc_phi_start, arc_phi_length, arc_r_width, arc_intensity]
+
+def _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid):
     """
-    import taichi as ti
-    ti.init(arch=ti.cpu, offline_cache=False)
-
-    n_arcs = arc_data.shape[0]
-    arcs = np.zeros((n_r, n_phi), dtype=np.float32)
-
-    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
-    r_norm = np.linspace(0, 1, n_r)
-    phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
-
-    arcs_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    phi_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    r_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-
-    phi_grid_field.from_numpy(phi_grid.astype(np.float32))
-    r_grid_field.from_numpy(r_norm_grid.astype(np.float32))
-
-    arc_data_field = ti.field(dtype=ti.f32, shape=(n_arcs, 5))
-    arc_data_field.from_numpy(arc_data.astype(np.float32))
-
-    @ti.kernel
-    def compute_arcs():
-        for i, j in ti.ndrange(n_r, n_phi):
-            total = 0.0
-            phi_val = phi_grid_field[i, j]
-            r_val = r_grid_field[i, j]
-            for k in range(n_arcs):
-                arc_r = arc_data_field[k, 0]
-                phi_start = arc_data_field[k, 1]
-                phi_len = arc_data_field[k, 2]
-                r_width = arc_data_field[k, 3]
-                intensity = arc_data_field[k, 4]
-
-                kappa = 1.0 / (phi_len * phi_len + 1e-6) * 1.5
-                arc_val = ti.exp(kappa * (ti.cos(phi_val - phi_start) - 1.0))
-
-                r_diff = r_val - arc_r
-                arc_val *= ti.exp(-0.5 * (r_diff * r_diff) / (r_width * r_width + 1e-6))
-                arc_val *= intensity
-
-                total += arc_val
-            arcs_field[i, j] = ti.min(total, 1.0)
-
-    compute_arcs()
-    arcs = arcs_field.to_numpy()
-    ti.reset()
-    return arcs
-
-
-def _generate_hotspots_taichi(n_r, n_phi, hotspot_data):
-    """Taichi 加速的 hotspots 生成
-    hotspot_data: (n_hotspots, 5) array [h_r, h_phi, h_phi_width, h_r_width, h_intensity]
+    生成螺旋臂密度和温度贡献
+    返回: (spiral, temp_contribution)
     """
-    import taichi as ti
-    ti.init(arch=ti.cpu, offline_cache=False)
-
-    n_hotspots = hotspot_data.shape[0]
-    hotspot = np.zeros((n_r, n_phi), dtype=np.float32)
-
-    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
-    r_norm = np.linspace(0, 1, n_r)
-    phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
-
-    hotspot_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    phi_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-    r_grid_field = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
-
-    phi_grid_field.from_numpy(phi_grid.astype(np.float32))
-    r_grid_field.from_numpy(r_norm_grid.astype(np.float32))
-
-    hotspot_data_field = ti.field(dtype=ti.f32, shape=(n_hotspots, 5))
-    hotspot_data_field.from_numpy(hotspot_data.astype(np.float32))
-
-    @ti.kernel
-    def compute_hotspots():
-        for i, j in ti.ndrange(n_r, n_phi):
-            total = 0.0
-            phi_val = phi_grid_field[i, j]
-            r_val = r_grid_field[i, j]
-            for k in range(n_hotspots):
-                h_r = hotspot_data_field[k, 0]
-                h_phi = hotspot_data_field[k, 1]
-                h_phi_w = hotspot_data_field[k, 2]
-                h_r_w = hotspot_data_field[k, 3]
-                intensity = hotspot_data_field[k, 4]
-
-                kappa = 1.0 / (h_phi_w * h_phi_w + 1e-6) * 1.5
-                h_val = ti.exp(kappa * (ti.cos(phi_val - h_phi) - 1.0))
-
-                r_diff = r_val - h_r
-                h_val *= ti.exp(-0.5 * (r_diff * r_diff) / (h_r_w * h_r_w + 1e-6))
-                h_val *= intensity
-
-                total += h_val
-            hotspot_field[i, j] = ti.min(total, 1.0)
-
-    compute_hotspots()
-    hotspot = hotspot_field.to_numpy()
-    ti.reset()
-    return hotspot
-
-
-def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True):
-    """
-    直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
-    - n_phi: 角度方向分辨率（对应 0-2π）
-    - n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
-    - enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
-    返回 (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
-    """
-    rng = np.random.default_rng(seed)
-
-    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
-    r_norm = np.linspace(0, 1, n_r)
-    phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
-
-    r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
-    disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
-
-    # ----- 温度基底（内热外冷 + 噪声扰动）-----
-    # 先生成径向递减的基底，再叠加轻微噪声，最终数值控制在 0~0.45
-    radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
-    temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
-    temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
-    temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
-    temp_base = np.clip(radial_decay * (0.85 + 0.15 * temp_noise), 0, 1)
-    temp_base *= 0.25
-
-    # 各结构的温度贡献将在下面的循环中累积
-    temp_struct = np.zeros((n_r, n_phi), dtype=np.float32)
-
-    # ----- 密度场 -----
-    # 1) 螺旋臂（2-4条，物理上吸积盘的旋臂是瞬态的，持续数天-数年，1-3条更符合物理）
     n_arms = rng.integers(2, 5)
     n_from_center = rng.integers(2, 4)
     spiral = np.zeros((n_r, n_phi), dtype=np.float32)
+    temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
-    # 生成一条噪声用于调制悬臂宽度和强度
     arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
 
     used_angles = []
@@ -840,7 +618,6 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         rotations = rng.uniform(2.5, 5.0)
         base_width = rng.uniform(0.2, 0.4)
         intensity = rng.uniform(0.5, 0.9)
-        # 每条臂的温度增量（密度波压缩加热）
         arm_delta_T = rng.uniform(0.1, 0.3)
 
         r_length = rotations / 6.0 * (1.0 - r_start)
@@ -849,7 +626,6 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
         arm_angle = phi_grid - base_angle - r_norm_grid * rotations * 2 * np.pi
 
-        # 宽度随噪声变化
         width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
         width_mod = np.clip(width_mod, 0.3, 2.0)
 
@@ -859,9 +635,7 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         mask = (r_norm_grid >= r_start) & (r_norm_grid <= r_end)
         arm_val = np.where(mask, arm_val, 0)
 
-        # 强度随噪声变化（断断续续，模拟吸积盘旋臂的瞬态和不稳定特性）
         intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.2)
-        # 额外的高频破碎：在某些位置完全断开，增加破碎感
         break_noise = _tileable_noise((n_r, n_phi), rng, freq_u=12, freq_v=6)
         break_mask = break_noise > 0.5
         intensity_mod = np.where(break_mask, intensity_mod * 0.05, intensity_mod)
@@ -871,18 +645,19 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         arm_val *= fade_in * fade_out * intensity * intensity_mod
 
         spiral += arm_val
-
-        # 温度贡献：密度波压缩加热
-        temp_struct += arm_val * arm_delta_T
+        temp_contribution += arm_val * arm_delta_T
 
     spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
+    return spiral, temp_contribution
 
-    # 2) 云雾（多频弧线叠加 + 开普勒剪切扭曲 + 像素级噪声增加絮状质感）
-    # 开普勒剪切：内圈角速度快、外圈慢，φ 坐标偏移量 ∝ r^(-1.5)
-    # 用剪切后的 φ 坐标采样噪声，拉出方向性丝状结构
-    shear_strength = rng.uniform(3.0, 6.0)  # 剪切强度
+
+def _generate_turbulence(rng, n_r, n_phi, r_norm_grid):
+    """
+    生成云雾/湍流密度和温度贡献
+    返回: (turbulence, kep_shift_pixels, temp_contribution)
+    """
+    shear_strength = rng.uniform(3.0, 6.0)
     kep_shear = shear_strength * (1.0 / np.maximum(r_norm_grid, 0.05) ** 1.5 - 1.0)
-    # 归一化到像素偏移量
     kep_shift_pixels = (kep_shear / (2 * np.pi) * n_phi).astype(int)
 
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
@@ -891,23 +666,26 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
 
-    # 对中低频层应用剪切扭曲（高频层保持原位，避免过度模糊）
     for layer in [turbulence_coarse, turbulence_mid, turbulence_fine]:
         for ri in range(n_r):
             layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
 
-    # 像素级高频噪声：直接用随机值，模拟未分辨的细小团块
     pixel_noise = rng.random((n_r, n_phi)).astype(np.float32)
-    pixel_noise = (pixel_noise - 0.5) * 2  # [-1, 1]
+    pixel_noise = (pixel_noise - 0.5) * 2
     turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
                   + 0.25 * turbulence_fine + 0.22 * turbulence_extra
                   + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
-    # 湍流剪切带来少量粘滞加热，保证所有半径都存在结构温度上限
-    temp_struct += 0.05 * np.clip(turbulence, 0, 1)
 
-    # 3) Filaments（细丝）- NumPy 向量化分批计算
+    temp_contribution = 0.05 * np.clip(turbulence, 0, 1)
+    return turbulence, kep_shift_pixels, temp_contribution
+
+
+def _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
+    """
+    生成细丝（filaments）密度和温度贡献
+    返回：(arcs, temp_contribution)
+    """
     arc_count = int(rng.uniform(50, 100) * disk_area)
-    batch_size = 100
 
     arc_phi_starts = rng.uniform(0, 2 * np.pi, arc_count)
     r_rands = rng.uniform(0, 1, arc_count)
@@ -938,10 +716,17 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         arcs += np.sum(arc_batch, axis=0)
 
     arcs = np.clip(arcs, 0, 1)
-    temp_struct += 0.08 * arcs  # 简化温度贡献
+    temp_contribution = 0.08 * arcs
+    return arcs, temp_contribution
 
-# 5) Rayleigh-Taylor 不稳定性（保持原有逻辑，但不使用 batch_size）
+
+def _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt):
+    """
+    生成 Rayleigh-Taylor 不稳定性密度和温度贡献
+    返回：(rt_spikes, temp_contribution)
+    """
     rt_spikes = np.zeros((n_r, n_phi), dtype=np.float32)
+    temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
     rt_count = int(rng.uniform(12, 24) * disk_area * 0.5)
 
     rt_phis = rng.uniform(0, 2 * np.pi, rt_count)
@@ -962,11 +747,53 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
 
         rt_val *= rt_r_profile * rt_intensities[i]
         rt_spikes += rt_val
-        temp_struct += rt_val * rt_delta_Ts[i]
+        temp_contribution += rt_val * rt_delta_Ts[i]
 
     rt_spikes = np.clip(rt_spikes, 0, 1)
+    return rt_spikes, temp_contribution
 
-    # 4) 温度热点 - NumPy 向量化分批计算
+
+def _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid):
+    """
+    生成方位热点（低频正弦 + 噪声，自转流动感）
+    返回：az_hotspot
+    """
+    az_freq = rng.integers(2, 5)
+    shear = r_norm_grid ** 1.2 * rng.uniform(2.0, 4.0)
+    az_wave = 0.5 + 0.5 * np.sin((phi_grid + shear) * az_freq)
+    az_noise = _fbm_noise((n_r, n_phi), rng, octaves=3, persistence=0.5, base_scale=3, wrap_u=True)
+    az_hotspot = np.clip(0.6 * az_wave + 0.4 * az_noise, 0, 1) ** 1.2
+    return az_hotspot
+
+
+def _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid):
+    """
+    Apply turbulence disturbance to density and temperature fields.
+    Returns: (density, temp_struct)
+    """
+    disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
+    disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
+    disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
+    disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
+    for layer in [disturb_coarse, disturb_mid]:
+        for ri in range(n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+    disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
+    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
+                   + 0.30 * disturb_extra + 0.20 * disturb_pixel)
+    disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
+    radial_preserve = 0.6 + 0.4 * r_norm_grid
+    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
+    density = density * disturb_mod
+    temp_struct = temp_struct * disturb_mod
+    return density, temp_struct
+
+
+def _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
+    """
+    生成温度热点密度和温度贡献
+    返回：(hotspot, temp_contribution)
+    """
     hotspot_count = int(rng.uniform(20, 35) * disk_area)
     hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)
 
@@ -999,40 +826,70 @@ def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5
         hotspot += np.sum(h_batch, axis=0)
 
     hotspot = np.clip(hotspot, 0, 1)
-    temp_struct += 0.12 * hotspot  # 简化温度贡献
+    temp_contribution = 0.12 * hotspot
+    return hotspot, temp_contribution
 
-    # 5) 方位热点（低频正弦 + 噪声，自转流动感）
-    az_freq = rng.integers(2, 5)
-    shear = r_norm_grid ** 1.2 * rng.uniform(2.0, 4.0)
-    az_wave = 0.5 + 0.5 * np.sin((phi_grid + shear) * az_freq)
-    az_noise = _fbm_noise((n_r, n_phi), rng, octaves=3, persistence=0.5, base_scale=3, wrap_u=True)
-    az_hotspot = np.clip(0.6 * az_wave + 0.4 * az_noise, 0, 1) ** 1.2
+
+def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True):
+    """
+    直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
+    - n_phi: 角度方向分辨率（对应 0-2π）
+    - n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
+    - enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
+    返回 (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
+    """
+    rng = np.random.default_rng(seed)
+
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+    r_norm = np.linspace(0, 1, n_r)
+    phi_grid, r_norm_grid = np.meshgrid(phi, r_norm)
+
+    r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
+    disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
+
+    # ----- 温度基底（内热外冷 + 噪声扰动）-----
+    # 先生成径向递减的基底，再叠加轻微噪声，最终数值控制在 0~0.45
+    radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
+    temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
+    temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
+    temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
+    temp_base = np.clip(radial_decay * (0.85 + 0.15 * temp_noise), 0, 1)
+    temp_base *= 0.25
+
+    # 各结构的温度贡献将在下面的循环中累积
+    temp_struct = np.zeros((n_r, n_phi), dtype=np.float32)
+
+    # ----- 密度场 -----
+    # 1) 螺旋臂
+    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid)
+    temp_struct += spiral_temp
+
+
+    # 2) 云雾
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid)
+    temp_struct += turb_temp
+
+    # 3) Filaments
+    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area)
+    temp_struct += arcs_temp
+
+    # 4) Rayleigh-Taylor 不稳定性
+    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt)
+    temp_struct += rt_temp
+
+    # 5) 温度热点
+    hotspot, hotspot_temp = _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area)
+    temp_struct += hotspot_temp
+
+    # 5) 方位热点
+    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid)
 
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
     density = 0.15 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
 
-    # 湍流扰动：借鉴 turbulence 的多频 + 剪切结构，对密度和温度场同时调制
-    disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
-    disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
-    disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
-    disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
-    # 对低频层应用剪切扭曲
-    for layer in [disturb_coarse, disturb_mid]:
-        for ri in range(n_r):
-            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
-    # 像素级噪声
-    disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
-    # 组合：0.05-1.0 极端扰动，内圈扰动较弱以保持亮度
-    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
-                   + 0.30 * disturb_extra + 0.20 * disturb_pixel)
-    disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
-    # 内圈保持较高亮度，外圈扰动更强
-    radial_preserve = 0.6 + 0.4 * r_norm_grid
-    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
-
-    density *= disturb_mod
-    temp_struct *= disturb_mod
+    # 湍流扰动
+    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid)
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -1185,10 +1042,12 @@ class TaichiRenderer:
         alpha_gain = ti.cast(DISK_ALPHA_GAIN, ti.f32)
 
         @ti.func
-        def apply_g_factor(base_color, hit_pos, hit_r, ray_dir_to_cam, cam_pos,
-                           r_inner, r_outer, tilt_rad):
-            """
-            Taichi 版本的 g 因子调制（参照 starless Redshift 推导）
+        def _apply_g_factor(base_color, hit_pos, hit_r, ray_dir_to_cam, cam_pos,
+                            r_inner, r_outer, tilt_rad):
+            """Apply relativistic g-factor to disk color.
+            
+            Computes Doppler shift and gravitational redshift for accretion disk emission.
+            Returns color modulated by g-factor with radial brightness profile.
             """
             rs_f = ti.cast(RS, ti.f32)
             r_obs = cam_pos.norm()
@@ -1262,17 +1121,19 @@ class TaichiRenderer:
             return ti.math.clamp(shifted * tint * brightness, 0.0, 10.0)
 
         @ti.func
-        def compute_acceleration(pos, L2):
+        def _compute_acceleration(pos, L2):
+            """Compute gravitational acceleration for Schwarzschild metric."""
             r2 = pos.dot(pos)
             r = ti.sqrt(r2)
             r5 = r2 * r2 * r
             return -1.5 * L2 / r5 * pos
 
         @ti.func
-        def compute_acc_jacobian(pos, d_pos, L2):
-            """计算加速度对位置的偏导数作用在 d_pos 上
-            acc = -1.5 * L2 / r^5 * pos
-            d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
+        def _compute_acc_jacobian(pos, d_pos, L2):
+            """Compute Jacobian of acceleration w.r.t. position.
+            
+            For variational equation: d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
+            Applied to perturbation vector d_pos.
             """
             r2 = pos.dot(pos)
             r = ti.sqrt(r2)
@@ -1283,7 +1144,8 @@ class TaichiRenderer:
             return factor * (d_pos - 5.0 * pos * proj)
 
         @ti.func
-        def sample_skybox(d):
+        def _sample_skybox(d):
+            """Sample skybox texture with bilinear interpolation."""
             x, y, z = d[0], d[1], d[2]
             theta = ti.acos(ti.min(ti.max(z, -1.0), 1.0))
             phi = ti.atan2(y, x)
@@ -1309,7 +1171,8 @@ class TaichiRenderer:
                     c11 * fu * fv)
 
         @ti.func
-        def sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset):
+        def _sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset):
+            """Sample accretion disk texture with bilinear interpolation."""
             r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
             phi = ti.atan2(hit_y, hit_x)
             omega = ti.sqrt(0.5 / (r + 0.01))
@@ -1339,8 +1202,8 @@ class TaichiRenderer:
                     c11 * fu * fv)
 
         @ti.func
-        def sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod):
-            """带 mipmap 的纹理采样"""
+        def _sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod):
+            """Sample accretion disk texture with mipmap LOD."""
             r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
             phi = ti.atan2(hit_y, hit_x)
             omega = ti.sqrt(0.5 / (r + 0.01))
@@ -1377,13 +1240,18 @@ class TaichiRenderer:
                     c11 * fu * fv)
 
         @ti.kernel
-        def render_kernel(image_field: ti.template(), disk_layer_field: ti.template(),
-                          cam_pos_field: ti.template(), cam_right_field: ti.template(),
-                          cam_up_field: ti.template(), cam_forward_field: ti.template(),
-                          pixel_width_field: ti.template(),
-                          pixel_height_field: ti.template(), r_escape_field: ti.template(),
-                          h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32,
-                          disk_tilt: ti.f32):
+        def _ray_march_kernel(image_field: ti.template(), disk_layer_field: ti.template(),
+                              cam_pos_field: ti.template(), cam_right_field: ti.template(),
+                              cam_up_field: ti.template(), cam_forward_field: ti.template(),
+                              pixel_width_field: ti.template(),
+                              pixel_height_field: ti.template(), r_escape_field: ti.template(),
+                              h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32,
+                              disk_tilt: ti.f32):
+            """Ray marching kernel for Schwarzschild black hole rendering.
+            
+            Traces rays from camera through each pixel, integrating accretion disk
+            emission along the path with relativistic effects.
+            """
             cp = cam_pos_field[None]
             cr = cam_right_field[None]
             cu = cam_up_field[None]
@@ -1458,39 +1326,39 @@ class TaichiRenderer:
 
                     # 主光线 RK4
                     k1p = h * dir_
-                    k1d = h * compute_acceleration(pos, L2_val)
+                    k1d = h * _compute_acceleration(pos, L2_val)
                     k2p = h * (dir_ + 0.5 * k1d)
-                    k2d = h * compute_acceleration(pos + 0.5 * k1p, L2_val)
+                    k2d = h * _compute_acceleration(pos + 0.5 * k1p, L2_val)
                     k3p = h * (dir_ + 0.5 * k2d)
-                    k3d = h * compute_acceleration(pos + 0.5 * k2p, L2_val)
+                    k3d = h * _compute_acceleration(pos + 0.5 * k2p, L2_val)
                     k4p = h * (dir_ + k3d)
-                    k4d = h * compute_acceleration(pos + k3p, L2_val)
+                    k4d = h * _compute_acceleration(pos + k3p, L2_val)
 
                     new_pos = pos + (k1p + 2 * k2p + 2 * k3p + k4p) / 6
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6
 
                     # 微分光线 RK4（同步更新 X 方向）
                     k1p_dx = h * d_dir_dx
-                    k1d_dx = h * compute_acc_jacobian(pos, d_pos_dx, L2_val)
+                    k1d_dx = h * _compute_acc_jacobian(pos, d_pos_dx, L2_val)
                     k2p_dx = h * (d_dir_dx + 0.5 * k1d_dx)
-                    k2d_dx = h * compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dx + 0.5 * k1p_dx, L2_val)
+                    k2d_dx = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dx + 0.5 * k1p_dx, L2_val)
                     k3p_dx = h * (d_dir_dx + 0.5 * k2d_dx)
-                    k3d_dx = h * compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dx + 0.5 * k2p_dx, L2_val)
+                    k3d_dx = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dx + 0.5 * k2p_dx, L2_val)
                     k4p_dx = h * (d_dir_dx + k3d_dx)
-                    k4d_dx = h * compute_acc_jacobian(pos + k3p, d_pos_dx + k3p_dx, L2_val)
+                    k4d_dx = h * _compute_acc_jacobian(pos + k3p, d_pos_dx + k3p_dx, L2_val)
 
                     new_d_pos_dx = d_pos_dx + (k1p_dx + 2 * k2p_dx + 2 * k3p_dx + k4p_dx) / 6
                     new_d_dir_dx = d_dir_dx + (k1d_dx + 2 * k2d_dx + 2 * k3d_dx + k4d_dx) / 6
 
                     # 微分光线 RK4（同步更新 Y 方向）
                     k1p_dy = h * d_dir_dy
-                    k1d_dy = h * compute_acc_jacobian(pos, d_pos_dy, L2_val)
+                    k1d_dy = h * _compute_acc_jacobian(pos, d_pos_dy, L2_val)
                     k2p_dy = h * (d_dir_dy + 0.5 * k1d_dy)
-                    k2d_dy = h * compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dy + 0.5 * k1p_dy, L2_val)
+                    k2d_dy = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dy + 0.5 * k1p_dy, L2_val)
                     k3p_dy = h * (d_dir_dy + 0.5 * k2d_dy)
-                    k3d_dy = h * compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dy + 0.5 * k2p_dy, L2_val)
+                    k3d_dy = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dy + 0.5 * k2p_dy, L2_val)
                     k4p_dy = h * (d_dir_dy + k3d_dy)
-                    k4d_dy = h * compute_acc_jacobian(pos + k3p, d_pos_dy + k3p_dy, L2_val)
+                    k4d_dy = h * _compute_acc_jacobian(pos + k3p, d_pos_dy + k3p_dy, L2_val)
 
                     new_d_pos_dy = d_pos_dy + (k1p_dy + 2 * k2p_dy + 2 * k3p_dy + k4p_dy) / 6
                     new_d_dir_dy = d_dir_dy + (k1d_dy + 2 * k2d_dy + 2 * k3d_dy + k4d_dy) / 6
@@ -1542,7 +1410,7 @@ class TaichiRenderer:
                             disk_rgba = ti.Vector([0.0, 0.0, 0.0, 0.0])
                             if anti_alias_mode == 0:
                                 # disabled: 直接采样
-                                disk_rgba = sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
+                                disk_rgba = _sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
                             else:
                                 # ray_differentials: 根据光线微分计算纹理梯度
                                 # 计算击中点处的纹理坐标梯度
@@ -1573,13 +1441,13 @@ class TaichiRenderer:
                                 lod_diff = ti.log(ti.max(grad_sq, 1.0)) / ti.log(2.0) * aa_strength
                                 lod_diff = ti.min(ti.max(lod_diff, 0.0), 3.0)
 
-                                disk_rgba = sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod_diff)
+                                disk_rgba = _sample_disk_mip(hit_x, hit_y, r_inner, r_outer, t_offset, lod_diff)
 
                             disk_col = ti.Vector([disk_rgba[0], disk_rgba[1], disk_rgba[2]])
                             base_alpha = ti.min(disk_rgba[3], 0.999)
                             disk_alpha = 1.0 - ti.pow(1.0 - base_alpha, alpha_gain)
 
-                            col_shifted = apply_g_factor(
+                            col_shifted = _apply_g_factor(
                                 disk_col, hit_pos_vec, hit_r, ray_to_cam, cp, r_inner, r_outer, tilt_rad
                             )
 
@@ -1596,19 +1464,24 @@ class TaichiRenderer:
                 if event_horizon_hit:
                     bg_color = ti.Vector([0.0, 0.0, 0.0])
                 elif escaped:
-                    bg_color = sample_skybox(escape_dir)
+                    bg_color = _sample_skybox(escape_dir)
 
                 bg_color = bg_color * (1.0 - disk_alpha_total)
 
                 image_field[i, j] = bg_color
                 disk_layer_field[i, j] = ti.math.clamp(accum_disk, 0.0, 1.0)
 
-        self._render_kernel = render_kernel
+        self._ray_march_kernel = _ray_march_kernel
 
         @ti.kernel
-        def bloom_kernel(image_field: ti.template(), bright_field: ti.template(),
-                         blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32,
-                         kernel_radius: ti.i32, sigma_scale: ti.f32):
+        def _bloom_kernel(image_field: ti.template(), bright_field: ti.template(),
+                          blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32,
+                          kernel_radius: ti.i32, sigma_scale: ti.f32):
+            """Bloom post-processing kernel.
+            
+            Extracts bright regions, applies separable Gaussian blur,
+            and adds back to image for glow effect.
+            """
             w = ti.cast(image_field.shape[0], ti.i32)
             h = ti.cast(image_field.shape[1], ti.i32)
 
@@ -1694,13 +1567,18 @@ class TaichiRenderer:
                 image_field[i, j] = ti.math.clamp(
                     image_field[i, j] + blur_field[i, j] * intensity, 0.0, 1.0)
 
-        self._bloom_kernel = bloom_kernel
+        self._bloom_kernel = _bloom_kernel
 
         @ti.kernel
-        def lens_flare_kernel(image_field: ti.template(),
-                              disk_center_x: ti.f32, disk_center_y: ti.f32,
-                              screen_center_x: ti.f32, screen_center_y: ti.f32,
-                              intensity: ti.f32, scale: ti.f32):
+        def _lens_flare_kernel(image_field: ti.template(),
+                               disk_center_x: ti.f32, disk_center_y: ti.f32,
+                               screen_center_x: ti.f32, screen_center_y: ti.f32,
+                               intensity: ti.f32, scale: ti.f32):
+            """Lens flare effect kernel.
+            
+            Renders ghost images and diffraction rings along the line
+            from bright source to screen center.
+            """
             w = ti.cast(image_field.shape[0], ti.i32)
             h = ti.cast(image_field.shape[1], ti.i32)
 
@@ -1740,7 +1618,7 @@ class TaichiRenderer:
 
                 image_field[i, j] = ti.math.clamp(image_field[i, j] + flare * intensity, 0.0, 1.0)
 
-        self._lens_flare_kernel = lens_flare_kernel
+        self._lens_flare_kernel = _lens_flare_kernel
 
     def render(self, cam_pos, fov, frame=0):
         """
@@ -1774,7 +1652,7 @@ class TaichiRenderer:
         t_offset = float(frame) * 0.1
         disk_tilt = float(self.disk_tilt)
 
-        self._render_kernel(
+        self._ray_march_kernel(
             self.image_field, self.disk_layer_field, self.cam_pos_field, self.cam_right_field,
             self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
             self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset,
@@ -1940,8 +1818,6 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
 
 def render_video(renderer, width, height, n_frames, fps, output_path,
                  fov, static_cam_pos, orbit=False, resume=False):
-    # orbit 时使用 POV 的距离绕原点旋转
-    orbit_radius = float(np.linalg.norm(static_cam_pos))
     """
     渲染视频（多帧并合成视频）。
 
@@ -1954,10 +1830,9 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         fov: 视野角度
         static_cam_pos: 静态模式下的相机位置
         orbit: 是否围绕原点旋转
-        orbit_radius: 轨道半径
-        orbit_z: 轨道高度
         resume: 是否尝试从断点恢复
     """
+    orbit_radius = float(np.linalg.norm(static_cam_pos))
     import imageio.v3 as iio
     import json
     from PIL import Image
