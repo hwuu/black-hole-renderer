@@ -595,7 +595,8 @@ def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] 
 
 
 
-def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray,
+                           t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成螺旋臂密度和温度贡献
     返回: (spiral, temp_contribution)
@@ -606,6 +607,10 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
     temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
     arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            arm_noise[ri, :] = np.roll(arm_noise[ri, :], rotation_pixels[ri, 0])
 
     used_angles = []
     for arm_idx in tqdm(range(n_arms), desc="Spiral arms", leave=False):
@@ -643,6 +648,9 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
 
         intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.2)
         break_noise = _tileable_noise((n_r, n_phi), rng, freq_u=12, freq_v=6)
+        if t_offset != 0.0 and omega_grid is not None:
+            for ri in range(n_r):
+                break_noise[ri, :] = np.roll(break_noise[ri, :], rotation_pixels[ri, 0])
         break_mask = break_noise > 0.5
         intensity_mod = np.where(break_mask, intensity_mod * 0.05, intensity_mod)
 
@@ -657,7 +665,8 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
     return spiral, temp_contribution
 
 
-def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_grid: np.ndarray,
+                          t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     生成云雾/湍流密度和温度贡献
     返回: (turbulence, kep_shift_pixels, temp_contribution)
@@ -672,12 +681,23 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
 
-    for layer in [turbulence_coarse, turbulence_mid, turbulence_fine]:
+    for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
         for ri in range(n_r):
             layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
 
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
+            for ri in range(n_r):
+                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
+
     pixel_noise = rng.random((n_r, n_phi)).astype(np.float32)
     pixel_noise = (pixel_noise - 0.5) * 2
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            pixel_noise[ri, :] = np.roll(pixel_noise[ri, :], rotation_pixels[ri, 0])
+
     turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
                   + 0.25 * turbulence_fine + 0.22 * turbulence_extra
                   + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
@@ -686,7 +706,8 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     return turbulence, kep_shift_pixels, temp_contribution
 
 
-def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float,
+                       t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成细丝（filaments）密度和温度贡献
     返回：(arcs, temp_contribution)
@@ -694,39 +715,80 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
     arc_count = int(rng.uniform(50, 100) * disk_area)
 
     arc_phi_starts = rng.uniform(0, 2 * np.pi, arc_count)
-    r_rands = rng.uniform(0, 1, arc_count)
-    arc_rs = 0.1 + r_rands ** 0.7 * 0.85
-    arc_phi_lengths = 0.15 + (1 - arc_rs) * 0.3 + rng.uniform(0, 0.2, arc_count)
-    arc_r_widths = 0.001 + (1 - arc_rs) * 0.004 + rng.uniform(0, 0.002, arc_count)
-    arc_intensities = 0.4 + (1 - arc_rs) * 0.4 + rng.uniform(0, 0.2, arc_count)
+    r_positions = rng.uniform(0.05, 0.95, arc_count)
+    arc_rs = 0.05 + r_positions ** 0.6 * 0.9
+    arc_r_widths = rng.uniform(0.005, 0.08, arc_count)
+    arc_lengths = rng.uniform(0.15, 0.6, arc_count)
+    
+    arc_intensities = rng.uniform(0.4, 0.8, arc_count)
+    arc_delta_Ts = 0.1 + 0.4 * rng.power(0.5, arc_count)  # 0.1 - 0.5 range
+    arc_phases = rng.uniform(0, 2*np.pi, arc_count)
+    arc_frequencies = rng.integers(2, 7, arc_count)
+    arc_width_mods = rng.uniform(0.3, 0.8, arc_count)
 
     print(f"Generating {arc_count} filaments...")
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
-    batch_size = 400
+
+    batch_size = 200
+    temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
     for batch_start in tqdm(range(0, arc_count, batch_size), desc="Filaments", leave=False):
         batch_end = min(batch_start + batch_size, arc_count)
-
-        p_starts = arc_phi_starts[batch_start:batch_end, None, None]
-        rs = arc_rs[batch_start:batch_end, None, None]
-        p_lens = arc_phi_lengths[batch_start:batch_end, None, None]
-        r_wids = arc_r_widths[batch_start:batch_end, None, None]
+        
+        # Shape parameters (per arc)
+        ars = arc_rs[batch_start:batch_end, None, None]
+        aps = arc_phi_starts[batch_start:batch_end, None, None]
+        ar_ws = arc_r_widths[batch_start:batch_end, None, None]
+        alens = arc_lengths[batch_start:batch_end, None, None]
         ints = arc_intensities[batch_start:batch_end, None, None]
+        phases = arc_phases[batch_start:batch_end, None, None]
+        frqs = arc_frequencies[batch_start:batch_end, None, None]
+        wmods = arc_width_mods[batch_start:batch_end, None, None]
 
-        kappa = 1.0 / (p_lens ** 2) * 1.5
-        arc_batch = np.exp(kappa * (np.cos(phi_grid[None, :, :] - p_starts) - 1.0))
-        r_diff = r_norm_grid[None, :, :] - rs
-        arc_batch *= np.exp(-0.5 * (r_diff / r_wids) ** 2)
-        arc_batch *= ints
+        # Radial profile (gaussian)
+        r_diff = r_norm_grid[None, :, :] - ars
+        arc_r = np.exp(-0.5 * (r_diff / ar_ws) ** 2)
 
+        # Angular profile (gaussian along phi, sine modulation)
+        phi_range = (alens / (ars + 0.01))  # Inner radii span wider angle
+        arc_phi_half_width = np.maximum(phi_range * 0.7, 0.3)
+        phi_diff = phi_grid[None, :, :] - aps
+        
+        # Apply phi wrap for periodicity
+        phi_diff = np.arctan2(np.sin(phi_diff), np.cos(phi_diff))
+        arc_phi = np.exp(-0.5 * (phi_diff / arc_phi_half_width) ** 2)
+        
+        # Sinusoidal modulation along phi
+        sin_mod = 0.3 + 0.7 * np.cos((phi_grid[None, :, :] - aps) * frqs + phases)
+        modulated_width = arc_phi_half_width * (1 + wmods * (sin_mod - 1))
+
+        sharpness = 1.0 / (modulated_width ** 2) * 1.5
+        arc_val = np.exp(sharpness * (np.cos((phi_grid[None, :, :] - aps) / arc_phi_half_width * np.pi) - 1.0))
+        arc_val = np.maximum(arc_val, np.exp(-0.5 * 3.0**2))  # Clamp to 3-sigma
+        arc_val = np.where(np.abs(phi_diff) <= 2*arc_phi_half_width, arc_val, 0)  # Support length
+
+        arc_batch = arc_r * arc_val * ints
         arcs += np.sum(arc_batch, axis=0)
 
+        tc_delta_ts = arc_delta_Ts[batch_start:batch_end, None, None]
+        temp_batch = arc_r * arc_val * ints * tc_delta_ts * 0.7
+        temp_contribution += np.sum(temp_batch, axis=0)
+
     arcs = np.clip(arcs, 0, 1)
-    temp_contribution = 0.08 * arcs
+    
+    # Apply rotation to any generated noise-like structures
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            arcs[ri, :] = np.roll(arcs[ri, :], rotation_pixels[ri, 0])
+            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
+    
+    temp_contribution = np.clip(temp_contribution, 0, arcs * 0.5)
     return arcs, temp_contribution
 
 
-def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float, enable_rt: bool) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float, enable_rt: bool,
+                       t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成 Rayleigh-Taylor 不稳定性密度和温度贡献
     返回：(rt_spikes, temp_contribution)
@@ -756,10 +818,19 @@ def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
         temp_contribution += rt_val * rt_delta_Ts[i]
 
     rt_spikes = np.clip(rt_spikes, 0, 1)
+    
+    # Apply rotation to any generated noise-like structures
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            rt_spikes[ri, :] = np.roll(rt_spikes[ri, :], rotation_pixels[ri, 0])
+            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
+    
     return rt_spikes, temp_contribution
 
 
-def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray) -> np.ndarray:
+def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray,
+                                 t_offset: float = 0.0, omega_grid: np.ndarray = None) -> np.ndarray:
     """
     生成方位热点（低频正弦 + 噪声，自转流动感）
     返回：az_hotspot
@@ -768,23 +839,50 @@ def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, 
     shear = r_norm_grid ** 1.2 * rng.uniform(2.0, 4.0)
     az_wave = 0.5 + 0.5 * np.sin((phi_grid + shear) * az_freq)
     az_noise = _fbm_noise((n_r, n_phi), rng, octaves=3, persistence=0.5, base_scale=3, wrap_u=True)
+
+    # 应用开普勒旋转
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            az_noise[ri, :] = np.roll(az_noise[ri, :], rotation_pixels[ri, 0])
+
     az_hotspot = np.clip(0.6 * az_wave + 0.4 * az_noise, 0, 1) ** 1.2
     return az_hotspot
 
 
-def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: np.ndarray, temp_struct: np.ndarray, kep_shift_pixels: np.ndarray, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: np.ndarray,
+                        temp_struct: np.ndarray, kep_shift_pixels: np.ndarray,
+                        r_norm_grid: np.ndarray, t_offset: float = 0.0,
+                        omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     Apply turbulence disturbance to density and temperature fields.
     Returns: (density, temp_struct)
+    
+    Args:
+        t_offset: 时间偏移，用于动态旋转
+        omega_grid: 开普勒角速度网格，用于计算旋转量
     """
     disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
     disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
     disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
-    for layer in [disturb_coarse, disturb_mid]:
+    for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
         for ri in range(n_r):
             layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
+            for ri in range(n_r):
+                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
+
     disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
+    
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            disturb_pixel[ri, :] = np.roll(disturb_pixel[ri, :], rotation_pixels[ri, 0])
+
     disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
                    + 0.30 * disturb_extra + 0.20 * disturb_pixel)
     disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
@@ -795,7 +893,8 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
     return density, temp_struct
 
 
-def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float) -> Tuple[np.ndarray, np.ndarray]:
+def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float,
+                      t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成温度热点密度和温度贡献
     返回：(hotspot, temp_contribution)
@@ -833,6 +932,14 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
 
     hotspot = np.clip(hotspot, 0, 1)
     temp_contribution = 0.12 * hotspot
+    
+    # Apply rotation to any generated noise-like structures
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for ri in range(n_r):
+            hotspot[ri, :] = np.roll(hotspot[ri, :], rotation_pixels[ri, 0])
+            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
+    
     return hotspot, temp_contribution
 
 
@@ -866,36 +973,36 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_i
     temp_struct = np.zeros((n_r, n_phi), dtype=np.float32)
 
     # ----- 密度场 -----
-    # 1) 螺旋臂
-    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid)
+# 1) 螺旋臂
+    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
     temp_struct += spiral_temp
 
 
     # 2) 云雾
-    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid)
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid, 0.0, None)
     temp_struct += turb_temp
 
     # 3) Filaments
-    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area)
+    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, 0.0, None)
     temp_struct += arcs_temp
 
     # 4) Rayleigh-Taylor 不稳定性
-    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt)
+    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, 0.0, None)
     temp_struct += rt_temp
 
     # 5) 温度热点
-    hotspot, hotspot_temp = _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area)
+    hotspot, hotspot_temp = _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, 0.0, None)
     temp_struct += hotspot_temp
 
     # 5) 方位热点
-    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid)
+    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
 
     # 组合密度
     rt_weight = 0.15 if enable_rt else 0.0
     density = 0.15 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
 
-    # 湍流扰动
-    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid)
+# 湍流扰动
+    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None)
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
