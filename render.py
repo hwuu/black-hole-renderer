@@ -19,6 +19,13 @@ import time
 import argparse
 import hashlib
 from tqdm import tqdm
+from typing import Tuple, List, Optional
+import math
+
+import taichi as ti
+import json
+import shutil
+import imageio.v3 as iio
 
 # ============================================================================
 # 公共常量
@@ -69,7 +76,7 @@ SKY_GALACTIC_CENTER_GLOW = 0.08
 # 公共模块：相机
 # ============================================================================
 
-def build_camera(cam_pos, fov_deg, width, height):
+def build_camera(cam_pos: np.ndarray, fov_deg: float, width: int, height: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     """
     构建相机参数
 
@@ -112,7 +119,7 @@ def build_camera(cam_pos, fov_deg, width, height):
 # 公共模块：天空盒
 # ============================================================================
 
-def _blackbody_rgb(T):
+def _blackbody_rgb(T: np.ndarray) -> np.ndarray:
     """色温(K) -> RGB，基于 Tanner Helland 近似"""
     t = T / 100.0
     r = np.where(t <= 66, 1.0,
@@ -129,7 +136,7 @@ def _blackbody_rgb(T):
     return np.stack([r, g, b], axis=-1).astype(np.float32)
 
 
-def generate_skybox(tex_w=2048, tex_h=1024, seed=42, n_stars=6000):
+def generate_skybox(tex_w: int = 2048, tex_h: int = 1024, seed: int = 42, n_stars: int = 6000) -> np.ndarray:
     """
     程序化生成天空盒纹理（等距柱状投影）
 
@@ -320,7 +327,7 @@ def generate_skybox(tex_w=2048, tex_h=1024, seed=42, n_stars=6000):
     return np.clip(texture, 0, 1)
 
 
-def load_or_generate_skybox(skybox_path, tex_w=2048, tex_h=1024, n_stars=6000):
+def load_or_generate_skybox(skybox_path: Optional[str], tex_w: int = 2048, tex_h: int = 1024, n_stars: int = 6000) -> Tuple[np.ndarray, int, int]:
     """
     加载或生成天空盒纹理
 
@@ -347,7 +354,7 @@ def load_or_generate_skybox(skybox_path, tex_w=2048, tex_h=1024, n_stars=6000):
     return texture, tex_h, tex_w
 
 
-def sample_skybox_bilinear(texture, directions):
+def sample_skybox_bilinear(texture: np.ndarray, directions: np.ndarray) -> np.ndarray:
     """
     双线性插值采样天空盒
 
@@ -396,7 +403,7 @@ def sample_skybox_bilinear(texture, directions):
 # 公共模块：图像保存
 # ============================================================================
 
-def save_image(image, path):
+def save_image(image: np.ndarray, path: str) -> None:
     """保存图像为 PNG 文件"""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     img_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
@@ -413,7 +420,7 @@ R_DISK_INNER_DEFAULT = 2.0 * RS
 R_DISK_OUTER_DEFAULT = 3.5 * RS
 
 
-def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.3):
+def compute_edge_alpha(height: int, inner_soft: float = 0.1, outer_soft: float = 0.3) -> np.ndarray:
     """计算边缘软化的 alpha 通道"""
     v = np.linspace(0, 1, height).astype(np.float32)
     alpha = np.ones_like(v)
@@ -424,7 +431,7 @@ def compute_edge_alpha(height, inner_soft=0.1, outer_soft=0.3):
     return alpha
 
 
-def load_disk_texture(path):
+def load_disk_texture(path: Optional[str]) -> Optional[np.ndarray]:
     """加载吸积盘纹理，返回 (h, w, 4) float32 数组（RGBA，边缘软化 alpha）"""
     if path and os.path.isfile(path):
         print(f"Loading disk texture: {path}")
@@ -440,7 +447,7 @@ def load_disk_texture(path):
 
 
 
-def _tileable_noise(shape, rng, freq_u=6, freq_v=6):
+def _tileable_noise(shape: Tuple[int, int], rng: np.random.Generator, freq_u: int = 6, freq_v: int = 6) -> np.ndarray:
     """用多条弧线生成云雾效果，保证 phi 方向无缝。"""
     h, w = shape
 
@@ -471,7 +478,7 @@ def _tileable_noise(shape, rng, freq_u=6, freq_v=6):
     return cloud
 
 
-def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=False):
+def _fbm_noise(shape: Tuple[int, int], rng: np.random.Generator, octaves: int = 4, persistence: float = 0.5, base_scale: int = 1, wrap_u: bool = False) -> np.ndarray:
     """分形布朗运动噪声（多层叠加）。wrap_u=True 时用 tileable 噪声替代。"""
     if wrap_u:
         result = np.zeros(shape, dtype=np.float32)
@@ -498,7 +505,7 @@ def _fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=Fals
 
 
 
-def _blend_azimuthal_seam(tex, seam_width=64):
+def _blend_azimuthal_seam(tex: np.ndarray, seam_width: int = 64) -> np.ndarray:
     """
     将纹理在 u=0/u=2π 方向做平滑过渡，避免拼接时出现明显缝隙。
     """
@@ -516,7 +523,7 @@ def _blend_azimuthal_seam(tex, seam_width=64):
     return tex_blended
 
 
-def generate_disk_mipmaps(base_tex, levels=4):
+def generate_disk_mipmaps(base_tex: np.ndarray, levels: int = 4) -> np.ndarray:
     """生成吸积盘纹理的 mipmap 金字塔"""
     mips = [base_tex.copy()]
     for _ in range(levels):
@@ -531,13 +538,12 @@ def generate_disk_mipmaps(base_tex, levels=4):
     return mips
 
 
-def compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_outer, rs=1.0):
+def compute_disk_texture_resolution(width: int, height: int, cam_pos: List[float], fov: float, r_inner: float, r_outer: float, rs: float = 1.0) -> Tuple[int, int]:
     """
     根据相机参数计算吸积盘纹理分辨率。
     n_phi: 基于视角覆盖的角分辨率，每个像素约 1 个 phi 样本
     n_r: 基于径向覆盖的分辨率，每个径向单位约 0.5 个样本
     """
-    import math
     camera_distance = math.sqrt(cam_pos[0]**2 + cam_pos[1]**2 + cam_pos[2]**2)
 
     disk_angular_radius = math.atan(r_outer / camera_distance)
@@ -556,8 +562,8 @@ def compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_oute
     return n_phi, n_r
 
 
-def load_cached_disk_texture(width=None, height=None, cam_pos=None, fov=None,
-                               seed=42, r_inner=2.0, r_outer=3.5, force=False):
+def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] = None, cam_pos: Optional[List[float]] = None, fov: Optional[float] = None,
+                               seed: int = 42, r_inner: float = 2.0, r_outer: float = 3.5, force: bool = False) -> np.ndarray:
     """
     加载或生成吸积盘纹理（带缓存）。
     - width, height, cam_pos, fov: 用于计算纹理分辨率
@@ -589,7 +595,7 @@ def load_cached_disk_texture(width=None, height=None, cam_pos=None, fov=None,
 
 
 
-def _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid):
+def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成螺旋臂密度和温度贡献
     返回: (spiral, temp_contribution)
@@ -651,7 +657,7 @@ def _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid):
     return spiral, temp_contribution
 
 
-def _generate_turbulence(rng, n_r, n_phi, r_norm_grid):
+def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     生成云雾/湍流密度和温度贡献
     返回: (turbulence, kep_shift_pixels, temp_contribution)
@@ -680,7 +686,7 @@ def _generate_turbulence(rng, n_r, n_phi, r_norm_grid):
     return turbulence, kep_shift_pixels, temp_contribution
 
 
-def _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
+def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成细丝（filaments）密度和温度贡献
     返回：(arcs, temp_contribution)
@@ -720,7 +726,7 @@ def _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
     return arcs, temp_contribution
 
 
-def _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt):
+def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float, enable_rt: bool) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成 Rayleigh-Taylor 不稳定性密度和温度贡献
     返回：(rt_spikes, temp_contribution)
@@ -753,7 +759,7 @@ def _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enabl
     return rt_spikes, temp_contribution
 
 
-def _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid):
+def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray) -> np.ndarray:
     """
     生成方位热点（低频正弦 + 噪声，自转流动感）
     返回：az_hotspot
@@ -766,7 +772,7 @@ def _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid):
     return az_hotspot
 
 
-def _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid):
+def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: np.ndarray, temp_struct: np.ndarray, kep_shift_pixels: np.ndarray, r_norm_grid: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Apply turbulence disturbance to density and temperature fields.
     Returns: (density, temp_struct)
@@ -789,7 +795,7 @@ def _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, 
     return density, temp_struct
 
 
-def _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
+def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成温度热点密度和温度贡献
     返回：(hotspot, temp_contribution)
@@ -830,7 +836,7 @@ def _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area):
     return hotspot, temp_contribution
 
 
-def generate_disk_texture(n_phi=1024, n_r=512, seed=42, r_inner=2.0, r_outer=3.5, enable_rt=True):
+def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_inner: float = 2.0, r_outer: float = 3.5, enable_rt: bool = True) -> np.ndarray:
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
     - n_phi: 角度方向分辨率（对应 0-2π）
@@ -964,8 +970,7 @@ class TaichiRenderer:
                  anti_alias="disabled",
                  aa_strength=1.0,
                  ignore_taichi_cache=False):
-        import taichi as ti
-        self.ti = ti
+        # ti is imported at module level as "import taichi as ti"
         self.width = width
         self.height = height
         self.step_size = step_size
@@ -1025,7 +1030,7 @@ class TaichiRenderer:
         self._compile_kernels()
 
     def _compile_kernels(self):
-        ti = self.ti
+        # ti is module-level import
         width, height = self.width, self.height
         tex_w, tex_h = self.tex_w, self.tex_h
         dtex_w, dtex_h = self.dtex_w, self.dtex_h
@@ -1620,7 +1625,7 @@ class TaichiRenderer:
 
         self._lens_flare_kernel = _lens_flare_kernel
 
-    def render(self, cam_pos, fov, frame=0):
+    def render(self, cam_pos: List[float], fov: float, frame: int = 0) -> np.ndarray:
         """
         渲染单帧图像。
 
@@ -1781,12 +1786,12 @@ class TaichiRenderer:
         return np.clip(final + flare, 0, 1)
 
 
-def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
-                  n_stars=6000, tex_w=2048, tex_h=1024, r_max=10.0, device="cpu",
-                  disk_texture_path=None, r_disk_inner=R_DISK_INNER_DEFAULT,
-                  r_disk_outer=R_DISK_OUTER_DEFAULT, disk_tilt=0.0,
-                  lens_flare=False, anti_alias="disabled", aa_strength=1.0,
-                  force_regenerate_disk_texture=False, ignore_taichi_cache=False):
+def render_image(width: int, height: int, cam_pos: List[float], fov: float, step_size: float, skybox_path: Optional[str] = None,
+                  n_stars: int = 6000, tex_w: int = 2048, tex_h: int = 1024, r_max: float = 10.0, device: str = "cpu",
+                  disk_texture_path: Optional[str] = None, r_disk_inner: float = R_DISK_INNER_DEFAULT,
+                  r_disk_outer: float = R_DISK_OUTER_DEFAULT, disk_tilt: float = 0.0,
+                  lens_flare: bool = False, anti_alias: str = "disabled", aa_strength: float = 1.0,
+                  force_regenerate_disk_texture: bool = False, ignore_taichi_cache: bool = False) -> np.ndarray:
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
     """
@@ -1816,8 +1821,8 @@ def render_image(width, height, cam_pos, fov, step_size, skybox_path=None,
     return img
 
 
-def render_video(renderer, width, height, n_frames, fps, output_path,
-                 fov, static_cam_pos, orbit=False, resume=False):
+def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: int, fps: int, output_path: str,
+                 fov: float, static_cam_pos: List[float], orbit: bool = False, resume: bool = False) -> None:
     """
     渲染视频（多帧并合成视频）。
 
@@ -1833,9 +1838,6 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         resume: 是否尝试从断点恢复
     """
     orbit_radius = float(np.linalg.norm(static_cam_pos))
-    import imageio.v3 as iio
-    import json
-    from PIL import Image
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 
@@ -1856,7 +1858,6 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         saved_params = saved.get("params", {})
         if saved_params != params:
             print(f"Warning: parameters changed, starting over")
-            import shutil
             shutil.rmtree(temp_dir)
             os.makedirs(temp_dir, exist_ok=True)
         else:
@@ -1917,7 +1918,6 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
     # 注意：如果需要更高质量的视频（减少摩尔纹），可以：
     # 1. 使用 ffmpeg 直接编码：ffmpeg -framerate {fps} -i frame_%04d.png -c:v libx264 -crf 18 -preset slow output.mp4
     # 2. 或安装 imageio-ffmpeg 并使用更高质量的编码参数
-    import imageio.v3 as iio
     writer = iio.imopen(output_path, "w", plugin="pyav")
     writer.init_video_stream("libx264", fps=fps)
 
@@ -1928,11 +1928,9 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
         ## 逐帧写入后删除临时文件以节省空间
         #os.remove(frame_path)
 
-    #if os.path.exists(progress_file):
     #    os.remove(progress_file)
     print(f"\n提示：如果视频有摩尔纹，可手动用 ffmpeg 重新编码更高质量：")
     print(f"  ffmpeg -framerate {fps} -i {temp_dir}/frame_%04d.png -c:v libx264 -crf 18 -preset slow -pix_fmt yuv420p {output_path}")
-    #import shutil
     #shutil.rmtree(temp_dir)
     print(f"Video saved: {output_path}")
 
@@ -1941,7 +1939,7 @@ def render_video(renderer, width, height, n_frames, fps, output_path,
 # 主入口
 # ============================================================================
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Schwarzschild 黑洞光线追踪渲染器")
     parser.add_argument("--pov", type=float, nargs=3, default=[6, 0, 0.5],
                         metavar=("X", "Y", "Z"),
@@ -1965,9 +1963,9 @@ def parse_args():
                         help="吸积盘纹理路径 (default: 程序生成)")
     parser.add_argument("--force_regenerate_disk_texture", action="store_true",
                         help="强制重新生成吸积盘纹理，忽略缓存 (default: 关闭)")
-    parser.add_argument("--ar1", type=float, default=R_DISK_INNER_DEFAULT,
+    parser.add_argument("--disk_inner_radius", "--ar1", dest="disk_inner_radius", type=float, default=R_DISK_INNER_DEFAULT,
                         help=f"吸积盘内半径 (default: {R_DISK_INNER_DEFAULT})")
-    parser.add_argument("--ar2", type=float, default=R_DISK_OUTER_DEFAULT,
+    parser.add_argument("--disk_outer_radius", "--ar2", dest="disk_outer_radius", type=float, default=R_DISK_OUTER_DEFAULT,
                         help=f"吸积盘外半径 (default: {R_DISK_OUTER_DEFAULT})")
     parser.add_argument("--disk_tilt", type=float, default=0.0,
                         help="吸积盘倾角 (度, default: 0)")
@@ -1996,8 +1994,36 @@ def parse_args():
     return parser.parse_args()
 
 
+def validate_args(args) -> None:
+    """Validate CLI arguments."""
+    # FOV range check
+    if not (0 < args.fov < 180):
+        raise ValueError(f"FOV must be between 0 and 180 degrees, got {args.fov}")
+    
+    # Disk radius check
+    if args.disk_inner_radius >= args.disk_outer_radius:
+        raise ValueError(f"disk_inner_radius ({args.disk_inner_radius}) must be less than "
+                        f"disk_outer_radius ({args.disk_outer_radius})")
+    
+    # Step size check
+    if args.step_size <= 0:
+        raise ValueError(f"step_size must be positive, got {args.step_size}")
+    
+    # AA strength range
+    if not (0.5 <= args.aa_strength <= 2.0):
+        raise ValueError(f"aa_strength must be between 0.5 and 2.0, got {args.aa_strength}")
+    
+    # Video parameters
+    if args.n_frames <= 0:
+        raise ValueError(f"n_frames must be positive, got {args.n_frames}")
+    
+    if args.fps <= 0:
+        raise ValueError(f"fps must be positive, got {args.fps}")
+
+
 if __name__ == "__main__":
     args = parse_args()
+    validate_args(args)
 
     resolutions = {"4k": (3840, 2160), "fhd": (1920, 1080), "hd": (1280, 720), "sd": (640, 360)}
     width, height = resolutions[args.resolution]
@@ -2008,14 +2034,14 @@ if __name__ == "__main__":
         disk_tex = load_disk_texture(args.disk_texture)
         if disk_tex is None:
             disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
-                                                r_inner=args.ar1, r_outer=args.ar2,
+                                                r_inner=args.disk_inner_radius, r_outer=args.disk_outer_radius,
                                                 seed=42,
                                                 force=args.force_regenerate_disk_texture)
 
         renderer = TaichiRenderer(
             width, height, skybox, disk_tex,
             step_size=args.step_size, r_max=args.r_max, device=args.device,
-            r_disk_inner=args.ar1, r_disk_outer=args.ar2,
+            r_disk_inner=args.disk_inner_radius, r_disk_outer=args.disk_outer_radius,
             disk_tilt=args.disk_tilt,
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
@@ -2046,8 +2072,8 @@ if __name__ == "__main__":
             r_max=args.r_max,
             device=args.device,
             disk_texture_path=args.disk_texture,
-            r_disk_inner=args.ar1,
-            r_disk_outer=args.ar2,
+            r_disk_inner=args.disk_inner_radius,
+            r_disk_outer=args.disk_outer_radius,
             disk_tilt=args.disk_tilt,
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
