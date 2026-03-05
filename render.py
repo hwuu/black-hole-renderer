@@ -607,10 +607,10 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
     temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
     arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            arm_noise[ri, :] = np.roll(arm_noise[ri, :], rotation_pixels[ri, 0])
+
+    # arm_noise 用于调制螺旋臂的宽度，它应该相对于螺旋臂保持固定
+    # 螺旋臂位置由 phi_grid 决定，当 phi_grid 旋转时，螺旋臂已经旋转了
+    # 所以 arm_noise 不需要独立旋转
 
     used_angles = []
     for arm_idx in tqdm(range(n_arms), desc="Spiral arms", leave=False):
@@ -628,14 +628,17 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
 
         rotations = rng.uniform(2.5, 5.0)
         base_width = rng.uniform(0.2, 0.4)
-        intensity = rng.uniform(0.5, 0.9)
+        intensity = rng.uniform(0.25, 0.5)  # 降低强度，避免过于突出
         arm_delta_T = rng.uniform(0.1, 0.3)
 
         r_length = rotations / 6.0 * (1.0 - r_start)
         r_length = min(r_length, 1.0 - r_start)
         r_end = r_start + r_length
 
-        arm_angle = phi_grid - base_angle - r_norm_grid * rotations * 2 * np.pi
+        # 螺旋臂角度公式：phi - base_angle + r_norm * rotations * 2π = 0
+        # 这样外圈（r_norm 大）的 phi 更小，形成从左上到右下的螺旋（后旋臂）
+        # 与开普勒剪切方向一致（内圈旋转快，外圈旋转慢）
+        arm_angle = phi_grid - base_angle + r_norm_grid * rotations * 2 * np.pi
 
         width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
         width_mod = np.clip(width_mod, 0.3, 2.0)
@@ -648,9 +651,7 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
 
         intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.2)
         break_noise = _tileable_noise((n_r, n_phi), rng, freq_u=12, freq_v=6)
-        if t_offset != 0.0 and omega_grid is not None:
-            for ri in range(n_r):
-                break_noise[ri, :] = np.roll(break_noise[ri, :], rotation_pixels[ri, 0])
+        # break_noise 用于调制螺旋臂的断裂，它应该相对于螺旋臂保持固定
         break_mask = break_noise > 0.5
         intensity_mod = np.where(break_mask, intensity_mod * 0.05, intensity_mod)
 
@@ -672,8 +673,14 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     返回: (turbulence, kep_shift_pixels, temp_contribution)
     """
     shear_strength = rng.uniform(3.0, 6.0)
-    kep_shear = shear_strength * (1.0 / np.maximum(r_norm_grid, 0.05) ** 1.5 - 1.0)
+    # 剪切公式：使用 (r_norm + c)^(-1.5) 限制内圈发散
+    # 添加常数项 0.3 避免内圈剪切过大，外圈剪切趋近于 0
+    kep_shear = shear_strength * (1.0 / (r_norm_grid + 0.3) ** 1.5 - 0.8)
+    kep_shear = np.clip(kep_shear, 0, shear_strength * 8)  # 限制最大剪切
     kep_shift_pixels = (kep_shear / (2 * np.pi) * n_phi).astype(int)
+    # 进一步限制最大位移不超过图像宽度的 25%（避免过度滚动）
+    max_shift = n_phi // 4
+    kep_shift_pixels = np.clip(kep_shift_pixels, -max_shift, max_shift)
 
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
@@ -691,12 +698,10 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
             for ri in range(n_r):
                 layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
 
-    pixel_noise = rng.random((n_r, n_phi)).astype(np.float32)
-    pixel_noise = (pixel_noise - 0.5) * 2
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            pixel_noise[ri, :] = np.roll(pixel_noise[ri, :], rotation_pixels[ri, 0])
+    # 像素级高频噪声：使用 tileable 噪声保证周期性边界
+    # 模拟未分辨的细小团块，频率足够高使得细节细腻
+    pixel_noise = _tileable_noise((n_r, n_phi), rng, freq_u=600, freq_v=300)
+    pixel_noise = (pixel_noise - 0.5) * 2  # [-1, 1]
 
     turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
                   + 0.25 * turbulence_fine + 0.22 * turbulence_extra
@@ -710,18 +715,24 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
                        t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成细丝（filaments）密度和温度贡献
-    返回：(arcs, temp_contribution)
+    物理意义：吸积盘中的丝状结构，可能是磁重联或剪切流形成的细长条纹
+    特征：沿角度方向延伸（长条状），径向很窄
+
+    数量说明：真实吸积盘中细丝结构约 20-50 条，这里用 30-60 条保证可见性
     """
-    arc_count = int(rng.uniform(50, 100) * disk_area)
+    # 细丝数量：120-200 条（进一步增加数量）
+    arc_count = int(rng.uniform(120, 200))
 
     arc_phi_starts = rng.uniform(0, 2 * np.pi, arc_count)
     r_positions = rng.uniform(0.05, 0.95, arc_count)
     arc_rs = 0.05 + r_positions ** 0.6 * 0.9
-    arc_r_widths = rng.uniform(0.005, 0.08, arc_count)
-    arc_lengths = rng.uniform(0.15, 0.6, arc_count)
-    
-    arc_intensities = rng.uniform(0.4, 0.8, arc_count)
-    arc_delta_Ts = 0.1 + 0.4 * rng.power(0.5, arc_count)  # 0.1 - 0.5 range
+    # 细丝径向宽度：0.002-0.008（适中宽度）
+    arc_r_widths = rng.uniform(0.002, 0.008, arc_count)
+    # 细丝角度长度：较长 0.3-1.0（约 100°-360°），形成细长条纹
+    arc_lengths = rng.uniform(0.3, 1.0, arc_count)
+
+    arc_intensities = rng.uniform(0.7, 1.0, arc_count)  # 提高细丝强度
+    arc_delta_Ts = 0.3 + 0.6 * rng.power(0.3, arc_count)  # 提高温度贡献范围：0.3-0.9
     arc_phases = rng.uniform(0, 2*np.pi, arc_count)
     arc_frequencies = rng.integers(2, 7, arc_count)
     arc_width_mods = rng.uniform(0.3, 0.8, arc_count)
@@ -749,23 +760,22 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
         r_diff = r_norm_grid[None, :, :] - ars
         arc_r = np.exp(-0.5 * (r_diff / ar_ws) ** 2)
 
-        # Angular profile (gaussian along phi, sine modulation)
+        # Angular profile: 使用 cos() 保证周期性边界
+        # 公式：exp(kappa * (cos(phi - phi_start) - 1))
+        # 当 phi - phi_start = 0 时取最大值 1
+        # kappa 越大，细丝越窄；kappa 越小，细丝越宽
         phi_range = (alens / (ars + 0.01))  # Inner radii span wider angle
         arc_phi_half_width = np.maximum(phi_range * 0.7, 0.3)
-        phi_diff = phi_grid[None, :, :] - aps
-        
-        # Apply phi wrap for periodicity
-        phi_diff = np.arctan2(np.sin(phi_diff), np.cos(phi_diff))
-        arc_phi = np.exp(-0.5 * (phi_diff / arc_phi_half_width) ** 2)
-        
-        # Sinusoidal modulation along phi
-        sin_mod = 0.3 + 0.7 * np.cos((phi_grid[None, :, :] - aps) * frqs + phases)
-        modulated_width = arc_phi_half_width * (1 + wmods * (sin_mod - 1))
 
-        sharpness = 1.0 / (modulated_width ** 2) * 1.5
-        arc_val = np.exp(sharpness * (np.cos((phi_grid[None, :, :] - aps) / arc_phi_half_width * np.pi) - 1.0))
-        arc_val = np.maximum(arc_val, np.exp(-0.5 * 3.0**2))  # Clamp to 3-sigma
-        arc_val = np.where(np.abs(phi_diff) <= 2*arc_phi_half_width, arc_val, 0)  # Support length
+        # kappa 与半高宽的关系：kappa = 1.5 / half_width^2
+        kappa = 1.5 / (arc_phi_half_width ** 2)
+
+        # Sinusoidal modulation along phi - 使用 cos() 保证周期性
+        sin_mod = 0.3 + 0.7 * np.cos((phi_grid[None, :, :] - aps) * frqs + phases)
+        modulated_width = 1.0 + wmods * (sin_mod - 0.3)  # 调制 kappa
+
+        # 使用 cos 形状的角度剖面，自动处理周期性边界
+        arc_val = np.exp(kappa * modulated_width * (np.cos(phi_grid[None, :, :] - aps) - 1))
 
         arc_batch = arc_r * arc_val * ints
         arcs += np.sum(arc_batch, axis=0)
@@ -775,14 +785,6 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
         temp_contribution += np.sum(temp_batch, axis=0)
 
     arcs = np.clip(arcs, 0, 1)
-    
-    # Apply rotation to any generated noise-like structures
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            arcs[ri, :] = np.roll(arcs[ri, :], rotation_pixels[ri, 0])
-            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
-    
     temp_contribution = np.clip(temp_contribution, 0, arcs * 0.5)
     return arcs, temp_contribution
 
@@ -818,14 +820,6 @@ def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
         temp_contribution += rt_val * rt_delta_Ts[i]
 
     rt_spikes = np.clip(rt_spikes, 0, 1)
-    
-    # Apply rotation to any generated noise-like structures
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            rt_spikes[ri, :] = np.roll(rt_spikes[ri, :], rotation_pixels[ri, 0])
-            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
-    
     return rt_spikes, temp_contribution
 
 
@@ -897,16 +891,22 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
                       t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成温度热点密度和温度贡献
-    返回：(hotspot, temp_contribution)
+    物理意义：吸积盘中的局部高温区域（如磁重联、激波碰撞形成的亮斑）
+    特征：近似圆形或椭圆形的斑点，径向和角度宽度相近
+
+    数量说明：真实吸积盘中观测到的热点约数个 - 数十个，这里用 20-40 个保证可见性
     """
-    hotspot_count = int(rng.uniform(20, 35) * disk_area)
+    # 热点数量：20-40 个（物理合理范围）
+    hotspot_count = int(rng.uniform(20, 40))
     hotspot_delta_Ts = 0.5 + 2.5 * rng.power(0.4, hotspot_count)
 
     h_phis = rng.uniform(0, 2 * np.pi, hotspot_count)
     r_rands = rng.uniform(0, 1, hotspot_count)
     h_rs = 0.1 + r_rands ** 0.6 * 0.85
-    h_phi_widths = rng.uniform(0.04, 0.12, hotspot_count)
-    h_r_widths = 0.003 + (1 - h_rs) * 0.006 + rng.uniform(0, 0.003, hotspot_count)
+    # 热点角度宽度：0.08-0.20（约 30°-70°），较宽形成斑点
+    h_phi_widths = rng.uniform(0.08, 0.20, hotspot_count)
+    # 热点径向宽度：0.02-0.05，与角度宽度相近，形成近似圆形的斑点
+    h_r_widths = 0.02 + rng.uniform(0, 0.03, hotspot_count)
     h_intensities = 0.3 + (1 - h_rs) * 0.6 + rng.uniform(0, 0.1, hotspot_count)
 
     print(f"Generating {hotspot_count} hotspots...")
@@ -932,14 +932,6 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
 
     hotspot = np.clip(hotspot, 0, 1)
     temp_contribution = 0.12 * hotspot
-    
-    # Apply rotation to any generated noise-like structures
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            hotspot[ri, :] = np.roll(hotspot[ri, :], rotation_pixels[ri, 0])
-            temp_contribution[ri, :] = np.roll(temp_contribution[ri, :], rotation_pixels[ri, 0])
-    
     return hotspot, temp_contribution
 
 
@@ -997,9 +989,9 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_i
     # 5) 方位热点
     az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
 
-    # 组合密度
+    # 组合密度 - 细丝权重与螺旋臂相近
     rt_weight = 0.15 if enable_rt else 0.0
-    density = 0.15 + 0.22 * spiral + 0.30 * turbulence + 0.16 * hotspot + 0.12 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
 # 湍流扰动
     density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None)

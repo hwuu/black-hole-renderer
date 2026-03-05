@@ -53,10 +53,11 @@ def generate_disk_texture_topview(n_phi=512, n_r=128, seed=42, r_inner=2.0, r_ou
     # 计算 omega_grid（用于湍流旋转）
     r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
     omega_grid = np.sqrt(0.5 / (r_vals + 0.01))
-    
+
     # 如果有旋转偏移，应用开普勒旋转到 phi_grid
+    # 注意：用减法，因为吸积盘逆时针旋转（phi 增加），phi_grid 需要减少才能看到特征向 phi 增加的方向移动
     if t_offset != 0.0:
-        phi_grid = phi_grid + t_offset * omega_grid
+        phi_grid = phi_grid - t_offset * omega_grid
 
     r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
     disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
