@@ -419,7 +419,7 @@ def save_image(image: np.ndarray, path: str) -> None:
 
 # 默认吸积盘参数（对齐 JaeHyunLee94）
 R_DISK_INNER_DEFAULT = 2.0 * RS
-R_DISK_OUTER_DEFAULT = 3.5 * RS
+R_DISK_OUTER_DEFAULT = 15.0 * RS
 
 
 def compute_edge_alpha(height: int, inner_soft: float = 0.1, outer_soft: float = 0.3) -> np.ndarray:
@@ -700,23 +700,34 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     max_shift = n_phi // 4
     kep_shift_pixels = np.clip(kep_shift_pixels, -max_shift, max_shift)
 
-    # 不使用剪切滚动，避免产生环状纹理
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
     turbulence_fine = _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40)
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
 
+    # 应用开普勒剪切滚动：内圈旋转快，外圈旋转慢，湍流被拉成条纹
+    for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
+        for ri in range(n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+
+    # 动态旋转支持：如果有 t_offset 和 omega_grid，进一步旋转
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
+            for ri in range(n_r):
+                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
+
     # 像素级高频噪声：使用 tileable 噪声保证周期性边界
     pixel_noise = _tileable_noise((n_r, n_phi), rng, freq_u=600, freq_v=300)
     pixel_noise = (pixel_noise - 0.5) * 2
 
-    # 极低湍流权重，仅添加细微纹理
-    turbulence = (0.03 * turbulence_coarse + 0.05 * turbulence_mid
-                  + 0.08 * turbulence_fine + 0.05 * turbulence_extra
-                  + 0.03 * turbulence_ultra + 0.02 * np.clip(pixel_noise, 0, 1))
+    # 湍流权重：多层噪声叠加产生云雾状结构
+    turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
+                  + 0.25 * turbulence_fine + 0.22 * turbulence_extra
+                  + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
 
-    temp_contribution = 0.04 * np.clip(turbulence, 0, 1)
+    temp_contribution = 0.05 * np.clip(turbulence, 0, 1)
     return turbulence, kep_shift_pixels, temp_contribution
 
 
@@ -876,21 +887,32 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
         t_offset: 时间偏移，用于动态旋转
         omega_grid: 开普勒角速度网格，用于计算旋转量
     """
-    # 不使用剪切滚动，避免产生环状纹理
     disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
     disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
     disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
 
+    # 应用开普勒剪切滚动
+    for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
+        for ri in range(n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
+
+    # 动态旋转支持：如果有 t_offset 和 omega_grid，进一步旋转
+    if t_offset != 0.0 and omega_grid is not None:
+        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
+        for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
+            for ri in range(n_r):
+                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
+
     disturb_pixel = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
     disturb_pixel = (disturb_pixel - 0.5) * 2  # [-1, 1] 范围
 
-    # 极轻微 disturbance - 仅添加细小扰动，不破坏 spiral arm 和 filament 的分段结构
-    disturb_mod = (0.01 * disturb_coarse + 0.02 * disturb_mid + 0.04 * disturb_fine
-                   + 0.03 * disturb_extra + 0.02 * disturb_pixel)
-    disturb_mod = np.clip(disturb_mod * 0.5 + 0.5, 0.5, 1.0)  # 保持在 0.5-1.0 范围
+    # disturbance 权重：提高高频层强度，保证细节丰富
+    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
+                   + 0.30 * disturb_extra + 0.20 * disturb_pixel)
+    disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
     radial_preserve = 0.6 + 0.4 * r_norm_grid
-    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.5, 1.0)
+    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
     density = density * disturb_mod
     temp_struct = temp_struct * disturb_mod
     return density, temp_struct
@@ -1012,9 +1034,9 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
     # 5) 方位热点
     az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
 
-    # 组合密度 - 大幅提高 spiral 和 arcs 权重，降低湍流
+    # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
-    density = 0.12 + 0.50 * spiral + 0.08 * turbulence + 0.15 * hotspot + 0.55 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
 # 湍流扰动 - 降低 disturbance 强度，保留更多 spiral arm 和 filament 的分段结构
     density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None)
@@ -1161,7 +1183,7 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
 
     # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
-    density = 0.12 + 0.50 * spiral + 0.08 * turbulence + 0.15 * hotspot + 0.55 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
     # 湍流扰动
     density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, t_offset, omega_grid)
