@@ -41,18 +41,20 @@ G_FACTOR_CAP = 1.5
 # g 的幂次，决定亮度随 g 变化的敏感度，建议 1.5~3（默认 2.2）
 G_LUMINOSITY_POWER = 1.5
 # 亮度缩放系数，常用 0.2~0.6（默认 0.38），越大盘面全局越亮
-G_BRIGHTNESS_GAIN = 0.22
+G_BRIGHTNESS_GAIN = 0.38
 
 # —— 吸积盘透明度与色温 —— 决定盘层遮挡背景与整体暖色偏移。
+# DISK_COLOR_TEMPERATURE: 吸积盘基准色温（单位：开尔文 K）
+#   典型取值：1000K(橙红) ~ 6500K(白) ~ 10000K+(白偏蓝)
+#   默认 4500K 暖白色
+DISK_COLOR_TEMPERATURE = 6000
 # DISK_ALPHA_GAIN > 1 会让盘体更实心，推荐 1~20（默认 1.2）
 DISK_ALPHA_GAIN = 6
-# DISK_BASE_TINT 拉伸 RGB，值越大对应的通道越亮；典型取值 0.6~1.4（默认暖色 1.1/0.92/0.75）
-DISK_BASE_TINT = (1.05, 0.95, 1)
 # DISK_RADIAL_BRIGHTNESS_POWER >0 会让亮度按 (1 - radial_t)^p 递减（常用 1~3）
-DISK_RADIAL_BRIGHTNESS_POWER = 1.5
+DISK_RADIAL_BRIGHTNESS_POWER = 1.2
 # 半径亮度增益的下限/上限，避免指数爆炸
 DISK_RADIAL_BRIGHTNESS_MIN = 0.2
-DISK_RADIAL_BRIGHTNESS_MAX = 12
+DISK_RADIAL_BRIGHTNESS_MAX = 8
 
 # —— 天空盒程序化生成 —— 控制恒星数量、亮度范围和银河弥漫光强度。
 # 恒星最低亮度，推荐 0.03~0.15（默认 0.08），越大暗星越明显
@@ -606,12 +608,6 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
     spiral = np.zeros((n_r, n_phi), dtype=np.float32)
     temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
-    arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
-
-    # arm_noise 用于调制螺旋臂的宽度，它应该相对于螺旋臂保持固定
-    # 螺旋臂位置由 phi_grid 决定，当 phi_grid 旋转时，螺旋臂已经旋转了
-    # 所以 arm_noise 不需要独立旋转
-
     used_angles = []
     for arm_idx in tqdm(range(n_arms), desc="Spiral arms", leave=False):
         if arm_idx < n_from_center:
@@ -628,39 +624,62 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
 
         rotations = rng.uniform(2.5, 5.0)
         base_width = rng.uniform(0.2, 0.4)
-        intensity = rng.uniform(0.25, 0.5)  # 降低强度，避免过于突出
         arm_delta_T = rng.uniform(0.1, 0.3)
 
         r_length = rotations / 6.0 * (1.0 - r_start)
         r_length = min(r_length, 1.0 - r_start)
-        r_end = r_start + r_length
 
-        # 螺旋臂角度公式：phi - base_angle + r_norm * rotations * 2π = 0
-        # 这样外圈（r_norm 大）的 phi 更小，形成从左上到右下的螺旋（后旋臂）
-        # 与开普勒剪切方向一致（内圈旋转快，外圈旋转慢）
-        arm_angle = phi_grid - base_angle + r_norm_grid * rotations * 2 * np.pi
+        # 每条螺旋臂由 4-8 个 sub-arm 段组成，每段之间有明显的间隙
+        sub_arm_count = rng.integers(4, 9)
+        sub_arm_fill = rng.uniform(0.4, 0.6)  # sub-arm 占总长度的比例（40-60%）
+        sub_arm_lengths = rng.uniform(0.08, 0.20, sub_arm_count)
+        sub_arm_lengths = sub_arm_lengths / sub_arm_lengths.sum() * r_length * sub_arm_fill
 
-        width_mod = 1.0 + 0.8 * (arm_noise - 0.5)
-        width_mod = np.clip(width_mod, 0.3, 2.0)
+        # sub-arm 的起始径向位置 - 大间隙让分段更明显
+        sub_r_starts = np.zeros(sub_arm_count)
+        for j in range(1, sub_arm_count):
+            gap = rng.uniform(0.08, 0.15)  # 大间隙
+            sub_r_starts[j] = sub_r_starts[j-1] + sub_arm_lengths[j-1] + gap
+        sub_r_starts += r_start
 
-        arm_kappa = 1.0 / (base_width ** 2) * 1.5
-        arm_val = np.exp(arm_kappa * (np.cos(arm_angle) - 1) / width_mod)
+        # sub-arm 的宽度和强度变化 - 增加对比度
+        sub_widths = base_width * rng.uniform(0.3, 2.5, sub_arm_count)
+        sub_widths = np.clip(sub_widths, 0.06, 1.2)
+        sub_intensities = rng.uniform(0.1, 0.7, sub_arm_count)
 
-        mask = (r_norm_grid >= r_start) & (r_norm_grid <= r_end)
-        arm_val = np.where(mask, arm_val, 0)
+        for j in range(sub_arm_count):
+            sr = sub_r_starts[j]
+            sr_len = sub_arm_lengths[j]
+            sr_width = sub_widths[j]
+            sr_int = sub_intensities[j]
+            sr_end = sr + sr_len
 
-        intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.2)
-        break_noise = _tileable_noise((n_r, n_phi), rng, freq_u=12, freq_v=6)
-        # break_noise 用于调制螺旋臂的断裂，它应该相对于螺旋臂保持固定
-        break_mask = break_noise > 0.5
-        intensity_mod = np.where(break_mask, intensity_mod * 0.05, intensity_mod)
+            # 螺旋臂角度公式
+            arm_angle = phi_grid - base_angle + r_norm_grid * rotations * 2 * np.pi
 
-        fade_in = np.clip((r_norm_grid - r_start) / 0.08, 0, 1)
-        fade_out = np.clip((r_end - r_norm_grid) / 0.08, 0, 1)
-        arm_val *= fade_in * fade_out * intensity * intensity_mod
+            # 宽度调制 - 使用固定的 arm_noise，避免每个 sub-arm 独立生成导致不连续
+            arm_noise = _tileable_noise((n_r, n_phi), rng, freq_u=3, freq_v=2)
+            width_mod = 0.2 + 1.5 * arm_noise
+            width_mod = np.clip(width_mod, 0.15, 3.0)
 
-        spiral += arm_val
-        temp_contribution += arm_val * arm_delta_T
+            arm_kappa = 1.0 / (sr_width ** 2) * 1.5
+            arm_val = np.exp(arm_kappa * (np.cos(arm_angle) - 1) * width_mod)
+
+            # 径向 mask - 使用硬边界，减少 fade 效果
+            mask = (r_norm_grid >= sr) & (r_norm_grid <= sr_end)
+            arm_val = np.where(mask, arm_val, 0)
+
+            # 强度调制 - 降低断裂效果，让 sub-arm 更连续
+            intensity_mod = 0.1 + 0.9 * (arm_noise ** 0.15)
+
+            # 轻微的边缘软化（比之前小）
+            fade_edge = 0.02
+            fade_in = np.clip((r_norm_grid - sr) / fade_edge, 0, 1)
+            fade_out = np.clip((sr_end - r_norm_grid) / fade_edge, 0, 1)
+            arm_val *= fade_in * fade_out * sr_int * intensity_mod
+
+            spiral += arm_val
+            temp_contribution += arm_val * arm_delta_T
 
     spiral = np.clip(spiral / (np.max(spiral) + 1e-6), 0, 1)
     return spiral, temp_contribution
@@ -676,38 +695,28 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     # 剪切公式：使用 (r_norm + c)^(-1.5) 限制内圈发散
     # 添加常数项 0.3 避免内圈剪切过大，外圈剪切趋近于 0
     kep_shear = shear_strength * (1.0 / (r_norm_grid + 0.3) ** 1.5 - 0.8)
-    kep_shear = np.clip(kep_shear, 0, shear_strength * 8)  # 限制最大剪切
+    kep_shear = np.clip(kep_shear, 0, shear_strength * 8)
     kep_shift_pixels = (kep_shear / (2 * np.pi) * n_phi).astype(int)
-    # 进一步限制最大位移不超过图像宽度的 25%（避免过度滚动）
     max_shift = n_phi // 4
     kep_shift_pixels = np.clip(kep_shift_pixels, -max_shift, max_shift)
 
+    # 不使用剪切滚动，避免产生环状纹理
     turbulence_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     turbulence_mid = _tileable_noise((n_r, n_phi), rng, freq_u=24, freq_v=12)
     turbulence_fine = _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40)
     turbulence_extra = _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100)
     turbulence_ultra = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
 
-    for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
-        for ri in range(n_r):
-            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
-
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for layer in [turbulence_coarse, turbulence_mid, turbulence_fine, turbulence_extra, turbulence_ultra]:
-            for ri in range(n_r):
-                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
-
     # 像素级高频噪声：使用 tileable 噪声保证周期性边界
-    # 模拟未分辨的细小团块，频率足够高使得细节细腻
     pixel_noise = _tileable_noise((n_r, n_phi), rng, freq_u=600, freq_v=300)
-    pixel_noise = (pixel_noise - 0.5) * 2  # [-1, 1]
+    pixel_noise = (pixel_noise - 0.5) * 2
 
-    turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
-                  + 0.25 * turbulence_fine + 0.22 * turbulence_extra
-                  + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
+    # 极低湍流权重，仅添加细微纹理
+    turbulence = (0.03 * turbulence_coarse + 0.05 * turbulence_mid
+                  + 0.08 * turbulence_fine + 0.05 * turbulence_extra
+                  + 0.03 * turbulence_ultra + 0.02 * np.clip(pixel_noise, 0, 1))
 
-    temp_contribution = 0.05 * np.clip(turbulence, 0, 1)
+    temp_contribution = 0.04 * np.clip(turbulence, 0, 1)
     return turbulence, kep_shift_pixels, temp_contribution
 
 
@@ -716,20 +725,22 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
     """
     生成细丝（filaments）密度和温度贡献
     物理意义：吸积盘中的丝状结构，可能是磁重联或剪切流形成的细长条纹
-    特征：沿角度方向延伸（长条状），径向很窄
+    特征：沿角度方向延伸（长条状），径向很窄，由多个 sub-filament 接续而成
 
     数量说明：真实吸积盘中细丝结构约 20-50 条，这里用 30-60 条保证可见性
     """
-    # 细丝数量：120-200 条（进一步增加数量）
-    arc_count = int(rng.uniform(120, 200))
+    # 细丝数量：150-300 条（每条由多个 sub-filament 组成）
+    arc_count = int(rng.uniform(150, 300))
+    # 每条细丝的 sub-filament 数量：2-4 个
+    sub_filament_counts = rng.integers(2, 5, arc_count)
 
     arc_phi_starts = rng.uniform(0, 2 * np.pi, arc_count)
     r_positions = rng.uniform(0.05, 0.95, arc_count)
     arc_rs = 0.05 + r_positions ** 0.6 * 0.9
     # 细丝径向宽度：0.002-0.008（适中宽度）
     arc_r_widths = rng.uniform(0.002, 0.008, arc_count)
-    # 细丝角度长度：较长 0.3-1.0（约 100°-360°），形成细长条纹
-    arc_lengths = rng.uniform(0.3, 1.0, arc_count)
+    # 细丝总角度长度：0.5-1.2（约 180°-430°）
+    arc_lengths = rng.uniform(0.5, 1.2, arc_count)
 
     arc_intensities = rng.uniform(0.7, 1.0, arc_count)  # 提高细丝强度
     arc_delta_Ts = 0.3 + 0.6 * rng.power(0.3, arc_count)  # 提高温度贡献范围：0.3-0.9
@@ -737,52 +748,59 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
     arc_frequencies = rng.integers(2, 7, arc_count)
     arc_width_mods = rng.uniform(0.3, 0.8, arc_count)
 
-    print(f"Generating {arc_count} filaments...")
+    print(f"Generating {arc_count} filaments with sub-segments...")
     arcs = np.zeros((n_r, n_phi), dtype=np.float32)
-
-    batch_size = 200
     temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
 
-    for batch_start in tqdm(range(0, arc_count, batch_size), desc="Filaments", leave=False):
-        batch_end = min(batch_start + batch_size, arc_count)
-        
-        # Shape parameters (per arc)
-        ars = arc_rs[batch_start:batch_end, None, None]
-        aps = arc_phi_starts[batch_start:batch_end, None, None]
-        ar_ws = arc_r_widths[batch_start:batch_end, None, None]
-        alens = arc_lengths[batch_start:batch_end, None, None]
-        ints = arc_intensities[batch_start:batch_end, None, None]
-        phases = arc_phases[batch_start:batch_end, None, None]
-        frqs = arc_frequencies[batch_start:batch_end, None, None]
-        wmods = arc_width_mods[batch_start:batch_end, None, None]
+    # 逐条生成细丝，每条细丝由多个 sub-filament 接续而成
+    for i in tqdm(range(arc_count), desc="Filaments", leave=False):
+        # 细丝基础参数
+        base_phi = arc_phi_starts[i]
+        base_r = arc_rs[i]
+        base_width = arc_r_widths[i]
+        total_length = arc_lengths[i]
+        intensity = arc_intensities[i]
+        delta_T = arc_delta_Ts[i]
 
-        # Radial profile (gaussian)
-        r_diff = r_norm_grid[None, :, :] - ars
-        arc_r = np.exp(-0.5 * (r_diff / ar_ws) ** 2)
+        # 生成 sub-filament 参数
+        sub_count = sub_filament_counts[i]
+        sub_fill = rng.uniform(0.35, 0.55)  # sub-filament 占总长度的比例
+        sub_lengths = rng.uniform(0.08, 0.20, sub_count)
+        # 归一化 sub 长度，使其总和等于 total_length * sub_fill
+        sub_lengths = sub_lengths / sub_lengths.sum() * total_length * sub_fill
 
-        # Angular profile: 使用 cos() 保证周期性边界
-        # 公式：exp(kappa * (cos(phi - phi_start) - 1))
-        # 当 phi - phi_start = 0 时取最大值 1
-        # kappa 越大，细丝越窄；kappa 越小，细丝越宽
-        phi_range = (alens / (ars + 0.01))  # Inner radii span wider angle
-        arc_phi_half_width = np.maximum(phi_range * 0.7, 0.3)
+        # sub-filament 的起始角度（沿细丝方向分布）- 大间隙
+        sub_starts = np.zeros(sub_count)
+        sub_starts[0] = base_phi
+        for j in range(1, sub_count):
+            gap = rng.uniform(0.08, 0.20)  # 大间隙
+            sub_starts[j] = sub_starts[j-1] + sub_lengths[j-1] + gap
 
-        # kappa 与半高宽的关系：kappa = 1.5 / half_width^2
-        kappa = 1.5 / (arc_phi_half_width ** 2)
+        # sub-filament 的宽度和强度变化 - 增加对比度
+        sub_widths = base_width * rng.uniform(0.3, 3.0, sub_count)
+        sub_widths = np.clip(sub_widths, 0.001, 0.025)
+        sub_intensities = intensity * rng.uniform(0.15, 1.0, sub_count)
 
-        # Sinusoidal modulation along phi - 使用 cos() 保证周期性
-        sin_mod = 0.3 + 0.7 * np.cos((phi_grid[None, :, :] - aps) * frqs + phases)
-        modulated_width = 1.0 + wmods * (sin_mod - 0.3)  # 调制 kappa
+        # 生成每个 sub-filament
+        for j in range(sub_count):
+            sub_phi = sub_starts[j]
+            sub_len = sub_lengths[j]
+            sub_w = sub_widths[j]
+            sub_int = sub_intensities[j]
 
-        # 使用 cos 形状的角度剖面，自动处理周期性边界
-        arc_val = np.exp(kappa * modulated_width * (np.cos(phi_grid[None, :, :] - aps) - 1))
+            # 角度剖面
+            phi_range = sub_len / (base_r + 0.01)
+            phi_half_width = np.maximum(phi_range * 0.7, 0.2)
+            kappa = 1.5 / (phi_half_width ** 2)
 
-        arc_batch = arc_r * arc_val * ints
-        arcs += np.sum(arc_batch, axis=0)
+            sub_val = np.exp(kappa * (np.cos(phi_grid - sub_phi) - 1))
 
-        tc_delta_ts = arc_delta_Ts[batch_start:batch_end, None, None]
-        temp_batch = arc_r * arc_val * ints * tc_delta_ts * 0.7
-        temp_contribution += np.sum(temp_batch, axis=0)
+            # 径向剖面
+            r_diff = r_norm_grid - base_r
+            r_prof = np.exp(-0.5 * (r_diff / sub_w) ** 2)
+
+            arcs += sub_val * r_prof * sub_int
+            temp_contribution += sub_val * r_prof * sub_int * delta_T * 0.7
 
     arcs = np.clip(arcs, 0, 1)
     temp_contribution = np.clip(temp_contribution, 0, arcs * 0.5)
@@ -797,14 +815,16 @@ def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
     """
     rt_spikes = np.zeros((n_r, n_phi), dtype=np.float32)
     temp_contribution = np.zeros((n_r, n_phi), dtype=np.float32)
-    rt_count = int(rng.uniform(12, 24) * disk_area * 0.5)
+    # RT 不稳定性主要出现在内圈，数量增加
+    rt_count = int(rng.uniform(15, 30) * disk_area * 0.8)
 
     rt_phis = rng.uniform(0, 2 * np.pi, rt_count)
-    rt_r_bases = rng.uniform(0.01, 0.08, rt_count)
-    rt_phi_widths = rng.uniform(0.1, 0.25, rt_count)
-    rt_r_lengths = rng.uniform(0.05, 0.15, rt_count)
-    rt_intensities = rng.uniform(0.6, 1.0, rt_count)
-    rt_delta_Ts = rng.uniform(0.3, 1.0, rt_count)
+    # RT 位置偏内圈，更多集中在 r_norm < 0.3 区域 - 使用幂次分布偏向内圈
+    rt_r_bases = np.power(rng.uniform(0.01, 0.15, rt_count), 1.5)  # 幂次分布偏向内圈
+    rt_phi_widths = rng.uniform(0.08, 0.20, rt_count)  # 更窄，更集中
+    rt_r_lengths = rng.uniform(0.08, 0.20, rt_count)  # 更长
+    rt_intensities = rng.uniform(0.8, 1.0, rt_count)  # 提高强度
+    rt_delta_Ts = rng.uniform(0.5, 1.2, rt_count)  # 提高温度贡献
 
     for i in range(rt_count):
         rt_phi_kappa = 1.0 / (rt_phi_widths[i] ** 2) * 1.5
@@ -851,37 +871,26 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
     """
     Apply turbulence disturbance to density and temperature fields.
     Returns: (density, temp_struct)
-    
+
     Args:
         t_offset: 时间偏移，用于动态旋转
         omega_grid: 开普勒角速度网格，用于计算旋转量
     """
+    # 不使用剪切滚动，避免产生环状纹理
     disturb_coarse = _tileable_noise((n_r, n_phi), rng, freq_u=8, freq_v=4)
     disturb_mid = _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16)
     disturb_fine = _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50)
     disturb_extra = _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125)
-    for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
-        for ri in range(n_r):
-            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels[ri, 0])
 
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
-            for ri in range(n_r):
-                layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
+    disturb_pixel = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
+    disturb_pixel = (disturb_pixel - 0.5) * 2  # [-1, 1] 范围
 
-    disturb_pixel = rng.random((n_r, n_phi)).astype(np.float32)
-    
-    if t_offset != 0.0 and omega_grid is not None:
-        rotation_pixels = (t_offset * omega_grid / (2 * np.pi) * n_phi).astype(int)
-        for ri in range(n_r):
-            disturb_pixel[ri, :] = np.roll(disturb_pixel[ri, :], rotation_pixels[ri, 0])
-
-    disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
-                   + 0.30 * disturb_extra + 0.20 * disturb_pixel)
-    disturb_mod = np.clip(disturb_mod * 1.4, 0.05, 1.0)
+    # 极轻微 disturbance - 仅添加细小扰动，不破坏 spiral arm 和 filament 的分段结构
+    disturb_mod = (0.01 * disturb_coarse + 0.02 * disturb_mid + 0.04 * disturb_fine
+                   + 0.03 * disturb_extra + 0.02 * disturb_pixel)
+    disturb_mod = np.clip(disturb_mod * 0.5 + 0.5, 0.5, 1.0)  # 保持在 0.5-1.0 范围
     radial_preserve = 0.6 + 0.4 * r_norm_grid
-    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.1, 1.0)
+    disturb_mod = np.clip(disturb_mod * radial_preserve, 0.5, 1.0)
     density = density * disturb_mod
     temp_struct = temp_struct * disturb_mod
     return density, temp_struct
@@ -935,14 +944,28 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
     return hotspot, temp_contribution
 
 
-def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_inner: float = 2.0, r_outer: float = 3.5, enable_rt: bool = True) -> np.ndarray:
+def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
+                          r_inner: float = 2.0, r_outer: float = 3.5,
+                          enable_rt: bool = True, color_temp: float = None) -> np.ndarray:
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
-    - n_phi: 角度方向分辨率（对应 0-2π）
-    - n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
-    - enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
-    返回 (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
+
+    Args:
+        n_phi: 角度方向分辨率（对应 0-2π）
+        n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
+        seed: 随机种子
+        r_inner: 内半径
+        r_outer: 外半径
+        enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
+        color_temp: 色温（单位：K），控制整体颜色。默认 None 使用 DISK_COLOR_TEMPERATURE
+
+    Returns:
+        (n_r, n_phi, 4) float32，第 4 通道为 alpha（面密度）
     """
+    # 使用全局色温参数或传入的色温
+    if color_temp is None:
+        color_temp = DISK_COLOR_TEMPERATURE
+
     rng = np.random.default_rng(seed)
 
     phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
@@ -989,11 +1012,11 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_i
     # 5) 方位热点
     az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
 
-    # 组合密度 - 细丝权重与螺旋臂相近
-    rt_weight = 0.15 if enable_rt else 0.0
-    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
+    # 组合密度 - 大幅提高 spiral 和 arcs 权重，降低湍流
+    rt_weight = 0.20 if enable_rt else 0.0
+    density = 0.12 + 0.50 * spiral + 0.08 * turbulence + 0.15 * hotspot + 0.55 * arcs + rt_weight * rt_spikes
 
-# 湍流扰动
+# 湍流扰动 - 降低 disturbance 强度，保留更多 spiral arm 和 filament 的分段结构
     density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None)
 
     # 边缘软化（沿径向）
@@ -1022,10 +1045,16 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_i
     temperature_field = np.clip(np.maximum(temp_base, temp_struct_scaled), 0, 1)
 
     # ----- 颜色（温度 -> 黑体辐射 RGB）-----
-    # 温度场 [0,1] 映射到视觉色温范围
-    # 低温 1200K（暗红）→ 高温 7000K（白偏黄），不超过白色
+    # 色温控制温度映射范围：
+    # - 2700K: 整体温度降低，更多区域处于红橙温度 (1500K-6000K)
+    # - 4500K: 中等温度范围 (2000K-9000K)
+    # - 6500K: 整体温度升高，更多区域处于白色温度 (3000K-12000K)
+    # 使用线性插值：以 4500K 为基准，色温变化时调整 T_min 和 T_max
+    t_factor = (color_temp - 4500) / (6500 - 2700)  # -0.47 ~ 0.47
+    T_min = 2000 + t_factor * 1000  # 1500K ~ 2500K
+    T_max = 9000 + t_factor * 3000  # 6000K ~ 12000K
+
     temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
-    T_min, T_max = 1200.0, 10000.0
     T_K = T_min + temp_aniso * (T_max - T_min)
     bb_color = _blackbody_rgb(T_K)  # (n_r, n_phi, 3)
     # 高温端钳制：确保 R >= B，避免蓝色偏移（真正的白热不偏蓝）
@@ -1040,6 +1069,148 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42, r_i
     tex[:, :, 1] = np.clip(bb_color[:, :, 1] * luminosity, 0, 1)
     tex[:, :, 2] = np.clip(bb_color[:, :, 2] * luminosity, 0, 1)
     tex[:, :, 3] = np.clip(density, 0, 1)  # alpha 只由面密度决定
+
+    return tex
+
+
+def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
+                                    r_inner: float = 2.0, r_outer: float = 3.5,
+                                    enable_rt: bool = True, t_offset: float = 0.0,
+                                    color_temp: float = None) -> np.ndarray:
+    """
+    生成吸积盘纹理，支持参数化旋转（用于动画渲染）
+
+    关键特性：
+    - 使用固定的随机种子生成结构参数
+    - 对温度基底和各组件应用开普勒旋转
+    - 保证不同 t_offset 下是同一结构的旋转
+
+    Args:
+        n_phi: 角度方向分辨率（对应 0-2π）
+        n_r: 径向方向分辨率（对应 r_inner 到 r_outer）
+        seed: 随机种子
+        r_inner: 内半径
+        r_outer: 外半径
+        enable_rt: 是否启用 Rayleigh-Taylor 不稳定性
+        t_offset: 旋转偏移量（用于动画）
+        color_temp: 色温（单位：K），控制整体颜色。默认 None 使用 DISK_COLOR_TEMPERATURE
+
+    Returns:
+        (n_r, n_phi, 4) float32 纹理，RGBA
+    """
+    # 使用全局色温参数或传入的色温
+    if color_temp is None:
+        color_temp = DISK_COLOR_TEMPERATURE
+
+    rng = np.random.default_rng(seed)
+
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+    r_norm = np.linspace(0, 1, n_r)
+    phi_grid_base, r_norm_grid = np.meshgrid(phi, r_norm)
+
+    r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
+    disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
+
+    # 计算开普勒角速度
+    omega_grid = np.sqrt(0.5 / (r_vals + 0.01))
+
+    # 应用旋转后的 phi_grid
+    phi_grid = phi_grid_base - t_offset * omega_grid
+
+    # ----- 温度基底 -----
+    radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
+    temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
+    temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
+
+    # 对温度基底应用开普勒旋转
+    if t_offset != 0.0:
+        for ri in range(n_r):
+            rotation_pixels = int(t_offset * omega_grid[ri, 0] / (2 * np.pi) * n_phi)
+            temp_coarse[ri, :] = np.roll(temp_coarse[ri, :], rotation_pixels)
+            temp_fine[ri, :] = np.roll(temp_fine[ri, :], rotation_pixels)
+
+    temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
+    temp_base = np.clip(radial_decay * (0.85 + 0.15 * temp_noise), 0, 1)
+    temp_base *= 0.25
+
+    temp_struct = np.zeros((n_r, n_phi), dtype=np.float32)
+
+    # ----- 密度场 -----
+    # 1) 螺旋臂
+    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid)
+    temp_struct += spiral_temp
+
+    # 2) 云雾
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid, t_offset, omega_grid)
+    temp_struct += turb_temp
+
+    # 3) Filaments
+    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, t_offset, omega_grid)
+    temp_struct += arcs_temp
+
+    # 4) RT 不稳定性
+    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, t_offset, omega_grid)
+    temp_struct += rt_temp
+
+    # 5) 温度热点
+    hotspot, hotspot_temp = _generate_hotspots(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, t_offset, omega_grid)
+    temp_struct += hotspot_temp
+
+    # 6) 方位热点
+    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid)
+
+    # 组合密度
+    rt_weight = 0.20 if enable_rt else 0.0
+    density = 0.12 + 0.50 * spiral + 0.08 * turbulence + 0.15 * hotspot + 0.55 * arcs + rt_weight * rt_spikes
+
+    # 湍流扰动
+    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, t_offset, omega_grid)
+
+    # 边缘软化
+    edge = compute_edge_alpha(n_r)
+    density *= edge[:, None]
+
+    # 归一化
+    density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
+
+    # 合成温度场
+    if np.any(temp_struct > 0):
+        struct_scale = np.percentile(temp_struct[temp_struct > 0], 95)
+        temp_struct_scaled = temp_struct / (struct_scale + 1e-6)
+    else:
+        temp_struct_scaled = temp_struct
+    temp_struct_scaled = np.clip(temp_struct_scaled * 0.8, 0, 1.2)
+
+    struct_max_per_r = np.max(temp_struct_scaled, axis=1)
+    struct_p70_per_r = np.quantile(temp_struct_scaled, 0.7, axis=1)
+    struct_ceiling = np.maximum(struct_p70_per_r, 0.05)
+    temp_base = np.minimum(temp_base, struct_ceiling[:, None])
+    temp_base = np.minimum(temp_base, struct_max_per_r[:, None])
+
+    temperature_field = np.clip(np.maximum(temp_base, temp_struct_scaled), 0, 1)
+
+    # 颜色（温度 -> 黑体辐射 RGB）
+    # 色温控制温度映射范围：
+    # - 2700K: 整体温度降低，更多区域处于红橙温度 (1500K-6000K)
+    # - 4500K: 中等温度范围 (2000K-9000K)
+    # - 6500K: 整体温度升高，更多区域处于白色温度 (3000K-12000K)
+    # 使用线性插值：以 4500K 为基准，色温变化时调整 T_min 和 T_max
+    t_factor = (color_temp - 4500) / (6500 - 2700)  # -0.47 ~ 0.47
+    T_min = 2000 + t_factor * 1000  # 1500K ~ 2500K
+    T_max = 9000 + t_factor * 3000  # 6000K ~ 12000K
+
+    temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
+    T_K = T_min + temp_aniso * (T_max - T_min)
+    bb_color = _blackbody_rgb(T_K)
+    bb_color[:, :, 2] = np.minimum(bb_color[:, :, 2], bb_color[:, :, 0])
+
+    luminosity = np.clip(np.sqrt(temp_aniso), 0, 1)
+
+    tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
+    tex[:, :, 0] = np.clip(bb_color[:, :, 0] * luminosity, 0, 1)
+    tex[:, :, 1] = np.clip(bb_color[:, :, 1] * luminosity, 0, 1)
+    tex[:, :, 2] = np.clip(bb_color[:, :, 2] * luminosity, 0, 1)
+    tex[:, :, 3] = np.clip(density, 0, 1)
 
     return tex
 
@@ -1144,12 +1315,45 @@ class TaichiRenderer:
         lum_power = ti.cast(G_LUMINOSITY_POWER, ti.f32)
         gain = ti.cast(G_BRIGHTNESS_GAIN, ti.f32)
         alpha_gain = ti.cast(DISK_ALPHA_GAIN, ti.f32)
+        color_temp = ti.cast(DISK_COLOR_TEMPERATURE, ti.f32)
+
+        @ti.func
+        def _color_temp_to_tint(temp):
+            """Convert color temperature (K) to RGB tint using Tanner Helland approximation.
+
+            Reference: http://www.tannerhelland.com/4435/convert-temperature-rgb-algorithm-code/
+            temp: temperature in Kelvin
+            Returns: RGB vector with values in [0, 1]
+            """
+            t = temp / 100.0
+
+            # Red calculation
+            r = 1.0
+            if t > 66.0:
+                r = ti.min(ti.max(1.292936 * ti.pow(ti.max(t - 60.0, 0.0001), -0.1332047592), 0.0), 1.0)
+
+            # Green calculation
+            g = 0.0
+            if t <= 66.0:
+                g = ti.min(ti.max(0.390082 * ti.log(ti.max(t, 0.0001)) - 0.631841, 0.0), 1.0)
+            else:
+                g = ti.min(ti.max(1.129891 * ti.pow(ti.max(t - 60.0, 0.0001), -0.0755148492), 0.0), 1.0)
+
+            # Blue calculation
+            b = 1.0
+            if t < 66.0:
+                if t <= 19.0:
+                    b = 0.0
+                else:
+                    b = ti.min(ti.max(0.543207 * ti.log(ti.max(t - 10.0, 0.0001)) - 1.19625, 0.0), 1.0)
+
+            return ti.Vector([r, g, b])
 
         @ti.func
         def _apply_g_factor(base_color, hit_pos, hit_r, ray_dir_to_cam, cam_pos,
                             r_inner, r_outer, tilt_rad):
             """Apply relativistic g-factor to disk color.
-            
+
             Computes Doppler shift and gravitational redshift for accretion disk emission.
             Returns color modulated by g-factor with radial brightness profile.
             """
@@ -1221,7 +1425,7 @@ class TaichiRenderer:
                 base_color[1] * g_scale,
                 base_color[2] * b_scale,
             ])
-            tint = ti.Vector([DISK_BASE_TINT[0], DISK_BASE_TINT[1], DISK_BASE_TINT[2]])
+            tint = _color_temp_to_tint(color_temp)
             return ti.math.clamp(shifted * tint * brightness, 0.0, 10.0)
 
         @ti.func
@@ -1235,7 +1439,7 @@ class TaichiRenderer:
         @ti.func
         def _compute_acc_jacobian(pos, d_pos, L2):
             """Compute Jacobian of acceleration w.r.t. position.
-            
+
             For variational equation: d(acc)/d(pos) = -1.5*L2 * (I/r^5 - 5*pos*pos^T/r^7)
             Applied to perturbation vector d_pos.
             """
@@ -1352,7 +1556,7 @@ class TaichiRenderer:
                               h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32,
                               disk_tilt: ti.f32):
             """Ray marching kernel for Schwarzschild black hole rendering.
-            
+
             Traces rays from camera through each pixel, integrating accretion disk
             emission along the path with relativistic effects.
             """
@@ -1582,7 +1786,7 @@ class TaichiRenderer:
                           blur_field: ti.template(), threshold: ti.f32, intensity: ti.f32,
                           kernel_radius: ti.i32, sigma_scale: ti.f32):
             """Bloom post-processing kernel.
-            
+
             Extracts bright regions, applies separable Gaussian blur,
             and adds back to image for glow effect.
             """
@@ -1679,7 +1883,7 @@ class TaichiRenderer:
                                screen_center_x: ti.f32, screen_center_y: ti.f32,
                                intensity: ti.f32, scale: ti.f32):
             """Lens flare effect kernel.
-            
+
             Renders ghost images and diffraction rings along the line
             from bright source to screen center.
             """
@@ -2098,24 +2302,24 @@ def validate_args(args) -> None:
     # FOV range check
     if not (0 < args.fov < 180):
         raise ValueError(f"FOV must be between 0 and 180 degrees, got {args.fov}")
-    
+
     # Disk radius check
     if args.disk_inner_radius >= args.disk_outer_radius:
         raise ValueError(f"disk_inner_radius ({args.disk_inner_radius}) must be less than "
                         f"disk_outer_radius ({args.disk_outer_radius})")
-    
+
     # Step size check
     if args.step_size <= 0:
         raise ValueError(f"step_size must be positive, got {args.step_size}")
-    
+
     # AA strength range
     if not (0.5 <= args.aa_strength <= 2.0):
         raise ValueError(f"aa_strength must be between 0.5 and 2.0, got {args.aa_strength}")
-    
+
     # Video parameters
     if args.n_frames <= 0:
         raise ValueError(f"n_frames must be positive, got {args.n_frames}")
-    
+
     if args.fps <= 0:
         raise ValueError(f"fps must be positive, got {args.fps}")
 
