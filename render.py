@@ -480,6 +480,17 @@ def _tileable_noise(shape: Tuple[int, int], rng: np.random.Generator, freq_u: in
     return cloud
 
 
+def _periodic_pixel_noise(shape: Tuple[int, int], rng: np.random.Generator) -> np.ndarray:
+    """生成像素级白噪声，保证 phi 方向周期性（首尾相接）。
+
+    用于湍流的 pixel_noise 层，提供高频颗粒感，同时保证纹理无缝。
+    """
+    h, w = shape
+    noise = rng.random((h, w)).astype(np.float32)
+    noise[:, -1] = noise[:, 0]  # 强制周期性：phi=0 和 phi=2π 相同
+    return noise * 2 - 1  # 返回 [-1, 1] 范围
+
+
 def _fbm_noise(shape: Tuple[int, int], rng: np.random.Generator, octaves: int = 4, persistence: float = 0.5, base_scale: int = 1, wrap_u: bool = False) -> np.ndarray:
     """分形布朗运动噪声（多层叠加）。wrap_u=True 时用 tileable 噪声替代。"""
     if wrap_u:
@@ -718,9 +729,8 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
             for ri in range(n_r):
                 layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
 
-    # 像素级高频噪声：使用 tileable 噪声保证周期性边界
-    pixel_noise = _tileable_noise((n_r, n_phi), rng, freq_u=600, freq_v=300)
-    pixel_noise = (pixel_noise - 0.5) * 2
+    # 像素级高频噪声：使用周期性像素噪声，提供高频颗粒感同时保证边界无缝
+    pixel_noise = _periodic_pixel_noise((n_r, n_phi), rng)
 
     # 湍流权重：多层噪声叠加产生云雾状结构
     turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
@@ -904,8 +914,7 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
             for ri in range(n_r):
                 layer[ri, :] = np.roll(layer[ri, :], rotation_pixels[ri, 0])
 
-    disturb_pixel = _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200)
-    disturb_pixel = (disturb_pixel - 0.5) * 2  # [-1, 1] 范围
+    disturb_pixel = _periodic_pixel_noise((n_r, n_phi), rng)
 
     # disturbance 权重：提高高频层强度，保证细节丰富
     disturb_mod = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine

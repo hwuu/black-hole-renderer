@@ -16,6 +16,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from render import (
     _tileable_noise,
+    _periodic_pixel_noise,
     _fbm_noise,
     _blackbody_rgb,
     compute_edge_alpha,
@@ -97,11 +98,11 @@ def _generate_turbulence_fixed(params: Dict, n_r: int, n_phi: int,
             turbulence_ultra[ri, :] = np.roll(turbulence_ultra[ri, :], rot)
             pixel_noise[ri, :] = np.roll(pixel_noise[ri, :], rot)
 
-    turbulence = (0.03 * turbulence_coarse + 0.05 * turbulence_mid
-                  + 0.08 * turbulence_fine + 0.05 * turbulence_extra
-                  + 0.03 * turbulence_ultra + 0.02 * np.clip(pixel_noise, 0, 1))
+    turbulence = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
+                  + 0.25 * turbulence_fine + 0.22 * turbulence_extra
+                  + 0.18 * turbulence_ultra + 0.12 * np.clip(pixel_noise, 0, 1))
 
-    temp_contribution = 0.04 * np.clip(turbulence, 0, 1)
+    temp_contribution = 0.05 * np.clip(turbulence, 0, 1)
     return turbulence, kep_shift_pixels, temp_contribution
 
 
@@ -317,7 +318,7 @@ def _precompute_disk_params(n_phi: int, n_r: int, seed: int,
         'noise_fine': _tileable_noise((n_r, n_phi), rng, freq_u=80, freq_v=40),
         'noise_extra': _tileable_noise((n_r, n_phi), rng, freq_u=200, freq_v=100),
         'noise_ultra': _tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200),
-        'pixel_noise': (_tileable_noise((n_r, n_phi), rng, freq_u=600, freq_v=300) - 0.5) * 2
+        'pixel_noise': _periodic_pixel_noise((n_r, n_phi), rng)
     }
 
     # 细丝参数
@@ -428,7 +429,7 @@ def _precompute_disk_params(n_phi: int, n_r: int, seed: int,
         'noise_mid': _tileable_noise((n_r, n_phi), rng, freq_u=32, freq_v=16),
         'noise_fine': _tileable_noise((n_r, n_phi), rng, freq_u=100, freq_v=50),
         'noise_extra': _tileable_noise((n_r, n_phi), rng, freq_u=250, freq_v=125),
-        'pixel_noise': (_tileable_noise((n_r, n_phi), rng, freq_u=400, freq_v=200) - 0.5) * 2
+        'pixel_noise': _periodic_pixel_noise((n_r, n_phi), rng)
     }
 
     # 存储网格参数
