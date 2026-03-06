@@ -758,6 +758,7 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
             layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels_low[ri, 0])
 
     # 动态旋转支持（低分辨率）
+    rotation_pixels_low = None
     if t_offset != 0.0 and omega_grid is not None:
         # 降级采样 omega_grid 到低分辨率
         omega_grid_low = omega_grid[::scale_factor, ::scale_factor]
@@ -768,6 +769,11 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
 
     # 像素级高频噪声（低分辨率）
     pixel_noise = _periodic_pixel_noise((low_n_r, low_n_phi), rng)
+
+    # 对 pixel_noise 应用开普勒旋转（t_offset != 0 时）
+    if rotation_pixels_low is not None:
+        for ri in range(low_n_r):
+            pixel_noise[ri, :] = np.roll(pixel_noise[ri, :], rotation_pixels_low[ri, 0])
 
     # 湍流权重：多层噪声叠加
     turbulence_low = (0.08 * turbulence_coarse + 0.15 * turbulence_mid
@@ -1031,6 +1037,7 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
             layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels_low[ri, 0])
 
     # 动态旋转支持（低分辨率）
+    rotation_pixels_low = None
     if t_offset != 0.0 and omega_grid is not None:
         # 降级采样 omega_grid 到低分辨率
         omega_grid_low = omega_grid[::scale_factor, ::scale_factor]
@@ -1040,6 +1047,11 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
                 layer[ri, :] = np.roll(layer[ri, :], rotation_pixels_low[ri, 0])
 
     disturb_pixel = _periodic_pixel_noise((low_n_r, low_n_phi), rng)
+
+    # 对 disturb_pixel 应用开普勒旋转（t_offset != 0 时）
+    if rotation_pixels_low is not None:
+        for ri in range(low_n_r):
+            disturb_pixel[ri, :] = np.roll(disturb_pixel[ri, :], rotation_pixels_low[ri, 0])
 
     # disturbance 权重（低分辨率）
     disturb_mod_low = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
