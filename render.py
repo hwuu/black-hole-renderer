@@ -979,6 +979,13 @@ def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, 
     az_wave = 0.5 + 0.5 * np.sin((low_phi_grid + shear) * az_freq)
     az_noise = _fbm_noise((low_n_r, low_n_phi), rng, octaves=3, persistence=0.5, base_scale=3, wrap_u=True)
 
+    # 对 az_noise 应用开普勒旋转（t_offset != 0 时）
+    if t_offset != 0.0 and omega_grid is not None:
+        omega_grid_low = omega_grid[::scale_factor, ::scale_factor]
+        rotation_pixels_low = (t_offset * omega_grid_low / (2 * np.pi) * low_n_phi).astype(int)
+        for ri in range(low_n_r):
+            az_noise[ri, :] = np.roll(az_noise[ri, :], rotation_pixels_low[ri, 0])
+
     az_hotspot_low = az_wave * az_noise
 
     # upscale
@@ -1270,8 +1277,8 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
     # 计算开普勒角速度
     omega_grid = np.sqrt(0.5 / (r_vals + 0.01))
 
-    # 应用旋转后的 phi_grid
-    phi_grid = phi_grid_base - t_offset * omega_grid
+    # 应用旋转后的 phi_grid（开普勒旋转：逆时针，角度增加）
+    phi_grid = phi_grid_base + t_offset * omega_grid
 
     # ----- 温度基底 -----
     radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
@@ -1395,6 +1402,7 @@ class TaichiRenderer:
                  lens_flare=False,
                  anti_alias="disabled",
                  aa_strength=1.0,
+                 disk_rotation_speed=0.1,
                  ignore_taichi_cache=False):
         # ti is imported at module level as "import taichi as ti"
         self.width = width
@@ -1407,6 +1415,7 @@ class TaichiRenderer:
         self.lens_flare = lens_flare
         self.anti_alias = anti_alias
         self.aa_strength = aa_strength
+        self.disk_rotation_speed = disk_rotation_speed
 
         use_cache = not ignore_taichi_cache
         ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, offline_cache=use_cache)
@@ -1454,6 +1463,28 @@ class TaichiRenderer:
         self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
 
         self._compile_kernels()
+
+    def update_disk_texture(self, new_disk_tex: np.ndarray) -> None:
+        """更新吸积盘纹理（用于动态纹理生成）。
+
+        Args:
+            new_disk_tex: 新的纹理数组 (n_r, n_phi, 4) float32
+        """
+        dtex_h, dtex_w = new_disk_tex.shape[:2]
+        assert dtex_h == self.dtex_h and dtex_w == self.dtex_w, \
+            f"Texture size mismatch: expected {self.dtex_h}x{self.dtex_w}, got {dtex_h}x{dtex_w}"
+
+        self.disk_texture_field.from_numpy(new_disk_tex)
+
+        # 重新生成 mipmap
+        mips = generate_disk_mipmaps(new_disk_tex, levels=4)
+        max_h = max(m.shape[0] for m in mips)
+        max_w = max(m.shape[1] for m in mips)
+        mips_padded = np.zeros((len(mips), max_h, max_w, 4), dtype=np.float32)
+        for i, m in enumerate(mips):
+            h, w = m.shape[:2]
+            mips_padded[i, :h, :w] = m
+        self.disk_mips_field.from_numpy(mips_padded)
 
     def _compile_kernels(self):
         # ti is module-level import
@@ -2113,7 +2144,7 @@ class TaichiRenderer:
         h_base = float(self.step_size)
         r_inner = float(self.r_disk_inner)
         r_outer = float(self.r_disk_outer)
-        t_offset = float(frame) * 0.1
+        t_offset = float(frame) * self.disk_rotation_speed
         disk_tilt = float(self.disk_tilt)
 
         self._ray_march_kernel(
@@ -2250,6 +2281,7 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
                   disk_texture_path: Optional[str] = None, r_disk_inner: float = R_DISK_INNER_DEFAULT,
                   r_disk_outer: float = R_DISK_OUTER_DEFAULT, disk_tilt: float = 0.0,
                   lens_flare: bool = False, anti_alias: str = "disabled", aa_strength: float = 1.0,
+                  disk_rotation_speed: float = 0.1,
                   force_regenerate_disk_texture: bool = False, ignore_taichi_cache: bool = False) -> np.ndarray:
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
@@ -2269,6 +2301,7 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
         lens_flare=lens_flare,
         anti_alias=anti_alias,
         aa_strength=aa_strength,
+        disk_rotation_speed=disk_rotation_speed,
         ignore_taichi_cache=ignore_taichi_cache
     )
 
@@ -2281,7 +2314,9 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
 
 
 def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: int, fps: int, output_path: str,
-                 fov: float, static_cam_pos: List[float], orbit: bool = False, resume: bool = False) -> None:
+                 fov: float, static_cam_pos: List[float], orbit: bool = False, resume: bool = False,
+                 disk_rotation_algorithm: str = "baseline", disk_rotation_speed: float = 0.1,
+                 keyframes_count: int = 10) -> None:
     """
     渲染视频（多帧并合成视频）。
 
@@ -2295,6 +2330,9 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         static_cam_pos: 静态模式下的相机位置
         orbit: 是否围绕原点旋转
         resume: 是否尝试从断点恢复
+        disk_rotation_algorithm: 吸积盘旋转算法 ("baseline", "parametric", "keyframes")
+        disk_rotation_speed: 旋转速度系数
+        keyframes_count: 关键帧数量（仅 keyframes 算法有效）
     """
     orbit_radius = float(np.linalg.norm(static_cam_pos))
 
@@ -2308,6 +2346,9 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         "n_frames": n_frames,
         "fov": fov,
         "orbit": orbit,
+        "disk_rotation_algorithm": disk_rotation_algorithm,
+        "disk_rotation_speed": disk_rotation_speed,
+        "keyframes_count": keyframes_count,
     }
 
     completed = set()
@@ -2329,6 +2370,28 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
     angle_step = 360.0 / n_frames
     rendered_this_session = 0
 
+    # —— 算法 2 和 3：预计算准备 ——
+    keyframe_textures = None  # 用于关键帧插值
+    base_seed = 42  # 固定种子，保证不同帧之间结构一致
+
+    if disk_rotation_algorithm == "keyframes":
+        # 预计算关键帧纹理
+        print(f"\n预计算 {keyframes_count} 个关键帧纹理（算法 3: keyframes）...")
+        keyframe_textures = []
+        t0_precompute = time.time()
+        for i in range(keyframes_count):
+            t_offset = i * (n_frames * disk_rotation_speed) / keyframes_count
+            tex = generate_disk_texture_rotating(
+                n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
+                seed=base_seed,
+                r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
+                enable_rt=True, t_offset=t_offset
+            )
+            keyframe_textures.append(tex)
+        precompute_time = time.time() - t0_precompute
+        print(f"关键帧预计算完成：{precompute_time:.2f}s")
+
+    # —— 主渲染循环 ——
     for frame in range(n_frames):
         if frame in completed:
             continue
@@ -2346,7 +2409,38 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
             status_str = "static"
 
         t0 = time.time()
-        img = renderer.render(cam_pos, fov, frame=frame)
+
+        # 根据算法处理纹理
+        if disk_rotation_algorithm == "baseline":
+            # 算法 1: 固定纹理，使用 frame 参数在光线追踪时旋转
+            img = renderer.render(cam_pos, fov, frame=frame)
+
+        elif disk_rotation_algorithm == "parametric":
+            # 算法 2: 每帧重新生成纹理
+            t_offset = float(frame) * disk_rotation_speed
+            tex = generate_disk_texture_rotating(
+                n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
+                seed=base_seed,
+                r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
+                enable_rt=True, t_offset=t_offset
+            )
+            renderer.update_disk_texture(tex)
+            # 注意：parametric 算法下，frame 参数不再需要（纹理已经旋转）
+            img = renderer.render(cam_pos, fov, frame=0)
+
+        elif disk_rotation_algorithm == "keyframes":
+            # 算法 3: 关键帧插值
+            t = frame / n_frames  # [0, 1)
+            keyframe_float = t * keyframes_count
+            keyframe_idx = int(keyframe_float) % keyframes_count
+            keyframe_next = (keyframe_idx + 1) % keyframes_count
+            alpha = keyframe_float - int(keyframe_float)
+
+            # 线性插值两个关键帧
+            tex = (1 - alpha) * keyframe_textures[keyframe_idx] + alpha * keyframe_textures[keyframe_next]
+            renderer.update_disk_texture(tex)
+            img = renderer.render(cam_pos, fov, frame=0)
+
         elapsed = time.time() - t0
         rendered_this_session += 1
 
@@ -2450,6 +2544,13 @@ def parse_args() -> argparse.Namespace:
                         help="视频帧率 (default: 36, 仅 --video 有效)")
     parser.add_argument("--resume", action="store_true",
                         help="视频模式：尝试从断点恢复（默认从头开始）")
+    parser.add_argument("--disk_rotation_algorithm", type=str, default="baseline",
+                        choices=["baseline", "parametric", "keyframes"],
+                        help="吸积盘旋转算法：baseline(固定纹理 + 刚体旋转), parametric(每帧重新生成), keyframes(关键帧插值) (default: baseline)")
+    parser.add_argument("--disk_rotation_speed", type=float, default=0.1,
+                        help="吸积盘旋转速度系数 (default: 0.1)")
+    parser.add_argument("--keyframes_count", type=int, default=10,
+                        help="关键帧数量（仅 keyframes 算法有效）(default: 10)")
     return parser.parse_args()
 
 
@@ -2505,19 +2606,26 @@ if __name__ == "__main__":
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
             aa_strength=args.aa_strength,
+            disk_rotation_speed=args.disk_rotation_speed,
             ignore_taichi_cache=args.ignore_taichi_cache
         )
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
         print(f"  orbit={args.orbit}")
         print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}, disk_tilt={args.disk_tilt}°")
+        print(f"  disk_rotation_algorithm={args.disk_rotation_algorithm}, disk_rotation_speed={args.disk_rotation_speed}")
+        if args.disk_rotation_algorithm == "keyframes":
+            print(f"  keyframes_count={args.keyframes_count}")
 
         render_video(
             renderer, width, height,
             n_frames=args.n_frames, fps=args.fps, output_path=args.output,
             fov=fov, static_cam_pos=args.pov,
             orbit=args.orbit,
-            resume=args.resume
+            resume=args.resume,
+            disk_rotation_algorithm=args.disk_rotation_algorithm,
+            disk_rotation_speed=args.disk_rotation_speed,
+            keyframes_count=args.keyframes_count
         )
     else:
         img = render_image(

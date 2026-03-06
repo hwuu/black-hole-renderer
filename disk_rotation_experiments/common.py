@@ -450,8 +450,8 @@ def _generate_texture_from_params(params: Dict, t_offset: float,
     grids = params['grids']
     n_r, n_phi = grids['r_norm_grid'].shape
 
-    # 计算旋转后的 phi_grid
-    phi_grid = grids['phi_grid_base'] - t_offset * grids['omega_grid']
+    # 计算旋转后的 phi_grid（开普勒旋转：逆时针，角度增加）
+    phi_grid = grids['phi_grid_base'] + t_offset * grids['omega_grid']
 
     # 温度基底
     radial_decay = np.clip(1.0 - grids['r_norm_grid'], 0, 1) ** 1.3
