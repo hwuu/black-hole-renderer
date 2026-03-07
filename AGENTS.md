@@ -31,6 +31,63 @@
 18. commit message 使用中文
 19. 每个 commit 必须添加 `Co-Authored-By` trailer
 
+---
+
+## 项目速记
+
+### 项目简介
+
+- 本项目是一个 **Schwarzschild 黑洞光线追踪渲染器**，核心目标是生成黑洞阴影、光子环、引力透镜扭曲星空和吸积盘效果。
+- 当前主实现为 **Taichi**，主入口基本集中在 `render.py`；设计文档以 `docs/design.md` 为准。
+- 当前不做 Kerr 度规，只关注无自旋黑洞；物理积分核心采用 **笛卡尔等效势形式**，而非球坐标 Christoffel 方案。
+
+### 核心实现约定
+
+- 核心光线方程：`d²x/dλ² = -1.5 * L² * x / r⁵`
+- 单帧/视频主入口：`render.py`
+- 设计与背景说明：`docs/design.md`
+- 端到端渲染测试：`tests/e2e_render.py`
+- 方向相关单测：`tests/unit/test_parametric_rotation_direction.py`
+
+### 代码结构速记
+
+- `render.py`
+  - 相机、天空盒、吸积盘程序纹理、Taichi 渲染器、视频渲染 CLI 都在这个文件
+  - `TaichiRenderer` 是核心渲染类
+  - `render_video()` 支持视频模式
+- `docs/design.md`
+  - 项目目标、物理模型、渲染管线、实现取舍的主文档
+- `tests/unit`
+  - 放轻量、定向、快速运行的单元测试
+- `tests/e2e_render.py`
+  - 放固定参数渲染 + hash 校验的端到端测试
+
+### 视频旋转算法速记
+
+- 当前视频模式支持三种吸积盘旋转算法：
+  - `baseline`：固定纹理，在采样阶段按 `frame` 做旋转
+  - `parametric`：每帧重新生成带时间偏移的程序纹理
+  - `keyframes`：预生成关键帧纹理并插值
+- 当排查视频中“结构旋转方向不一致”问题时，**先确认用户实际使用的是哪种算法**。
+- `parametric` 模式下，最容易出问题的是：
+  - `phi_grid` 路线的相位旋转
+  - `np.roll(...)` 路线的动态滚动
+  - 两者若符号不一致，就会出现“有些组件方向对、有些组件方向反”的现象。
+
+### 测试速记
+
+- 定向方向单测：
+
+```bash
+python -m unittest tests/unit/test_parametric_rotation_direction.py
+```
+
+- 端到端渲染校验：
+
+```bash
+python -m unittest tests/e2e_render.py
+```
+
 ### 踩坑记录
 
 21. 重试过 2 次以上的环境配置问题或重复犯错的问题，记录在本文件
@@ -44,6 +101,15 @@
     - 待分析：为什么物理正确的多普勒效应在视觉上呈现"反直觉"的颜色？
       - 可能方向：shift 的定义是否有误？g>1 实际对应什么物理条件？
       - 文件位置：`render.py:716-741` 的 `apply_g_factor` 函数
+
+23. **`parametric` 模式下动态旋转方向不一致** (已修复)
+    - 现象：视频中吸积盘不同组件旋转方向不一致，部分结构看起来“反着转”
+    - 根因：`phi_grid = phi_grid_base + t_offset * omega_grid` 与 `np.roll(..., +rotation_pixels)` 使用了相反的方向约定
+    - 最终修正：
+      - 统一以 `phi_grid` / `baseline` 采样方向为准
+      - 动态时间旋转使用 `np.roll(..., -rotation_pixels)`
+    - 重点文件：`render.py`
+    - 保护测试：`tests/unit/test_parametric_rotation_direction.py`
 
 ---
 
