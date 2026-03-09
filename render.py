@@ -27,6 +27,7 @@ import taichi as ti
 import json
 import shutil
 import imageio.v3 as iio
+from concurrent.futures import ThreadPoolExecutor
 
 # ============================================================================
 # 公共常量
@@ -1775,6 +1776,81 @@ class TaichiRenderer:
             mips_padded[i, :h, :w] = m
         self.disk_mips_field.from_numpy(mips_padded)
 
+    def upload_parametric_state(self, state: 'DiskTextureRotatingState') -> None:
+        """上传 parametric 旋转状态到 GPU，预计算归一化统计量。
+
+        将 DiskTextureRotatingState 的 13 个组件场和辅助数据上传到 Taichi fields，
+        预计算密度和温度的归一化统计量。当 generation_scale=1 时，这些统计量
+        在所有 t_offset 下精确不变，GPU 合成结果与 CPU 路径像素级等价。
+
+        Args:
+            state: DiskTextureRotatingState，预计算的旋转状态对象
+
+        Notes:
+            此方法应在 render_video 的 parametric 模式循环前调用一次。
+            调用后可使用 update_disk_texture_gpu(t_offset) 替代 CPU 纹理生成路径。
+
+        组件打包顺序（索引 0-12）:
+            0: temp_base, 1: spiral, 2: spiral_temp, 3: turbulence, 4: turb_temp,
+            5: arcs, 6: arcs_temp, 7: rt_spikes, 8: rt_temp, 9: hotspot,
+            10: hotspot_temp, 11: az_hotspot, 12: disturb_mod
+        """
+        n_r = state.n_r
+        n_phi = state.n_phi
+
+        packed = np.stack([
+            state.temp_base,       # 0
+            state.spiral,          # 1
+            state.spiral_temp,     # 2
+            state.turbulence,      # 3
+            state.turb_temp,       # 4
+            state.arcs,            # 5
+            state.arcs_temp,       # 6
+            state.rt_spikes,       # 7
+            state.rt_temp,         # 8
+            state.hotspot,         # 9
+            state.hotspot_temp,    # 10
+            state.az_hotspot,      # 11
+            state.disturb_mod,     # 12
+        ], axis=0).astype(np.float32)
+
+        self._comp_field = ti.field(dtype=ti.f32, shape=(13, n_r, n_phi))
+        self._comp_field.from_numpy(packed)
+
+        self._omega_rows_field = ti.field(dtype=ti.f32, shape=(n_r,))
+        self._omega_rows_field.from_numpy(state.omega_rows)
+
+        self._edge_field = ti.field(dtype=ti.f32, shape=(n_r,))
+        self._edge_field.from_numpy(state.edge)
+
+        # 预计算归一化统计量（t=0 无旋转，直接用原始组件计算）
+        rt_weight = 0.20 if state.enable_rt else 0.0
+        density = (0.15 + 0.10 * state.spiral + 0.30 * state.turbulence
+                   + 0.20 * state.hotspot + 0.30 * state.arcs
+                   + rt_weight * state.rt_spikes) * state.disturb_mod
+        density *= state.edge[:, None]
+        density_p98 = float(np.percentile(density, 98))
+
+        temp_struct = (state.spiral_temp + state.turb_temp + state.arcs_temp
+                       + state.rt_temp + state.hotspot_temp) * state.disturb_mod
+        pos_mask = temp_struct > 0
+        struct_scale = float(np.percentile(temp_struct[pos_mask], 95)) if np.any(pos_mask) else 1.0
+
+        temp_struct_scaled = np.clip(temp_struct / (struct_scale + 1e-6) * 0.8, 0, 1.2)
+        struct_max_per_r = np.max(temp_struct_scaled, axis=1).astype(np.float32)
+        struct_p70_per_r = np.quantile(temp_struct_scaled, 0.7, axis=1).astype(np.float32)
+
+        self._param_stats_field = ti.field(dtype=ti.f32, shape=(2,))
+        self._param_stats_field.from_numpy(np.array([density_p98, struct_scale], dtype=np.float32))
+
+        row_stats = np.stack([struct_max_per_r, struct_p70_per_r], axis=1).astype(np.float32)
+        self._param_row_stats_field = ti.Vector.field(2, dtype=ti.f32, shape=(n_r,))
+        self._param_row_stats_field.from_numpy(row_stats)
+
+        self._param_enable_rt = 1 if state.enable_rt else 0
+        self._param_color_temp = float(state.color_temp)
+        self._parametric_gpu_ready = True
+
     def _compile_kernels(self):
         # ti is module-level import
         width, height = self.width, self.height
@@ -2406,6 +2482,149 @@ class TaichiRenderer:
 
         self._lens_flare_kernel = _lens_flare_kernel
 
+        @ti.kernel
+        def _compose_disk_texture_kernel(
+                disk_tex: ti.template(),
+                comp: ti.template(),
+                omega: ti.template(),
+                edge: ti.template(),
+                stats: ti.template(),
+                row_stats: ti.template(),
+                t_offset: ti.f32,
+                enable_rt: ti.i32,
+                color_temp_val: ti.f32):
+            """GPU 纹理合成 kernel：滚动 13 个组件 + 合成最终 RGBA 纹理。
+
+            精确复现 _generate_disk_texture_rotating_from_state +
+            _compose_disk_texture_from_fields 的完整逻辑。
+            当 generation_scale=1 时与 CPU 路径像素级等价。
+            """
+            n_r = disk_tex.shape[0]
+            n_phi = disk_tex.shape[1]
+
+            density_p98 = stats[0]
+            struct_scale = stats[1]
+
+            t_factor = (color_temp_val - 4500.0) / (6500.0 - 2700.0)
+            T_min = 2000.0 + t_factor * 1000.0
+            T_max = 9000.0 + t_factor * 3000.0
+
+            rt_w = 0.20
+            if enable_rt == 0:
+                rt_w = 0.0
+
+            for ri, phi_i in disk_tex:
+                omega_val = omega[ri]
+                shift = ti.cast(
+                    t_offset * omega_val / (2.0 * ti.math.pi) * ti.cast(n_phi, ti.f32),
+                    ti.i32)
+                src = (phi_i + shift) % n_phi
+                if src < 0:
+                    src += n_phi
+
+                tb = comp[0, ri, src]
+                sp = comp[1, ri, src]
+                sp_t = comp[2, ri, src]
+                turb = comp[3, ri, src]
+                turb_t = comp[4, ri, src]
+                arc = comp[5, ri, src]
+                arc_t = comp[6, ri, src]
+                rt = comp[7, ri, src]
+                rt_t = comp[8, ri, src]
+                hs = comp[9, ri, src]
+                hs_t = comp[10, ri, src]
+                az = comp[11, ri, src]
+                dm = comp[12, ri, src]
+
+                # density = weighted sum * disturb_mod * edge
+                density = (0.15 + 0.10 * sp + 0.30 * turb + 0.20 * hs
+                           + 0.30 * arc + rt_w * rt) * dm * edge[ri]
+                density = ti.min(ti.max(density / (density_p98 + 1e-6), 0.0), 1.0)
+
+                # temp_struct = sum of temp components * disturb_mod
+                temp_struct = (sp_t + turb_t + arc_t + rt_t + hs_t) * dm
+                ts_scaled = ti.min(ti.max(
+                    temp_struct / (struct_scale + 1e-6) * 0.8, 0.0), 1.2)
+
+                # clamp temp_base
+                max_r = row_stats[ri][0]
+                p70_r = row_stats[ri][1]
+                ceiling = ti.max(p70_r, 0.05)
+                tb_clamped = ti.min(tb, ceiling)
+                tb_clamped = ti.min(tb_clamped, max_r)
+
+                temperature = ti.min(ti.max(
+                    ti.max(tb_clamped, ts_scaled), 0.0), 1.0)
+
+                # anisotropic temperature + blackbody
+                temp_aniso = ti.min(ti.max(
+                    temperature * (0.9 + 0.25 * az), 0.0), 1.0)
+                T_K = T_min + temp_aniso * (T_max - T_min)
+                bb = _color_temp_to_tint(T_K)
+                bb_b = ti.min(bb[2], bb[0])
+
+                lum = ti.min(ti.max(ti.sqrt(temp_aniso), 0.0), 1.0)
+
+                disk_tex[ri, phi_i] = ti.Vector([
+                    ti.min(ti.max(bb[0] * lum, 0.0), 1.0),
+                    ti.min(ti.max(bb[1] * lum, 0.0), 1.0),
+                    ti.min(ti.max(bb_b * lum, 0.0), 1.0),
+                    density
+                ])
+
+        self._compose_disk_texture_kernel = _compose_disk_texture_kernel
+
+        @ti.kernel
+        def _mipmap_copy_base_kernel(mips: ti.template(), base: ti.template()):
+            """将 disk_texture_field (level 0) 复制到 mipmap field。"""
+            for ri, phi_i in base:
+                mips[0, ri, phi_i] = base[ri, phi_i]
+
+        self._mipmap_copy_base_kernel = _mipmap_copy_base_kernel
+
+        @ti.kernel
+        def _mipmap_downsample_kernel(mips: ti.template(),
+                                      level: ti.i32,
+                                      src_h: ti.i32, src_w: ti.i32):
+            """2×2 box filter 下采样生成 mipmap 的第 level 级。"""
+            dst_h = src_h // 2
+            dst_w = src_w // 2
+            for ri, phi_i in ti.ndrange(dst_h, dst_w):
+                c = (mips[level - 1, ri * 2, phi_i * 2]
+                     + mips[level - 1, ri * 2, phi_i * 2 + 1]
+                     + mips[level - 1, ri * 2 + 1, phi_i * 2]
+                     + mips[level - 1, ri * 2 + 1, phi_i * 2 + 1]) / 4.0
+                mips[level, ri, phi_i] = c
+
+        self._mipmap_downsample_kernel = _mipmap_downsample_kernel
+
+    def update_disk_texture_gpu(self, t_offset: float) -> None:
+        """在 GPU 上合成旋转纹理并更新 mipmap（替代 CPU 路径）。
+
+        调用前需先调用 upload_parametric_state() 上传组件数据。
+        完整替代 generate_disk_texture_rotating() + update_disk_texture() 的 CPU 路径，
+        当 generation_scale=1 时与 CPU 路径像素级等价。
+
+        Args:
+            t_offset: 旋转时间偏移量，决定各行的开普勒旋转角度
+        """
+        assert hasattr(self, '_parametric_gpu_ready') and self._parametric_gpu_ready, \
+            "Must call upload_parametric_state() before update_disk_texture_gpu()"
+
+        self._compose_disk_texture_kernel(
+            self.disk_texture_field, self._comp_field,
+            self._omega_rows_field, self._edge_field,
+            self._param_stats_field, self._param_row_stats_field,
+            float(t_offset), self._param_enable_rt, self._param_color_temp
+        )
+
+        self._mipmap_copy_base_kernel(self.disk_mips_field, self.disk_texture_field)
+        h, w = self.dtex_h, self.dtex_w
+        for lev in range(1, self.num_mip_levels):
+            self._mipmap_downsample_kernel(self.disk_mips_field, lev, h, w)
+            h //= 2
+            w //= 2
+
     def render(self, cam_pos: List[float], fov: float, frame: int = 0) -> np.ndarray:
         """
         渲染单帧图像。
@@ -2667,6 +2886,14 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
     angle_step = orbit_degrees / n_frames
     rendered_this_session = 0
 
+    # —— 异步 PNG 保存 ——
+    MAX_PENDING_PNGS = 4
+    png_pool = ThreadPoolExecutor(max_workers=2)
+    png_futures = []
+
+    def _save_png(path, img_uint8):
+        Image.fromarray(img_uint8, "RGB").save(path)
+
     # —— 算法 2 和 3：预计算准备 ——
     keyframe_textures = None  # 用于关键帧插值
     base_seed = 42  # 固定种子，保证不同帧之间结构一致
@@ -2682,6 +2909,10 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
             enable_rt=True,
             generation_scale=disk_generation_scale,
         )
+
+    if disk_rotation_algorithm == "parametric" and disk_generation_scale == 1:
+        renderer.upload_parametric_state(disk_rotation_state)
+        print(f"  GPU 纹理合成已启用 (generation_scale=1)")
 
     if disk_rotation_algorithm == "keyframes":
         # 预计算关键帧纹理
@@ -2726,17 +2957,19 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
             img = renderer.render(cam_pos, fov, frame=frame)
 
         elif disk_rotation_algorithm == "parametric":
-            # 算法 2: 每帧重新生成纹理
+            # 算法 2: parametric 纹理旋转
             t_offset = float(frame) * disk_rotation_speed
-            tex = generate_disk_texture_rotating(
-                n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
-                seed=base_seed,
-                r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-                enable_rt=True, t_offset=t_offset,
-                state=disk_rotation_state, generation_scale=disk_generation_scale,
-            )
-            renderer.update_disk_texture(tex)
-            # 注意：parametric 算法下，frame 参数不再需要（纹理已经旋转）
+            if hasattr(renderer, '_parametric_gpu_ready') and renderer._parametric_gpu_ready:
+                renderer.update_disk_texture_gpu(t_offset)
+            else:
+                tex = generate_disk_texture_rotating(
+                    n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
+                    seed=base_seed,
+                    r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
+                    enable_rt=True, t_offset=t_offset,
+                    state=disk_rotation_state, generation_scale=disk_generation_scale,
+                )
+                renderer.update_disk_texture(tex)
             img = renderer.render(cam_pos, fov, frame=0)
 
         elif disk_rotation_algorithm == "keyframes":
@@ -2757,7 +2990,11 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
 
         frame_path = os.path.join(temp_dir, f"frame_{frame:04d}.png")
         img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
-        Image.fromarray(img_uint8, "RGB").save(frame_path)
+
+        # 异步 PNG 保存：等待最早的 future 完成以限制内存
+        if len(png_futures) >= MAX_PENDING_PNGS:
+            png_futures.pop(0).result()
+        png_futures.append(png_pool.submit(_save_png, frame_path, img_uint8))
 
         completed.add(frame)
         if rendered_this_session % 10 == 0 or frame == n_frames - 1:
@@ -2767,6 +3004,11 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         if rendered_this_session % 100 == 0 or frame == n_frames - 1:
             eta = (time.time() - total_t0) / rendered_this_session * (n_frames - len(completed))
             print(f"  frame {frame}/{n_frames} ({status_str}) {elapsed:.1f}s, done {len(completed)}/{n_frames}, ETA {eta/60:.0f}min")
+
+    # 等待所有 PNG 写入完成
+    for f in png_futures:
+        f.result()
+    png_pool.shutdown(wait=False)
 
     if rendered_this_session > 0:
         print(f"\nSession rendered {rendered_this_session} frames in {(time.time() - total_t0)/60:.1f} min")
