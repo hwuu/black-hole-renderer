@@ -45,8 +45,11 @@ python render.py --device gpu -o output/gpu.png
 # 环绕视频（默认 3600 帧，36 fps）
 python render.py --video --orbit -o output/demo.mp4
 
-# 自定义轨道参数
-python render.py --video --orbit --orbit_radius 10 --orbit_z 1 --n_frames 1800 --fps 30 -o output/demo.mp4
+# 自定义轨道总角度（半圈）
+python render.py --video --orbit --orbit_degrees 180 --n_frames 1800 --fps 30 -o output/demo.mp4
+
+# 程序生成吸积盘纹理时使用 1x 原分辨率
+python render.py --video --orbit --disk_generation_scale 1 -o output/demo.mp4
 
 # 断点续传
 python render.py --video --orbit --resume -o output/demo.mp4
@@ -61,6 +64,7 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--resolution`, `-r` | 分辨率: 4k/fhd/hd/sd | fhd |
 | `--texture`, `-t` | 天空盒纹理路径 | 程序生成 |
 | `--disk_texture` | 吸积盘纹理路径 | 程序生成 |
+| `--disk_generation_scale` | 程序生成吸积盘纹理时的降采样倍率：1/2/4 | 2 |
 | `--ar1` | 吸积盘内半径 | 2.0 rs |
 | `--ar2` | 吸积盘外半径 | 3.5 rs |
 | `--disk_tilt` | 吸积盘倾角（度） | 0 |
@@ -79,8 +83,7 @@ python render.py --video --orbit --resume -o output/demo.mp4
 |------|------|--------|
 | `--video` | 开启视频模式 | - |
 | `--orbit` | 相机围绕原点旋转 | - |
-| `--orbit_radius` | 轨道半径 | 8.0 |
-| `--orbit_z` | 轨道高度 | 0.5 |
+| `--orbit_degrees` | 轨道模式下整段视频的总旋转角度，支持负数反向旋转 | 360 |
 | `--n_frames` | 视频帧数 | 3600 |
 | `--fps` | 视频帧率 | 36 |
 | `--resume` | 从断点恢复 | - |

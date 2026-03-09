@@ -18,6 +18,7 @@ import os
 import time
 import argparse
 import hashlib
+from dataclasses import dataclass
 from tqdm import tqdm
 from typing import Tuple, List, Optional
 import math
@@ -73,6 +74,16 @@ SKY_STAR_SIZE_MAX = 1.7
 SKY_MILKY_WAY_GLOW = 0.10
 # 银心额外增亮强度，推荐 0.01~0.10（默认 0.08）
 SKY_GALACTIC_CENTER_GLOW = 0.08
+DISK_GENERATION_SCALE_CHOICES = (1, 2, 4)
+ENABLE_DISK_SPIRAL_ARMS = False
+
+
+def _validate_disk_generation_scale(generation_scale: int) -> int:
+    if generation_scale not in DISK_GENERATION_SCALE_CHOICES:
+        raise ValueError(
+            f"disk_generation_scale must be one of {DISK_GENERATION_SCALE_CHOICES}, got {generation_scale}"
+        )
+    return generation_scale
 
 # ============================================================================
 # 公共模块：相机
@@ -447,6 +458,262 @@ def load_disk_texture(path: Optional[str]) -> Optional[np.ndarray]:
     return None
 
 
+@dataclass(frozen=True)
+class DiskTextureRotatingState:
+    n_phi: int
+    n_r: int
+    seed: int
+    generation_scale: int
+    r_inner: float
+    r_outer: float
+    enable_rt: bool
+    color_temp: float
+    omega_rows: np.ndarray
+    edge: np.ndarray
+    temp_base: np.ndarray
+    spiral: np.ndarray
+    spiral_temp: np.ndarray
+    turbulence: np.ndarray
+    turb_temp: np.ndarray
+    arcs: np.ndarray
+    arcs_temp: np.ndarray
+    rt_spikes: np.ndarray
+    rt_temp: np.ndarray
+    hotspot: np.ndarray
+    hotspot_temp: np.ndarray
+    az_hotspot: np.ndarray
+    disturb_mod: np.ndarray
+
+
+def _generate_temperature_base(rng: np.random.Generator, n_r: int, n_phi: int,
+                               r_norm_grid: np.ndarray) -> np.ndarray:
+    """生成吸积盘基础温度场（不含动态旋转）。"""
+    radial_decay = np.clip(1.0 - r_norm_grid, 0, 1) ** 1.3
+    temp_coarse = _fbm_noise((n_r, n_phi), rng, octaves=4, persistence=0.6, base_scale=8, wrap_u=True)
+    temp_fine = _fbm_noise((n_r, n_phi), rng, octaves=5, persistence=0.45, base_scale=3, wrap_u=True)
+    temp_noise = 0.6 * temp_coarse + 0.4 * temp_fine
+    temp_base = np.clip(radial_decay * (0.85 + 0.15 * temp_noise), 0, 1)
+    temp_base *= 0.25
+    return temp_base.astype(np.float32)
+
+
+def _generate_disturbance_mod(rng: np.random.Generator, n_r: int, n_phi: int,
+                              kep_shift_pixels: np.ndarray, r_norm_grid: np.ndarray,
+                              t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                              generation_scale: int = 2) -> np.ndarray:
+    """生成湍流扰动调制场。"""
+    scale_factor = _validate_disk_generation_scale(generation_scale)
+    low_n_r = n_r // scale_factor
+    low_n_phi = n_phi // scale_factor
+
+    low_r_norm_grid = r_norm_grid[::scale_factor, ::scale_factor]
+    kep_shift_pixels_low = (kep_shift_pixels // scale_factor).astype(np.int32)[:low_n_r, :]
+
+    disturb_coarse = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=8, freq_v=4)
+    disturb_mid = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=32, freq_v=16)
+    disturb_fine = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=100, freq_v=50)
+    disturb_extra = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=250, freq_v=125)
+
+    for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
+        for ri in range(low_n_r):
+            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels_low[ri, 0])
+
+    rotation_pixels_low = None
+    if t_offset != 0.0 and omega_grid is not None:
+        omega_grid_low = omega_grid[::scale_factor, ::scale_factor]
+        rotation_pixels_low = (t_offset * omega_grid_low / (2 * np.pi) * low_n_phi).astype(int)
+        for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
+            for ri in range(low_n_r):
+                layer[ri, :] = np.roll(layer[ri, :], -rotation_pixels_low[ri, 0])
+
+    disturb_pixel = _periodic_pixel_noise((low_n_r, low_n_phi), rng)
+    if rotation_pixels_low is not None:
+        for ri in range(low_n_r):
+            disturb_pixel[ri, :] = np.roll(disturb_pixel[ri, :], -rotation_pixels_low[ri, 0])
+
+    disturb_mod_low = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
+                       + 0.30 * disturb_extra + 0.20 * disturb_pixel)
+    disturb_mod_low = np.clip(disturb_mod_low * 1.4, 0.05, 1.0)
+
+    radial_preserve = 0.6 + 0.4 * low_r_norm_grid
+    disturb_mod_low = np.clip(disturb_mod_low * radial_preserve, 0.1, 1.0)
+
+    upscale_kernel = np.ones((scale_factor, scale_factor), dtype=np.float32)
+    return np.kron(disturb_mod_low, upscale_kernel)[:n_r, :n_phi].astype(np.float32)
+
+
+def _compose_disk_texture_from_fields(temp_base: np.ndarray, temp_struct: np.ndarray,
+                                      density: np.ndarray, az_hotspot: np.ndarray,
+                                      edge: np.ndarray, color_temp: float) -> np.ndarray:
+    """从温度/密度场合成最终 RGBA 纹理。"""
+    density = density * edge[:, None]
+    density = np.clip(density / (np.percentile(density, 98) + 1e-6), 0, 1)
+
+    if np.any(temp_struct > 0):
+        struct_scale = np.percentile(temp_struct[temp_struct > 0], 95)
+        temp_struct_scaled = temp_struct / (struct_scale + 1e-6)
+    else:
+        temp_struct_scaled = temp_struct
+    temp_struct_scaled = np.clip(temp_struct_scaled * 0.8, 0, 1.2)
+
+    struct_max_per_r = np.max(temp_struct_scaled, axis=1)
+    struct_p70_per_r = np.quantile(temp_struct_scaled, 0.7, axis=1)
+    struct_ceiling = np.maximum(struct_p70_per_r, 0.05)
+    temp_base = np.minimum(temp_base, struct_ceiling[:, None])
+    temp_base = np.minimum(temp_base, struct_max_per_r[:, None])
+
+    temperature_field = np.clip(np.maximum(temp_base, temp_struct_scaled), 0, 1)
+
+    t_factor = (color_temp - 4500) / (6500 - 2700)
+    T_min = 2000 + t_factor * 1000
+    T_max = 9000 + t_factor * 3000
+
+    temp_aniso = np.clip(temperature_field * (0.9 + 0.25 * az_hotspot), 0, 1)
+    T_K = T_min + temp_aniso * (T_max - T_min)
+    bb_color = _blackbody_rgb(T_K)
+    bb_color[:, :, 2] = np.minimum(bb_color[:, :, 2], bb_color[:, :, 0])
+
+    luminosity = np.clip(np.sqrt(temp_aniso), 0, 1)
+
+    tex = np.zeros((temp_base.shape[0], temp_base.shape[1], 4), dtype=np.float32)
+    tex[:, :, 0] = np.clip(bb_color[:, :, 0] * luminosity, 0, 1)
+    tex[:, :, 1] = np.clip(bb_color[:, :, 1] * luminosity, 0, 1)
+    tex[:, :, 2] = np.clip(bb_color[:, :, 2] * luminosity, 0, 1)
+    tex[:, :, 3] = np.clip(density, 0, 1)
+    return tex
+
+
+def _roll_rows(field: np.ndarray, shifts: np.ndarray) -> np.ndarray:
+    """按行循环平移二维/三维场。"""
+    rolled = np.empty_like(field)
+    if field.ndim == 2:
+        for ri, shift in enumerate(shifts):
+            rolled[ri, :] = np.roll(field[ri, :], -int(shift))
+        return rolled
+    if field.ndim == 3:
+        for ri, shift in enumerate(shifts):
+            rolled[ri, :, :] = np.roll(field[ri, :, :], -int(shift), axis=0)
+        return rolled
+    raise ValueError(f"Unsupported field ndim: {field.ndim}")
+
+
+def _compute_rotation_pixels(omega_rows: np.ndarray, t_offset: float, n_phi: int) -> np.ndarray:
+    return (t_offset * omega_rows / (2 * np.pi) * n_phi).astype(np.int32)
+
+
+def _compute_upscaled_rotation_pixels(omega_rows: np.ndarray, t_offset: float, n_phi: int,
+                                      scale_factor: int = 2) -> np.ndarray:
+    scale_factor = _validate_disk_generation_scale(scale_factor)
+    low_n_phi = n_phi // scale_factor
+    low_omega_rows = omega_rows[::scale_factor]
+    low_shifts = (t_offset * low_omega_rows / (2 * np.pi) * low_n_phi).astype(np.int32)
+    return np.repeat(low_shifts * scale_factor, scale_factor)[:omega_rows.shape[0]]
+
+
+def build_disk_texture_rotating_state(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
+                                      r_inner: float = 2.0, r_outer: float = 3.5,
+                                      enable_rt: bool = True, color_temp: float = None,
+                                      generation_scale: int = 2) -> DiskTextureRotatingState:
+    """预计算 `parametric` 旋转纹理的静态状态。"""
+    generation_scale = _validate_disk_generation_scale(generation_scale)
+
+    if color_temp is None:
+        color_temp = DISK_COLOR_TEMPERATURE
+
+    rng = np.random.default_rng(seed)
+
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+    r_norm = np.linspace(0, 1, n_r)
+    phi_grid_base, r_norm_grid = np.meshgrid(phi, r_norm)
+
+    r_vals = r_inner + (r_outer - r_inner) * r_norm_grid
+    disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
+    omega_grid = np.sqrt(0.5 / (r_vals ** 3 + 1e-6))
+
+    temp_base = _generate_temperature_base(rng, n_r, n_phi, r_norm_grid)
+    spiral, spiral_temp = _generate_spiral_arms(
+        rng, n_r, n_phi, phi_grid_base, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(
+        rng, n_r, n_phi, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
+    arcs, arcs_temp = _generate_filaments(
+        rng, n_r, n_phi, phi_grid_base, r_norm_grid, disk_area, 0.0, None, generation_scale=generation_scale
+    )
+    rt_spikes, rt_temp = _generate_rt_spikes(
+        rng, n_r, n_phi, phi_grid_base, r_norm_grid, disk_area, enable_rt, 0.0, None, generation_scale=generation_scale
+    )
+    hotspot, hotspot_temp = _generate_hotspots(rng, n_r, n_phi, phi_grid_base, r_norm_grid, disk_area, 0.0, None)
+    az_hotspot = _generate_azimuthal_hotspot(
+        rng, n_r, n_phi, phi_grid_base, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
+    disturb_mod = _generate_disturbance_mod(
+        rng, n_r, n_phi, kep_shift_pixels, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
+
+    return DiskTextureRotatingState(
+        n_phi=n_phi,
+        n_r=n_r,
+        seed=seed,
+        generation_scale=generation_scale,
+        r_inner=r_inner,
+        r_outer=r_outer,
+        enable_rt=enable_rt,
+        color_temp=float(color_temp),
+        omega_rows=omega_grid[:, 0].astype(np.float32),
+        edge=compute_edge_alpha(n_r).astype(np.float32),
+        temp_base=temp_base.astype(np.float32),
+        spiral=spiral.astype(np.float32),
+        spiral_temp=spiral_temp.astype(np.float32),
+        turbulence=turbulence.astype(np.float32),
+        turb_temp=turb_temp.astype(np.float32),
+        arcs=arcs.astype(np.float32),
+        arcs_temp=arcs_temp.astype(np.float32),
+        rt_spikes=rt_spikes.astype(np.float32),
+        rt_temp=rt_temp.astype(np.float32),
+        hotspot=hotspot.astype(np.float32),
+        hotspot_temp=hotspot_temp.astype(np.float32),
+        az_hotspot=az_hotspot.astype(np.float32),
+        disturb_mod=disturb_mod.astype(np.float32),
+    )
+
+
+def _generate_disk_texture_rotating_from_state(state: DiskTextureRotatingState,
+                                               t_offset: float = 0.0,
+                                               color_temp: float = None) -> np.ndarray:
+    """基于预计算状态生成某一时刻的旋转纹理。"""
+    if color_temp is None:
+        color_temp = state.color_temp
+
+    full_res_rot = _compute_rotation_pixels(state.omega_rows, t_offset, state.n_phi)
+    low_res_rot = _compute_upscaled_rotation_pixels(
+        state.omega_rows, t_offset, state.n_phi, scale_factor=state.generation_scale
+    )
+
+    temp_base = _roll_rows(state.temp_base, full_res_rot)
+    spiral = _roll_rows(state.spiral, low_res_rot)
+    spiral_temp = _roll_rows(state.spiral_temp, low_res_rot)
+    turbulence = _roll_rows(state.turbulence, low_res_rot)
+    turb_temp = _roll_rows(state.turb_temp, low_res_rot)
+    arcs = _roll_rows(state.arcs, low_res_rot)
+    arcs_temp = _roll_rows(state.arcs_temp, low_res_rot)
+    rt_spikes = _roll_rows(state.rt_spikes, low_res_rot)
+    rt_temp = _roll_rows(state.rt_temp, low_res_rot)
+    hotspot = _roll_rows(state.hotspot, full_res_rot)
+    hotspot_temp = _roll_rows(state.hotspot_temp, full_res_rot)
+    az_hotspot = _roll_rows(state.az_hotspot, low_res_rot)
+    disturb_mod = _roll_rows(state.disturb_mod, low_res_rot)
+
+    temp_struct = spiral_temp + turb_temp + arcs_temp + rt_temp + hotspot_temp
+    rt_weight = 0.20 if state.enable_rt else 0.0
+    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
+
+    density = density * disturb_mod
+    temp_struct = temp_struct * disturb_mod
+
+    return _compose_disk_texture_from_fields(temp_base, temp_struct, density, az_hotspot, state.edge, color_temp)
+
+
 
 
 def _tileable_noise(shape: Tuple[int, int], rng: np.random.Generator, freq_u: int = 6, freq_v: int = 6) -> np.ndarray:
@@ -576,7 +843,8 @@ def compute_disk_texture_resolution(width: int, height: int, cam_pos: List[float
 
 
 def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] = None, cam_pos: Optional[List[float]] = None, fov: Optional[float] = None,
-                               seed: int = 42, r_inner: float = 2.0, r_outer: float = 3.5, force: bool = False) -> np.ndarray:
+                               seed: int = 42, r_inner: float = 2.0, r_outer: float = 3.5, force: bool = False,
+                               generation_scale: int = 2) -> np.ndarray:
     """
     加载或生成吸积盘纹理（带缓存）。
     - width, height, cam_pos, fov: 用于计算纹理分辨率
@@ -585,13 +853,15 @@ def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] 
     - force: 强制重新生成，忽略缓存
     返回 (n_r, n_phi, 4) float32
     """
+    generation_scale = _validate_disk_generation_scale(generation_scale)
+
     if width and height and cam_pos and fov:
         n_phi, n_r = compute_disk_texture_resolution(width, height, cam_pos, fov, r_inner, r_outer)
     else:
         n_phi, n_r = 1024, 512
 
     cache_dir = "output/.disk_texture_cache"
-    cache_key = f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}_{n_phi}x{n_r}.npy"
+    cache_key = f"disk_{r_inner:.2f}_{r_outer:.2f}_{seed}_{n_phi}x{n_r}_scale{generation_scale}.npy"
     cache_path = os.path.join(cache_dir, cache_key)
 
     if not force and os.path.exists(cache_path):
@@ -599,7 +869,10 @@ def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] 
         return np.load(cache_path)
 
     print(f"Generating disk texture: r_inner={r_inner}, r_outer={r_outer}, seed={seed}, n_phi={n_phi}, n_r={n_r}")
-    tex = generate_disk_texture(n_phi=n_phi, n_r=n_r, seed=seed, r_inner=r_inner, r_outer=r_outer)
+    tex = generate_disk_texture(
+        n_phi=n_phi, n_r=n_r, seed=seed, r_inner=r_inner, r_outer=r_outer,
+        generation_scale=generation_scale,
+    )
 
     os.makedirs(cache_dir, exist_ok=True)
     np.save(cache_path, tex)
@@ -609,15 +882,20 @@ def load_cached_disk_texture(width: Optional[int] = None, height: Optional[int] 
 
 
 def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray,
-                           t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                           t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                           generation_scale: int = 2) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成螺旋臂密度和温度贡献
     返回：(spiral, temp_contribution)
 
     优化：使用 2x 低分辨率生成 + upscale，获得约 5x 加速比
     """
+    if not ENABLE_DISK_SPIRAL_ARMS:
+        zeros = np.zeros((n_r, n_phi), dtype=np.float32)
+        return zeros, zeros
+
     # ===== 性能优化：2x 低分辨率生成 + upscale =====
-    scale_factor = 2
+    scale_factor = _validate_disk_generation_scale(generation_scale)
     low_n_r = n_r // scale_factor
     low_n_phi = n_phi // scale_factor
 
@@ -722,7 +1000,8 @@ def _generate_spiral_arms(rng: np.random.Generator, n_r: int, n_phi: int, phi_gr
 
 
 def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_grid: np.ndarray,
-                          t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+                          t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                          generation_scale: int = 2) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     生成云雾/湍流密度和温度贡献
     返回：(turbulence, kep_shift_pixels, temp_contribution)
@@ -730,7 +1009,7 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
     优化：使用 2x 低分辨率生成 + upscale，获得约 2-3x 加速比
     """
     # ===== 性能优化：2x 低分辨率生成 + upscale =====
-    scale_factor = 2
+    scale_factor = _validate_disk_generation_scale(generation_scale)
     low_n_r = n_r // scale_factor
     low_n_phi = n_phi // scale_factor
 
@@ -797,7 +1076,8 @@ def _generate_turbulence(rng: np.random.Generator, n_r: int, n_phi: int, r_norm_
 
 
 def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float,
-                       t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                       t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                       generation_scale: int = 2) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成细丝（filaments）密度和温度贡献
     物理意义：吸积盘中的丝状结构，可能是磁重联或剪切流形成的细长条纹
@@ -810,7 +1090,7 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
     # ===== 性能优化：2x 低分辨率生成 + upscale =====
     # 在低分辨率下生成 filaments，然后 upscale 到目标分辨率
     # 测试表明：2x 低分辨率 + upscale 可获得 5x 加速，MSE 仅 0.044
-    scale_factor = 2
+    scale_factor = _validate_disk_generation_scale(generation_scale)
     low_n_r = n_r // scale_factor
     low_n_phi = n_phi // scale_factor
 
@@ -905,7 +1185,8 @@ def _generate_filaments(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
 
 
 def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray, disk_area: float, enable_rt: bool,
-                       t_offset: float = 0.0, omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                       t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                       generation_scale: int = 2) -> Tuple[np.ndarray, np.ndarray]:
     """
     生成 Rayleigh-Taylor 不稳定性密度和温度贡献
     返回：(rt_spikes, temp_contribution)
@@ -917,7 +1198,7 @@ def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
         return np.zeros((n_r, n_phi), dtype=np.float32), np.zeros((n_r, n_phi), dtype=np.float32)
 
     # ===== 性能优化：2x 低分辨率生成 + upscale =====
-    scale_factor = 2
+    scale_factor = _validate_disk_generation_scale(generation_scale)
     low_n_r = n_r // scale_factor
     low_n_phi = n_phi // scale_factor
 
@@ -964,7 +1245,8 @@ def _generate_rt_spikes(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid
 
 
 def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid: np.ndarray, r_norm_grid: np.ndarray,
-                                 t_offset: float = 0.0, omega_grid: np.ndarray = None) -> np.ndarray:
+                                 t_offset: float = 0.0, omega_grid: np.ndarray = None,
+                                 generation_scale: int = 2) -> np.ndarray:
     """
     生成方位热点（低频正弦 + 噪声，自转流动感）
     返回：az_hotspot
@@ -972,7 +1254,7 @@ def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, 
     优化：使用 2x 低分辨率生成 + upscale，获得约 2-3x 加速比
     """
     # ===== 性能优化：2x 低分辨率生成 + upscale =====
-    scale_factor = 2
+    scale_factor = _validate_disk_generation_scale(generation_scale)
     low_n_r = n_r // scale_factor
     low_n_phi = n_phi // scale_factor
 
@@ -1003,7 +1285,7 @@ def _generate_azimuthal_hotspot(rng: np.random.Generator, n_r: int, n_phi: int, 
 def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: np.ndarray,
                         temp_struct: np.ndarray, kep_shift_pixels: np.ndarray,
                         r_norm_grid: np.ndarray, t_offset: float = 0.0,
-                        omega_grid: np.ndarray = None) -> Tuple[np.ndarray, np.ndarray]:
+                        omega_grid: np.ndarray = None, generation_scale: int = 2) -> Tuple[np.ndarray, np.ndarray]:
     """
     Apply turbulence disturbance to density and temperature fields.
     Returns: (density, temp_struct)
@@ -1014,58 +1296,10 @@ def _apply_disturbance(rng: np.random.Generator, n_r: int, n_phi: int, density: 
 
     优化：使用 2x 低分辨率生成 + upscale，获得约 1.5-2x 加速比
     """
-    # ===== 性能优化：2x 低分辨率生成 + upscale =====
-    scale_factor = 2
-    low_n_r = n_r // scale_factor
-    low_n_phi = n_phi // scale_factor
-
-    # 从传入的网格降级采样
-    low_r_norm_grid = r_norm_grid[::scale_factor, ::scale_factor]
-
-    # 低分辨率 kep_shift
-    kep_shift_pixels_low = (kep_shift_pixels // scale_factor).astype(np.int32)[:low_n_r, :]
-
-    # 在低分辨率下生成 4 层噪声
-    disturb_coarse = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=8, freq_v=4)
-    disturb_mid = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=32, freq_v=16)
-    disturb_fine = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=100, freq_v=50)
-    disturb_extra = _tileable_noise((low_n_r, low_n_phi), rng, freq_u=250, freq_v=125)
-
-    # 应用开普勒剪切滚动（低分辨率）
-    for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
-        for ri in range(low_n_r):
-            layer[ri, :] = np.roll(layer[ri, :], kep_shift_pixels_low[ri, 0])
-
-    # 动态旋转支持（低分辨率）
-    rotation_pixels_low = None
-    if t_offset != 0.0 and omega_grid is not None:
-        # 降级采样 omega_grid 到低分辨率
-        omega_grid_low = omega_grid[::scale_factor, ::scale_factor]
-        rotation_pixels_low = (t_offset * omega_grid_low / (2 * np.pi) * low_n_phi).astype(int)
-        for layer in [disturb_coarse, disturb_mid, disturb_fine, disturb_extra]:
-            for ri in range(low_n_r):
-                layer[ri, :] = np.roll(layer[ri, :], -rotation_pixels_low[ri, 0])
-
-    disturb_pixel = _periodic_pixel_noise((low_n_r, low_n_phi), rng)
-
-    # 对 disturb_pixel 应用开普勒旋转（t_offset != 0 时）
-    if rotation_pixels_low is not None:
-        for ri in range(low_n_r):
-            disturb_pixel[ri, :] = np.roll(disturb_pixel[ri, :], -rotation_pixels_low[ri, 0])
-
-    # disturbance 权重（低分辨率）
-    disturb_mod_low = (0.05 * disturb_coarse + 0.15 * disturb_mid + 0.30 * disturb_fine
-                       + 0.30 * disturb_extra + 0.20 * disturb_pixel)
-    disturb_mod_low = np.clip(disturb_mod_low * 1.4, 0.05, 1.0)
-
-    # 径向保留因子（内圈保持更多）
-    radial_preserve = 0.6 + 0.4 * low_r_norm_grid
-    disturb_mod_low = np.clip(disturb_mod_low * radial_preserve, 0.1, 1.0)
-
-    # upscale
-    upscale_kernel = np.ones((scale_factor, scale_factor), dtype=np.float32)
-    disturb_mod = np.kron(disturb_mod_low, upscale_kernel)[:n_r, :n_phi]
-
+    disturb_mod = _generate_disturbance_mod(
+        rng, n_r, n_phi, kep_shift_pixels, r_norm_grid, t_offset, omega_grid,
+        generation_scale=generation_scale,
+    )
     density = density * disturb_mod
     temp_struct = temp_struct * disturb_mod
     return density, temp_struct
@@ -1121,7 +1355,8 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
 
 def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
                           r_inner: float = 2.0, r_outer: float = 3.5,
-                          enable_rt: bool = True, color_temp: float = None) -> np.ndarray:
+                          enable_rt: bool = True, color_temp: float = None,
+                          generation_scale: int = 2) -> np.ndarray:
     """
     直接在极坐标下生成吸积盘纹理，避免笛卡尔到极坐标的映射接缝问题。
 
@@ -1164,20 +1399,29 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
 
     # ----- 密度场 -----
 # 1) 螺旋臂
-    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
+    generation_scale = _validate_disk_generation_scale(generation_scale)
+    spiral, spiral_temp = _generate_spiral_arms(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
     temp_struct += spiral_temp
 
 
     # 2) 云雾
-    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid, 0.0, None)
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(
+        rng, n_r, n_phi, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
     temp_struct += turb_temp
 
     # 3) Filaments
-    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, 0.0, None)
+    arcs, arcs_temp = _generate_filaments(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, 0.0, None, generation_scale=generation_scale
+    )
     temp_struct += arcs_temp
 
     # 4) Rayleigh-Taylor 不稳定性
-    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, 0.0, None)
+    rt_spikes, rt_temp = _generate_rt_spikes(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, 0.0, None, generation_scale=generation_scale
+    )
     temp_struct += rt_temp
 
     # 5) 温度热点
@@ -1185,14 +1429,19 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
     temp_struct += hotspot_temp
 
     # 5) 方位热点
-    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None)
+    az_hotspot = _generate_azimuthal_hotspot(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, 0.0, None, generation_scale=generation_scale
+    )
 
     # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
     density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
 # 湍流扰动 - 降低 disturbance 强度，保留更多 spiral arm 和 filament 的分段结构
-    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None)
+    density, temp_struct = _apply_disturbance(
+        rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, 0.0, None,
+        generation_scale=generation_scale,
+    )
 
     # 边缘软化（沿径向）
     edge = compute_edge_alpha(n_r)
@@ -1251,7 +1500,9 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
 def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
                                     r_inner: float = 2.0, r_outer: float = 3.5,
                                     enable_rt: bool = True, t_offset: float = 0.0,
-                                    color_temp: float = None) -> np.ndarray:
+                                    color_temp: float = None,
+                                    state: Optional[DiskTextureRotatingState] = None,
+                                    generation_scale: int = 2) -> np.ndarray:
     """
     生成吸积盘纹理，支持参数化旋转（用于动画渲染）
 
@@ -1273,6 +1524,19 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
     Returns:
         (n_r, n_phi, 4) float32 纹理，RGBA
     """
+    generation_scale = _validate_disk_generation_scale(generation_scale)
+
+    if state is not None:
+        if state.n_phi != n_phi or state.n_r != n_r:
+            raise ValueError(
+                f"State size mismatch: expected {state.n_r}x{state.n_phi}, got {n_r}x{n_phi}"
+            )
+        if state.generation_scale != generation_scale:
+            raise ValueError(
+                f"State generation_scale mismatch: expected {state.generation_scale}, got {generation_scale}"
+            )
+        return _generate_disk_texture_rotating_from_state(state, t_offset=t_offset, color_temp=color_temp)
+
     # 使用全局色温参数或传入的色温
     if color_temp is None:
         color_temp = DISK_COLOR_TEMPERATURE
@@ -1287,7 +1551,7 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
     disk_area = (r_outer ** 2 - r_inner ** 2) / 10.0
 
     # 计算开普勒角速度
-    omega_grid = np.sqrt(0.5 / (r_vals + 0.01))
+    omega_grid = np.sqrt(0.5 / (r_vals ** 3 + 1e-6))
 
     # 应用旋转后的 phi_grid（开普勒旋转：逆时针，角度增加）
     phi_grid = phi_grid_base + t_offset * omega_grid
@@ -1312,19 +1576,27 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
 
     # ----- 密度场 -----
     # 1) 螺旋臂
-    spiral, spiral_temp = _generate_spiral_arms(rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid)
+    spiral, spiral_temp = _generate_spiral_arms(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid, generation_scale=generation_scale
+    )
     temp_struct += spiral_temp
 
     # 2) 云雾
-    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(rng, n_r, n_phi, r_norm_grid, t_offset, omega_grid)
+    turbulence, kep_shift_pixels, turb_temp = _generate_turbulence(
+        rng, n_r, n_phi, r_norm_grid, t_offset, omega_grid, generation_scale=generation_scale
+    )
     temp_struct += turb_temp
 
     # 3) Filaments
-    arcs, arcs_temp = _generate_filaments(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, t_offset, omega_grid)
+    arcs, arcs_temp = _generate_filaments(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, t_offset, omega_grid, generation_scale=generation_scale
+    )
     temp_struct += arcs_temp
 
     # 4) RT 不稳定性
-    rt_spikes, rt_temp = _generate_rt_spikes(rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, t_offset, omega_grid)
+    rt_spikes, rt_temp = _generate_rt_spikes(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, disk_area, enable_rt, t_offset, omega_grid, generation_scale=generation_scale
+    )
     temp_struct += rt_temp
 
     # 5) 温度热点
@@ -1332,14 +1604,19 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
     temp_struct += hotspot_temp
 
     # 6) 方位热点
-    az_hotspot = _generate_azimuthal_hotspot(rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid)
+    az_hotspot = _generate_azimuthal_hotspot(
+        rng, n_r, n_phi, phi_grid, r_norm_grid, t_offset, omega_grid, generation_scale=generation_scale
+    )
 
     # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
     density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
     # 湍流扰动
-    density, temp_struct = _apply_disturbance(rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, t_offset, omega_grid)
+    density, temp_struct = _apply_disturbance(
+        rng, n_r, n_phi, density, temp_struct, kep_shift_pixels, r_norm_grid, t_offset, omega_grid,
+        generation_scale=generation_scale,
+    )
 
     # 边缘软化
     edge = compute_edge_alpha(n_r)
@@ -1682,7 +1959,8 @@ class TaichiRenderer:
             """Sample accretion disk texture with bilinear interpolation."""
             r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
             phi = ti.atan2(hit_y, hit_x)
-            omega = ti.sqrt(0.5 / (r + 0.01))
+            r_safe = ti.max(r, 1e-3)
+            omega = ti.sqrt(0.5 / (r_safe ** 3 + 1e-6))
             phi = phi + t_offset * omega
             while phi < 0:
                 phi += 2 * ti.math.pi
@@ -1713,7 +1991,8 @@ class TaichiRenderer:
             """Sample accretion disk texture with mipmap LOD."""
             r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
             phi = ti.atan2(hit_y, hit_x)
-            omega = ti.sqrt(0.5 / (r + 0.01))
+            r_safe = ti.max(r, 1e-3)
+            omega = ti.sqrt(0.5 / (r_safe ** 3 + 1e-6))
             phi = phi + t_offset * omega
             while phi < 0:
                 phi += 2 * ti.math.pi
@@ -2293,7 +2572,7 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
                   disk_texture_path: Optional[str] = None, r_disk_inner: float = R_DISK_INNER_DEFAULT,
                   r_disk_outer: float = R_DISK_OUTER_DEFAULT, disk_tilt: float = 0.0,
                   lens_flare: bool = False, anti_alias: str = "disabled", aa_strength: float = 1.0,
-                  disk_rotation_speed: float = 0.1,
+                  disk_rotation_speed: float = 0.1, disk_generation_scale: int = 2,
                   force_regenerate_disk_texture: bool = False, ignore_taichi_cache: bool = False) -> np.ndarray:
     """
     使用 Taichi 渲染单帧图像（兼容旧接口）。
@@ -2303,7 +2582,8 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
     if disk_tex is None:
         disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=cam_pos, fov=fov,
                                             r_inner=r_disk_inner, r_outer=r_disk_outer,
-                                            seed=42, force=force_regenerate_disk_texture)
+                                            seed=42, force=force_regenerate_disk_texture,
+                                            generation_scale=disk_generation_scale)
 
     renderer = TaichiRenderer(
         width, height, skybox, disk_tex,
@@ -2328,7 +2608,8 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
 def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: int, fps: int, output_path: str,
                  fov: float, static_cam_pos: List[float], orbit: bool = False, resume: bool = False,
                  disk_rotation_algorithm: str = "baseline", disk_rotation_speed: float = 0.1,
-                 keyframes_count: int = 10) -> None:
+                 keyframes_count: int = 10, orbit_degrees: float = 360.0,
+                 disk_generation_scale: int = 2) -> None:
     """
     渲染视频（多帧并合成视频）。
 
@@ -2345,6 +2626,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         disk_rotation_algorithm: 吸积盘旋转算法 ("baseline", "parametric", "keyframes")
         disk_rotation_speed: 旋转速度系数
         keyframes_count: 关键帧数量（仅 keyframes 算法有效）
+        orbit_degrees: 轨道模式下整段视频的总旋转角度（度）
+        disk_generation_scale: 程序生成吸积盘纹理时的降采样倍率
     """
     orbit_radius = float(np.linalg.norm(static_cam_pos))
 
@@ -2361,6 +2644,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         "disk_rotation_algorithm": disk_rotation_algorithm,
         "disk_rotation_speed": disk_rotation_speed,
         "keyframes_count": keyframes_count,
+        "orbit_degrees": orbit_degrees,
+        "disk_generation_scale": disk_generation_scale,
     }
 
     completed = set()
@@ -2379,12 +2664,24 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         os.makedirs(temp_dir, exist_ok=True)
 
     total_t0 = time.time()
-    angle_step = 360.0 / n_frames
+    angle_step = orbit_degrees / n_frames
     rendered_this_session = 0
 
     # —— 算法 2 和 3：预计算准备 ——
     keyframe_textures = None  # 用于关键帧插值
     base_seed = 42  # 固定种子，保证不同帧之间结构一致
+    disk_rotation_state = None
+
+    if disk_rotation_algorithm in {"parametric", "keyframes"}:
+        disk_rotation_state = build_disk_texture_rotating_state(
+            n_phi=renderer.dtex_w,
+            n_r=renderer.dtex_h,
+            seed=base_seed,
+            r_inner=renderer.r_disk_inner,
+            r_outer=renderer.r_disk_outer,
+            enable_rt=True,
+            generation_scale=disk_generation_scale,
+        )
 
     if disk_rotation_algorithm == "keyframes":
         # 预计算关键帧纹理
@@ -2397,7 +2694,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
                 n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
                 seed=base_seed,
                 r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-                enable_rt=True, t_offset=t_offset
+                enable_rt=True, t_offset=t_offset,
+                state=disk_rotation_state, generation_scale=disk_generation_scale,
             )
             keyframe_textures.append(tex)
         precompute_time = time.time() - t0_precompute
@@ -2434,7 +2732,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
                 n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
                 seed=base_seed,
                 r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-                enable_rt=True, t_offset=t_offset
+                enable_rt=True, t_offset=t_offset,
+                state=disk_rotation_state, generation_scale=disk_generation_scale,
             )
             renderer.update_disk_texture(tex)
             # 注意：parametric 算法下，frame 参数不再需要（纹理已经旋转）
@@ -2526,6 +2825,8 @@ def parse_args() -> argparse.Namespace:
                         help="程序天空盒恒星数 (default: 6000)")
     parser.add_argument("--disk_texture", type=str, default=None,
                         help="吸积盘纹理路径 (default: 程序生成)")
+    parser.add_argument("--disk_generation_scale", type=int, default=2, choices=DISK_GENERATION_SCALE_CHOICES,
+                        help="程序生成吸积盘纹理时的降采样倍率：1=原分辨率，2/4=更快但更糙 (default: 2)")
     parser.add_argument("--force_regenerate_disk_texture", action="store_true",
                         help="强制重新生成吸积盘纹理，忽略缓存 (default: 关闭)")
     parser.add_argument("--disk_inner_radius", "--ar1", dest="disk_inner_radius", type=float, default=R_DISK_INNER_DEFAULT,
@@ -2550,6 +2851,8 @@ def parse_args() -> argparse.Namespace:
                         help="视频模式：渲染多帧并合成视频")
     parser.add_argument("--orbit", action="store_true",
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
+    parser.add_argument("--orbit_degrees", type=float, default=360.0,
+                        help="轨道模式下整段视频的总旋转角度，支持负数反向旋转 (default: 360.0)")
     parser.add_argument("--n_frames", type=int, default=3600,
                         help="视频帧数 (default: 3600, 仅 --video 有效)")
     parser.add_argument("--fps", type=int, default=36,
@@ -2592,6 +2895,11 @@ def validate_args(args) -> None:
     if args.fps <= 0:
         raise ValueError(f"fps must be positive, got {args.fps}")
 
+    if not math.isfinite(args.orbit_degrees):
+        raise ValueError(f"orbit_degrees must be finite, got {args.orbit_degrees}")
+
+    _validate_disk_generation_scale(args.disk_generation_scale)
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -2608,7 +2916,8 @@ if __name__ == "__main__":
             disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
                                                 r_inner=args.disk_inner_radius, r_outer=args.disk_outer_radius,
                                                 seed=42,
-                                                force=args.force_regenerate_disk_texture)
+                                                force=args.force_regenerate_disk_texture,
+                                                generation_scale=args.disk_generation_scale)
 
         renderer = TaichiRenderer(
             width, height, skybox, disk_tex,
@@ -2624,7 +2933,10 @@ if __name__ == "__main__":
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
         print(f"  orbit={args.orbit}")
+        if args.orbit:
+            print(f"  orbit_degrees={args.orbit_degrees}°")
         print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}, disk_tilt={args.disk_tilt}°")
+        print(f"  disk_generation_scale={args.disk_generation_scale}x")
         print(f"  disk_rotation_algorithm={args.disk_rotation_algorithm}, disk_rotation_speed={args.disk_rotation_speed}")
         if args.disk_rotation_algorithm == "keyframes":
             print(f"  keyframes_count={args.keyframes_count}")
@@ -2637,7 +2949,9 @@ if __name__ == "__main__":
             resume=args.resume,
             disk_rotation_algorithm=args.disk_rotation_algorithm,
             disk_rotation_speed=args.disk_rotation_speed,
-            keyframes_count=args.keyframes_count
+            keyframes_count=args.keyframes_count,
+            orbit_degrees=args.orbit_degrees,
+            disk_generation_scale=args.disk_generation_scale,
         )
     else:
         img = render_image(
@@ -2657,6 +2971,7 @@ if __name__ == "__main__":
             lens_flare=args.lens_flare,
             anti_alias=args.anti_alias,
             aa_strength=args.aa_strength,
+            disk_generation_scale=args.disk_generation_scale,
             force_regenerate_disk_texture=args.force_regenerate_disk_texture,
             ignore_taichi_cache=args.ignore_taichi_cache,
         )

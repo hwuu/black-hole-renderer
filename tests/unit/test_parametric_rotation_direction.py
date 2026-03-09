@@ -76,7 +76,7 @@ class ParametricRotationDirectionTest(unittest.TestCase):
 
             r_norm = np.linspace(0.0, 1.0, n_r)
             r_vals = 2.0 + (3.5 - 2.0) * r_norm
-            omega_vals = np.sqrt(0.5 / (r_vals + 0.01))
+            omega_vals = np.sqrt(0.5 / (r_vals ** 3 + 1e-6))
             expected_shifts = [
                 -int(t_offset * omega / (2.0 * np.pi) * n_phi)
                 for omega in omega_vals
