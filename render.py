@@ -528,6 +528,7 @@ class EntityInstance:
     lifetime: float
     fade_in: float
     fade_out: float
+    fade_noise: np.ndarray  # (n_phi,) smooth noise in [0,1] for dissolve effect
 
     @property
     def total_duration(self) -> float:
@@ -624,7 +625,24 @@ class EntityFactory:
             lifetime=lifetime,
             fade_in=self.fade_in,
             fade_out=self.fade_out,
+            fade_noise=self._make_fade_noise(),
         )
+
+    def _make_fade_noise(self) -> np.ndarray:
+        """Generate smooth 1D dissolve noise along phi, range [0, 1].
+
+        Uses 2-3 sinusoidal components for low-frequency spatial variation,
+        ensuring the dissolve front is smooth (cloud-like), not pixelated.
+        """
+        phi = np.linspace(0, 2 * np.pi, self.n_phi, endpoint=False)
+        freq1 = int(self.rng.integers(3, 8))
+        freq2 = int(self.rng.integers(8, 16))
+        p1 = float(self.rng.uniform(0, 2 * np.pi))
+        p2 = float(self.rng.uniform(0, 2 * np.pi))
+        noise = (0.6 * np.sin(phi * freq1 + p1)
+                 + 0.4 * np.sin(phi * freq2 + p2))
+        noise = np.clip(noise * 0.5 + 0.5, 0, 1)
+        return noise.astype(np.float32)
 
     def seed_initial(self, now: float) -> None:
         """Pre-populate with target_count entities at staggered ages.
@@ -3238,13 +3256,10 @@ class TaichiRenderer:
         self._noise_eval_kernel = _noise_eval_kernel
 
         # ---- 背景层实时生成 kernel（宽 r 组件）----
-        _MAX_BG_SPIRAL_ARMS = 8
 
         @ti.kernel
         def _generate_background_kernel(
                 comp: ti.template(),
-                spiral_params: ti.template(),
-                n_arms: ti.i32,
                 az_freq: ti.i32,
                 az_shear: ti.f32,
                 r_inner: ti.f32,
@@ -3253,19 +3268,15 @@ class TaichiRenderer:
             """Generate wide-r background components using time-varying 3D noise.
 
             Writes to comp_field at indices [0,1,2,3,4,11,12] for the 5 wide-r
-            components: temp_base, spiral/spiral_temp, turbulence/turb_temp,
+            components: temp_base, MAD asymmetry/temp, turbulence/turb_temp,
             az_hotspot, disturb_mod.
 
-            Noise coordinates use Keplerian-rotated phi: phi_rot = phi - omega(r)*t,
+            Noise coordinates use Keplerian-rotated phi: phi_rot = phi + omega(r)*t,
             mapped via (cos(phi_rot), sin(phi_rot)) for seamless wrapping. This gives
             differential rotation without pre-computed array roll or wrap artifacts.
-            The t axis in noise provides slow morphological evolution on top of rotation.
 
             Args:
                 comp: component field (13, n_r, n_phi) — output for indices 0-4, 11, 12
-                spiral_params: per-arm parameters (MAX_ARMS, 7):
-                    [base_angle, r_start, r_end, rotations, width, intensity, delta_T]
-                n_arms: number of active spiral arms
                 az_freq: azimuthal hotspot frequency (integer, typically 2-4)
                 az_shear: azimuthal hotspot shear strength (float, typically 2-4)
                 r_inner: inner disk radius (physical units)
@@ -3290,89 +3301,40 @@ class TaichiRenderer:
 
                 # --- idx 0: temp_base ---
                 # 径向衰减 + 慢速 FBM 噪声调制
+                # 噪声映射到 [0,1] 以匹配 CPU _fbm_noise 的归一化输出
                 decay = ti.pow(ti.max(1.0 - r, 0.0), 1.3)
-                tb_noise = _fbm_3d(cx * 8.0, cy * 8.0, r * 8.0 + t * 0.05,
-                                   4, 0.6, 2.0)
+                tb_noise = ti.min(ti.max(
+                    0.5 + 0.5 * _fbm_3d(cx * 8.0, cy * 8.0,
+                                         r * 8.0 + t * 0.05,
+                                         4, 0.6, 2.0),
+                    0.0), 1.0)
                 comp[0, ri, phi_i] = decay * (0.85 + 0.15 * tb_noise) * 0.25
 
-                # --- idx 1,2: spiral / spiral_temp ---
-                # 参数化对数螺旋几何 + 噪声调制宽度/强度
-                spiral_val = 0.0
-                spiral_temp_val = 0.0
-                for arm_idx in ti.static(range(_MAX_BG_SPIRAL_ARMS)):
-                    if arm_idx < n_arms:
-                        base_angle = spiral_params[arm_idx, 0]
-                        r_start = spiral_params[arm_idx, 1]
-                        r_end = spiral_params[arm_idx, 2]
-                        rotations = spiral_params[arm_idx, 3]
-                        width = spiral_params[arm_idx, 4]
-                        intensity = spiral_params[arm_idx, 5]
-                        delta_T = spiral_params[arm_idx, 6]
-
-                        arm_angle = phi_rot - base_angle + r * rotations * pi2
-
-                        # 噪声调制宽度（低频，时变）
-                        w_n = _fbm_3d(
-                            cx * 3.0 + ti.cast(arm_idx, ti.f32) * 7.1,
-                            cy * 3.0,
-                            r * 3.0 + t * 0.03,
-                            2, 0.5, 2.0)
-                        width_mod = ti.max(0.2 + 1.5 * (0.5 + 0.5 * w_n), 0.15)
-
-                        kappa = 1.5 / (width * width + 1e-6)
-                        arm_v = ti.exp(kappa * (ti.cos(arm_angle) - 1.0) * width_mod)
-
-                        # 径向 mask（软边）
-                        fade_e = 0.02
-                        fi = ti.min(ti.max((r - r_start) / fade_e, 0.0), 1.0)
-                        fo = ti.min(ti.max((r_end - r) / fade_e, 0.0), 1.0)
-
-                        # 噪声驱动的碎片化（取代 CPU 的 sub-arm 离散分段）
-                        frag_n = _fbm_3d(
-                            cx * 2.0 + ti.cast(arm_idx, ti.f32) * 17.3,
-                            cy * 2.0,
-                            r * 4.0 + t * 0.02,
-                            2, 0.6, 2.0)
-                        frag_mask = ti.min(ti.max(frag_n * 1.5 + 0.3, 0.0), 1.0)
-
-                        # 强度调制
-                        int_n = _fbm_3d(
-                            cx * 6.0 + ti.cast(arm_idx, ti.f32) * 13.7,
-                            cy * 6.0,
-                            r * 6.0 + t * 0.08,
-                            3, 0.5, 2.0)
-                        int_mod = 0.1 + 0.9 * ti.pow(
-                            ti.max(0.5 + 0.5 * int_n, 0.001), 0.15)
-
-                        arm_v *= fi * fo * intensity * int_mod * frag_mask
-                        spiral_val += arm_v
-                        spiral_temp_val += arm_v * delta_T
-
-                spiral_val = ti.min(spiral_val, 1.0)
-                comp[1, ri, phi_i] = spiral_val
-                comp[2, ri, phi_i] = spiral_temp_val
+                # --- idx 1,2: spiral 已移除，置零 ---
+                comp[1, ri, phi_i] = 0.0
+                comp[2, ri, phi_i] = 0.0
 
                 # --- idx 3,4: turbulence / turb_temp ---
-                # 多尺度时变噪声叠加
-                t_coarse = (0.5 + 0.5 * _fbm_3d(
+                # 多尺度时变噪声叠加（每层 clamp 到 [0,1] 匹配 CPU _tileable_noise）
+                t_coarse = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 8.0, cy * 8.0, r * 4.0 + t * 0.06,
-                    3, 0.45, 2.0)) * 0.08
-                t_mid = (0.5 + 0.5 * _fbm_3d(
+                    3, 0.45, 2.0), 0.0), 1.0) * 0.08
+                t_mid = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 24.0, cy * 24.0, r * 12.0 + t * 0.08,
-                    4, 0.45, 2.0)) * 0.15
-                t_fine = (0.5 + 0.5 * _fbm_3d(
+                    4, 0.45, 2.0), 0.0), 1.0) * 0.15
+                t_fine = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 80.0, cy * 80.0, r * 40.0 + t * 0.1,
-                    5, 0.45, 2.0)) * 0.25
-                t_extra = (0.5 + 0.5 * _fbm_3d(
+                    5, 0.45, 2.0), 0.0), 1.0) * 0.25
+                t_extra = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 200.0, cy * 200.0, r * 100.0 + t * 0.12,
-                    4, 0.4, 2.0)) * 0.22
-                t_ultra = (0.5 + 0.5 * _fbm_3d(
+                    4, 0.4, 2.0), 0.0), 1.0) * 0.22
+                t_ultra = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 400.0, cy * 400.0, r * 200.0 + t * 0.15,
-                    3, 0.35, 2.0)) * 0.18
-                t_pixel = ti.max(
+                    3, 0.35, 2.0), 0.0), 1.0) * 0.18
+                t_pixel = ti.min(ti.max(
                     _simplex_noise_3d(cx * 800.0, cy * 800.0,
                                       r * 400.0 + t * 0.2),
-                    0.0) * 0.12
+                    0.0), 1.0) * 0.12
                 turb = ti.min(ti.max(
                     t_coarse + t_mid + t_fine + t_extra + t_ultra + t_pixel,
                     0.0), 1.0)
@@ -3384,28 +3346,32 @@ class TaichiRenderer:
                 shear = ti.pow(r, 1.2) * az_shear
                 az_wave = 0.5 + 0.5 * ti.sin(
                     (phi_rot + shear) * ti.cast(az_freq, ti.f32))
-                az_n = _fbm_3d(cx * 3.0, cy * 3.0, r * 3.0 + t * 0.04,
-                               3, 0.5, 2.0)
-                comp[11, ri, phi_i] = az_wave * ti.max(0.5 + 0.5 * az_n, 0.0)
+                az_n = ti.min(ti.max(
+                    0.5 + 0.5 * _fbm_3d(cx * 3.0, cy * 3.0,
+                                         r * 3.0 + t * 0.04,
+                                         3, 0.5, 2.0),
+                    0.0), 1.0)
+                comp[11, ri, phi_i] = az_wave * az_n
 
                 # --- idx 12: disturb_mod ---
                 # 多层扰动调制场（t 演化极慢，旋转由 phi_rot 主导）
-                d_coarse = (0.5 + 0.5 * _fbm_3d(
+                # 每层 clamp 到 [0,1] 匹配 CPU _tileable_noise
+                d_coarse = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 8.0, cy * 8.0, r * 4.0 + t * 0.003,
-                    3, 0.5, 2.0)) * 0.05
-                d_mid = (0.5 + 0.5 * _fbm_3d(
+                    3, 0.5, 2.0), 0.0), 1.0) * 0.05
+                d_mid = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 32.0, cy * 32.0, r * 16.0 + t * 0.005,
-                    3, 0.5, 2.0)) * 0.15
-                d_fine = (0.5 + 0.5 * _fbm_3d(
+                    3, 0.5, 2.0), 0.0), 1.0) * 0.15
+                d_fine = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 100.0, cy * 100.0, r * 50.0 + t * 0.006,
-                    4, 0.45, 2.0)) * 0.30
-                d_extra = (0.5 + 0.5 * _fbm_3d(
+                    4, 0.45, 2.0), 0.0), 1.0) * 0.30
+                d_extra = ti.min(ti.max(0.5 + 0.5 * _fbm_3d(
                     cx * 250.0, cy * 250.0, r * 125.0 + t * 0.008,
-                    4, 0.4, 2.0)) * 0.30
-                d_pixel = ti.max(
+                    4, 0.4, 2.0), 0.0), 1.0) * 0.30
+                d_pixel = ti.min(ti.max(
                     _simplex_noise_3d(cx * 500.0, cy * 500.0,
                                       r * 250.0 + t * 0.01),
-                    0.0) * 0.20
+                    0.0), 1.0) * 0.20
                 disturb_raw = (d_coarse + d_mid + d_fine + d_extra + d_pixel) * 1.4
                 disturb_raw = ti.min(ti.max(disturb_raw, 0.05), 1.0)
                 radial_preserve = 0.6 + 0.4 * r
@@ -3468,40 +3434,6 @@ class TaichiRenderer:
         if not hasattr(self, '_comp_field') or self._comp_field.shape != (13, n_r, n_phi):
             self._comp_field = ti.field(dtype=ti.f32, shape=(13, n_r, n_phi))
 
-        # 螺旋臂参数
-        n_arms = int(rng.integers(2, 5))
-        n_from_center = int(rng.integers(2, min(n_arms + 1, 5)))
-        max_arms = 8
-        params = np.zeros((max_arms, 7), dtype=np.float32)
-
-        used_angles = []
-        for arm_idx in range(n_arms):
-            if arm_idx < n_from_center:
-                r_start = 0.0
-                base_angle = arm_idx * 2 * np.pi / n_from_center
-            else:
-                r_start = float(rng.uniform(0.05, 0.5))
-                base_angle = float(rng.uniform(0, 2 * np.pi))
-
-            for existing in used_angles:
-                if abs(base_angle - existing) < 0.4:
-                    base_angle = (base_angle + 0.5) % (2 * np.pi)
-            used_angles.append(base_angle)
-
-            rotations = float(rng.uniform(2.5, 5.0))
-            width = float(rng.uniform(0.2, 0.4))
-            intensity = float(rng.uniform(0.1, 0.7))
-            delta_T = float(rng.uniform(0.1, 0.3))
-            r_length = rotations / 6.0 * (1.0 - r_start)
-            r_end = r_start + min(r_length, 1.0 - r_start)
-
-            params[arm_idx] = [base_angle, r_start, r_end, rotations,
-                               width, intensity, delta_T]
-
-        self._bg_spiral_params_field = ti.field(ti.f32, shape=(max_arms, 7))
-        self._bg_spiral_params_field.from_numpy(params)
-        self._bg_n_arms = n_arms
-
         # 方位热点参数
         self._bg_az_freq = int(rng.integers(2, 5))
         self._bg_az_shear = float(rng.uniform(2.0, 4.0))
@@ -3515,6 +3447,7 @@ class TaichiRenderer:
         omega_rows = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
         self._omega_rows_field = ti.field(dtype=ti.f32, shape=(n_r,))
         self._omega_rows_field.from_numpy(omega_rows)
+        self._bg_omega_all_np = omega_rows
 
         self._bg_n_r = n_r
         self._bg_n_phi = n_phi
@@ -3522,14 +3455,16 @@ class TaichiRenderer:
         # 实体层 staging field（CPU 累加 → from_numpy → copy kernel → comp[5:10]）
         self._entity_staging_field = ti.field(ti.f32, shape=(6, n_r, n_phi))
 
-        # compose kernel 所需统计量（初始值，后续由 recompute_interactive_stats 更新）
+        # compose kernel 所需统计量（初始值足够宽松，不过度钳制 temp_base）
         self._param_stats_field = ti.field(dtype=ti.f32, shape=(2,))
         self._param_stats_field.from_numpy(np.array([0.5, 0.5], dtype=np.float32))
 
+        r_norm_init = np.linspace(0, 1, n_r)
+        tb_init = np.clip(1.0 - r_norm_init, 0, 1) ** 1.3 * 0.25
         self._param_row_stats_field = ti.Vector.field(2, dtype=ti.f32, shape=(n_r,))
         init_row_stats = np.column_stack([
-            np.full(n_r, 0.25, dtype=np.float32),
-            np.full(n_r, 0.10, dtype=np.float32),
+            np.maximum(tb_init, 0.25).astype(np.float32),
+            np.maximum(tb_init * 0.8, 0.10).astype(np.float32),
         ])
         self._param_row_stats_field.from_numpy(init_row_stats)
 
@@ -3550,8 +3485,7 @@ class TaichiRenderer:
         assert hasattr(self, '_bg_ready') and self._bg_ready, \
             "Must call init_background_layer() first"
         self._generate_background_kernel(
-            self._comp_field, self._bg_spiral_params_field,
-            self._bg_n_arms, self._bg_az_freq, self._bg_az_shear,
+            self._comp_field, self._bg_az_freq, self._bg_az_shear,
             float(self.r_disk_inner), float(self.r_disk_outer), float(t))
 
     def accumulate_entity_layer(self, factories: dict, now: float) -> None:
@@ -3586,6 +3520,8 @@ class TaichiRenderer:
             ('hotspot',  4, 5),   # density → staging[4], temp → staging[5]
         ]
 
+        omega_np = self._bg_omega_all_np
+
         for key, d_idx, t_idx in component_map:
             factory = factories.get(key)
             if factory is None:
@@ -3595,13 +3531,13 @@ class TaichiRenderer:
                 if alpha <= 0:
                     continue
                 age = now - entity.birth_time
-                shift = int(age * entity.omega / (2 * np.pi) * n_phi)
                 for k, ri in enumerate(entity.row_indices):
                     if 0 <= ri < n_r:
+                        shift_ri = int(age * omega_np[ri] / (2 * np.pi) * n_phi)
                         staging[d_idx, ri] += np.roll(
-                            entity.phi_density[k], -shift) * alpha
+                            entity.phi_density[k], -shift_ri) * alpha
                         staging[t_idx, ri] += np.roll(
-                            entity.phi_temp[k], -shift) * alpha
+                            entity.phi_temp[k], -shift_ri) * alpha
 
         self._entity_staging_field.from_numpy(staging)
         self._copy_entity_staging_to_comp(self._comp_field,
@@ -3651,6 +3587,14 @@ class TaichiRenderer:
         struct_max_per_r = np.max(temp_struct_scaled, axis=1).astype(np.float32)
         struct_p70_per_r = np.quantile(
             temp_struct_scaled, 0.7, axis=1).astype(np.float32)
+
+        # 生命周期模式下实体层更稀疏，很多行的 struct 统计量接近 0，
+        # 导致 compose kernel 将 temp_base 过度钳制（ceiling=max(p70,0.05)≈0.05）。
+        # 设置下限让 temp_base 在无结构区域仍保持内盘基础亮度。
+        tb = self._comp_field.to_numpy()[0]  # temp_base
+        tb_max_per_r = np.max(tb, axis=1).astype(np.float32)
+        struct_max_per_r = np.maximum(struct_max_per_r, tb_max_per_r)
+        struct_p70_per_r = np.maximum(struct_p70_per_r, tb_max_per_r * 0.8)
 
         self._param_stats_field.from_numpy(
             np.array([density_p98, struct_scale], dtype=np.float32))
@@ -4068,17 +4012,17 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
     factories = {
         'filament': EntityFactory(
             _spawn_single_filament, target_count=200,
-            lifetime_range=(10.0, 20.0), fade_in=2.0, fade_out=2.0,
+            lifetime_range=(20.0, 40.0), fade_in=5.0, fade_out=5.0,
             n_r=n_r, n_phi=n_phi,
             r_norm_all=r_norm_all, omega_all=omega_all, seed=100),
         'hotspot': EntityFactory(
             _spawn_single_hotspot, target_count=30,
-            lifetime_range=(8.0, 15.0), fade_in=2.0, fade_out=2.0,
+            lifetime_range=(15.0, 30.0), fade_in=4.0, fade_out=4.0,
             n_r=n_r, n_phi=n_phi,
             r_norm_all=r_norm_all, omega_all=omega_all, seed=200),
         'rt_spike': EntityFactory(
             _spawn_single_rt_spike, target_count=15,
-            lifetime_range=(8.0, 15.0), fade_in=1.5, fade_out=1.5,
+            lifetime_range=(15.0, 30.0), fade_in=3.0, fade_out=3.0,
             n_r=n_r, n_phi=n_phi,
             r_norm_all=r_norm_all, omega_all=omega_all, seed=300),
     }

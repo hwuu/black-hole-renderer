@@ -37,6 +37,7 @@ def _make_entity(birth=0.0, lifetime=10.0, fade_in=2.0, fade_out=2.0):
         lifetime=lifetime,
         fade_in=fade_in,
         fade_out=fade_out,
+        fade_noise=np.random.default_rng(0).random(32).astype(np.float32),
     )
 
 

@@ -35,19 +35,11 @@ class TestBackgroundLayerInit(unittest.TestCase):
         comp = self.renderer._comp_field
         self.assertEqual(comp.shape, (13, 32, 64))
 
-    def test_spiral_params_created(self):
-        """螺旋臂参数应被创建且在合理范围内。"""
-        params = self.renderer._bg_spiral_params_field.to_numpy()
-        n_arms = self.renderer._bg_n_arms
-        self.assertGreaterEqual(n_arms, 2)
-        self.assertLessEqual(n_arms, 4)
-        for i in range(n_arms):
-            base_angle = params[i, 0]
-            self.assertGreaterEqual(base_angle, 0)
-            self.assertLess(base_angle, 2 * np.pi + 0.1)
-            rotations = params[i, 3]
-            self.assertGreaterEqual(rotations, 2.5)
-            self.assertLessEqual(rotations, 5.0)
+    def test_omega_numpy_cached(self):
+        """omega numpy 缓存应被创建，用于实体层差速剪切。"""
+        omega_np = self.renderer._bg_omega_all_np
+        self.assertEqual(omega_np.shape, (32,))
+        self.assertTrue(np.all(omega_np > 0))
 
     def test_az_params(self):
         """方位热点参数应在合理范围内。"""
@@ -97,20 +89,10 @@ class TestGenerateBackground(unittest.TestCase):
         self.assertTrue(np.all(sp >= -0.01), f"min={sp.min()}")
         self.assertTrue(np.all(sp <= 1.01), f"max={sp.max()}")
 
-    def test_spiral_not_zero(self):
-        """spiral 不应全为零。"""
-        sp = self.comp_t0[1]
-        self.assertGreater(sp.max(), 0.01, "spiral is all zeros")
-
-    def test_spiral_temp_proportional(self):
-        """spiral_temp (idx 2) 应与 spiral (idx 1) 成正比。"""
-        sp = self.comp_t0[1]
-        sp_t = self.comp_t0[2]
-        nonzero = sp > 0.01
-        if np.any(nonzero):
-            ratio = sp_t[nonzero] / sp[nonzero]
-            self.assertGreater(ratio.mean(), 0.05,
-                               "spiral_temp should be proportional to spiral")
+    def test_spiral_is_zero(self):
+        """spiral (idx 1,2) 已移除，应全为零。"""
+        self.assertAlmostEqual(self.comp_t0[1].sum(), 0.0, places=5)
+        self.assertAlmostEqual(self.comp_t0[2].sum(), 0.0, places=5)
 
     def test_turbulence_range(self):
         """turbulence (idx 3) 应在 [0, 1]。"""
