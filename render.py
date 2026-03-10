@@ -1751,6 +1751,7 @@ class TaichiRenderer:
 
         self.bright_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.final_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
 
         self._compile_kernels()
 
@@ -2108,7 +2109,7 @@ class TaichiRenderer:
                               pixel_width_field: ti.template(),
                               pixel_height_field: ti.template(), r_escape_field: ti.template(),
                               h_base: ti.f32, r_inner: ti.f32, r_outer: ti.f32, t_offset: ti.f32,
-                              disk_tilt: ti.f32):
+                              disk_tilt: ti.f32, skip_diff: ti.i32):
             """Ray marching kernel for Schwarzschild black hole rendering.
 
             Traces rays from camera through each pixel, integrating accretion disk
@@ -2144,18 +2145,17 @@ class TaichiRenderer:
                 dir_ = ray_dir
                 L2_val = dir_.cross(pos).norm() ** 2
 
-                # Ray differentials（x 方向）
-                # 更精确：计算相邻像素的方向差
-                pixel_pos_x1 = tl + (px_f + 1.5) * pw * cr - (py_f + 0.5) * ph * cu
-                ray_dir_x1 = (pixel_pos_x1 - cp).normalized()
                 d_pos_dx = ti.Vector([0.0, 0.0, 0.0])
-                d_dir_dx = ray_dir_x1 - ray_dir
-
-                # Y 方向微分
-                pixel_pos_y1 = tl + (px_f + 0.5) * pw * cr - (py_f + 1.5) * ph * cu
-                ray_dir_y1 = (pixel_pos_y1 - cp).normalized()
+                d_dir_dx = ti.Vector([0.0, 0.0, 0.0])
                 d_pos_dy = ti.Vector([0.0, 0.0, 0.0])
-                d_dir_dy = ray_dir_y1 - ray_dir
+                d_dir_dy = ti.Vector([0.0, 0.0, 0.0])
+                if skip_diff == 0:
+                    pixel_pos_x1 = tl + (px_f + 1.5) * pw * cr - (py_f + 0.5) * ph * cu
+                    ray_dir_x1 = (pixel_pos_x1 - cp).normalized()
+                    d_dir_dx = ray_dir_x1 - ray_dir
+                    pixel_pos_y1 = tl + (px_f + 0.5) * pw * cr - (py_f + 1.5) * ph * cu
+                    ray_dir_y1 = (pixel_pos_y1 - cp).normalized()
+                    d_dir_dy = ray_dir_y1 - ray_dir
 
                 escaped = False
                 escape_dir = ti.Vector([0.0, 0.0, 0.0])
@@ -2199,31 +2199,34 @@ class TaichiRenderer:
                     new_pos = pos + (k1p + 2 * k2p + 2 * k3p + k4p) / 6
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6
 
-                    # 微分光线 RK4（同步更新 X 方向）
-                    k1p_dx = h * d_dir_dx
-                    k1d_dx = h * _compute_acc_jacobian(pos, d_pos_dx, L2_val)
-                    k2p_dx = h * (d_dir_dx + 0.5 * k1d_dx)
-                    k2d_dx = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dx + 0.5 * k1p_dx, L2_val)
-                    k3p_dx = h * (d_dir_dx + 0.5 * k2d_dx)
-                    k3d_dx = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dx + 0.5 * k2p_dx, L2_val)
-                    k4p_dx = h * (d_dir_dx + k3d_dx)
-                    k4d_dx = h * _compute_acc_jacobian(pos + k3p, d_pos_dx + k3p_dx, L2_val)
+                    new_d_pos_dx = d_pos_dx
+                    new_d_dir_dx = d_dir_dx
+                    new_d_pos_dy = d_pos_dy
+                    new_d_dir_dy = d_dir_dy
+                    if skip_diff == 0:
+                        k1p_dx = h * d_dir_dx
+                        k1d_dx = h * _compute_acc_jacobian(pos, d_pos_dx, L2_val)
+                        k2p_dx = h * (d_dir_dx + 0.5 * k1d_dx)
+                        k2d_dx = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dx + 0.5 * k1p_dx, L2_val)
+                        k3p_dx = h * (d_dir_dx + 0.5 * k2d_dx)
+                        k3d_dx = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dx + 0.5 * k2p_dx, L2_val)
+                        k4p_dx = h * (d_dir_dx + k3d_dx)
+                        k4d_dx = h * _compute_acc_jacobian(pos + k3p, d_pos_dx + k3p_dx, L2_val)
 
-                    new_d_pos_dx = d_pos_dx + (k1p_dx + 2 * k2p_dx + 2 * k3p_dx + k4p_dx) / 6
-                    new_d_dir_dx = d_dir_dx + (k1d_dx + 2 * k2d_dx + 2 * k3d_dx + k4d_dx) / 6
+                        new_d_pos_dx = d_pos_dx + (k1p_dx + 2 * k2p_dx + 2 * k3p_dx + k4p_dx) / 6
+                        new_d_dir_dx = d_dir_dx + (k1d_dx + 2 * k2d_dx + 2 * k3d_dx + k4d_dx) / 6
 
-                    # 微分光线 RK4（同步更新 Y 方向）
-                    k1p_dy = h * d_dir_dy
-                    k1d_dy = h * _compute_acc_jacobian(pos, d_pos_dy, L2_val)
-                    k2p_dy = h * (d_dir_dy + 0.5 * k1d_dy)
-                    k2d_dy = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dy + 0.5 * k1p_dy, L2_val)
-                    k3p_dy = h * (d_dir_dy + 0.5 * k2d_dy)
-                    k3d_dy = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dy + 0.5 * k2p_dy, L2_val)
-                    k4p_dy = h * (d_dir_dy + k3d_dy)
-                    k4d_dy = h * _compute_acc_jacobian(pos + k3p, d_pos_dy + k3p_dy, L2_val)
+                        k1p_dy = h * d_dir_dy
+                        k1d_dy = h * _compute_acc_jacobian(pos, d_pos_dy, L2_val)
+                        k2p_dy = h * (d_dir_dy + 0.5 * k1d_dy)
+                        k2d_dy = h * _compute_acc_jacobian(pos + 0.5 * k1p, d_pos_dy + 0.5 * k1p_dy, L2_val)
+                        k3p_dy = h * (d_dir_dy + 0.5 * k2d_dy)
+                        k3d_dy = h * _compute_acc_jacobian(pos + 0.5 * k2p, d_pos_dy + 0.5 * k2p_dy, L2_val)
+                        k4p_dy = h * (d_dir_dy + k3d_dy)
+                        k4d_dy = h * _compute_acc_jacobian(pos + k3p, d_pos_dy + k3p_dy, L2_val)
 
-                    new_d_pos_dy = d_pos_dy + (k1p_dy + 2 * k2p_dy + 2 * k3p_dy + k4p_dy) / 6
-                    new_d_dir_dy = d_dir_dy + (k1d_dy + 2 * k2d_dy + 2 * k3d_dy + k4d_dy) / 6
+                        new_d_pos_dy = d_pos_dy + (k1p_dy + 2 * k2p_dy + 2 * k3p_dy + k4p_dy) / 6
+                        new_d_dir_dy = d_dir_dy + (k1d_dy + 2 * k2d_dy + 2 * k3d_dy + k4d_dy) / 6
 
                     r = new_pos.norm()
                     affine += h
@@ -2240,11 +2243,11 @@ class TaichiRenderer:
                         escape_dir = new_dir.normalized()
                         break
 
-                    # 更新微分光线状态
-                    d_pos_dx = new_d_pos_dx
-                    d_dir_dx = new_d_dir_dx
-                    d_pos_dy = new_d_pos_dy
-                    d_dir_dy = new_d_dir_dy
+                    if skip_diff == 0:
+                        d_pos_dx = new_d_pos_dx
+                        d_dir_dx = new_d_dir_dx
+                        d_pos_dy = new_d_pos_dy
+                        d_dir_dy = new_d_dir_dy
 
                     new_z = new_pos[2]
                     new_y = new_pos[1]
@@ -2259,18 +2262,17 @@ class TaichiRenderer:
                         hit_y = old_pos[1] + t_frac * (new_pos[1] - old_pos[1])
                         hit_r = ti.sqrt(hit_x ** 2 + hit_y ** 2)
 
-                        # 记录击中时的微分位置（用于计算纹理梯度）
-                        hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
-                        hit_d_pos_dy = d_pos_dy + t_frac * (new_d_pos_dy - d_pos_dy)
+                        if skip_diff == 0:
+                            hit_d_pos_dx = d_pos_dx + t_frac * (new_d_pos_dx - d_pos_dx)
+                            hit_d_pos_dy = d_pos_dy + t_frac * (new_d_pos_dy - d_pos_dy)
 
                         if r_outer >= hit_r >= r_inner:
                             hit_z = hit_y * tan_t
                             hit_pos_vec = ti.Vector([hit_x, hit_y, hit_z])
                             ray_to_cam = -dir_
 
-                            # 根据抗锯齿模式选择采样方式
                             disk_rgba = ti.Vector([0.0, 0.0, 0.0, 0.0])
-                            if anti_alias_mode == 0:
+                            if anti_alias_mode == 0 or skip_diff == 1:
                                 # disabled: 直接采样
                                 disk_rgba = _sample_disk(hit_x, hit_y, r_inner, r_outer, t_offset)
                             else:
@@ -2598,6 +2600,25 @@ class TaichiRenderer:
 
         self._mipmap_downsample_kernel = _mipmap_downsample_kernel
 
+        @ti.kernel
+        def _compose_final_kernel(final: ti.template(),
+                                  bg: ti.template(),
+                                  disk: ti.template(),
+                                  bloom: ti.template(),
+                                  use_bloom: ti.i32):
+            """合成最终图像：背景 + 吸积盘 + 可选 bloom，Y 轴翻转适配 ti.GUI。"""
+            h = final.shape[1]
+            for i, j in final:
+                jf = h - 1 - j
+                if use_bloom == 1:
+                    final[i, j] = ti.math.clamp(
+                        bg[i, jf] + disk[i, jf] + bloom[i, jf], 0.0, 1.0)
+                else:
+                    final[i, j] = ti.math.clamp(
+                        bg[i, jf] + disk[i, jf], 0.0, 1.0)
+
+        self._compose_final_kernel = _compose_final_kernel
+
     def update_disk_texture_gpu(self, t_offset: float) -> None:
         """在 GPU 上合成旋转纹理并更新 mipmap（替代 CPU 路径）。
 
@@ -2625,7 +2646,54 @@ class TaichiRenderer:
             h //= 2
             w //= 2
 
-    def render(self, cam_pos: List[float], fov: float, frame: int = 0) -> np.ndarray:
+    def render_to_field(self, cam_pos: List[float], fov: float, frame: int = 0,
+                        skip_differentials: bool = False, skip_bloom: bool = False) -> None:
+        """渲染单帧到 GPU final_field（不做 GPU→CPU 传输，供交互模式使用）。
+
+        渲染结果写入 self.final_field，可直接传给 ti.GUI.set_image()。
+        """
+        cam_pos_arr, cam_right, cam_up, cam_forward, pw, ph = build_camera(
+            np.array(cam_pos, dtype=np.float64), fov, self.width, self.height
+        )
+        distance = float(np.linalg.norm(cam_pos_arr))
+        r_escape = max(self.r_max, distance * 2)
+
+        self.cam_pos_field[None] = list(cam_pos_arr.astype(np.float32))
+        self.cam_right_field[None] = list(cam_right.astype(np.float32))
+        self.cam_up_field[None] = list(cam_up.astype(np.float32))
+        self.cam_forward_field[None] = list(cam_forward.astype(np.float32))
+        self.pixel_width_field[None] = float(pw)
+        self.pixel_height_field[None] = float(ph)
+        self.r_escape_field[None] = float(r_escape)
+
+        h_base = float(self.step_size)
+        r_inner = float(self.r_disk_inner)
+        r_outer = float(self.r_disk_outer)
+        t_offset = float(frame) * self.disk_rotation_speed
+        disk_tilt = float(self.disk_tilt)
+
+        skip_diff_i = 1 if skip_differentials else 0
+        self._ray_march_kernel(
+            self.image_field, self.disk_layer_field, self.cam_pos_field, self.cam_right_field,
+            self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
+            self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset,
+            disk_tilt, skip_diff_i
+        )
+
+        use_bloom = 0
+        if not skip_bloom:
+            kernel_radius = int(self.width * 0.02)
+            sigma_scale = (self.width / 640.0) ** 2
+            self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4, kernel_radius, sigma_scale)
+            use_bloom = 1
+
+        self._compose_final_kernel(
+            self.final_field, self.image_field, self.disk_layer_field,
+            self.blur_field, use_bloom
+        )
+
+    def render(self, cam_pos: List[float], fov: float, frame: int = 0,
+               skip_differentials: bool = False, skip_bloom: bool = False) -> np.ndarray:
         """
         渲染单帧图像。
 
@@ -2633,6 +2701,8 @@ class TaichiRenderer:
             cam_pos: 相机位置 [x, y, z]
             fov: 视野角度
             frame: 帧编号（用于吸积盘自转动画）
+            skip_differentials: 跳过微分光线计算（~3x 加速，禁用抗锯齿 LOD）
+            skip_bloom: 跳过 bloom 后处理
 
         返回:
             (height, width, 3) RGB 图像
@@ -2657,23 +2727,25 @@ class TaichiRenderer:
         t_offset = float(frame) * self.disk_rotation_speed
         disk_tilt = float(self.disk_tilt)
 
+        skip_diff_i = 1 if skip_differentials else 0
         self._ray_march_kernel(
             self.image_field, self.disk_layer_field, self.cam_pos_field, self.cam_right_field,
             self.cam_up_field, self.cam_forward_field, self.pixel_width_field,
             self.pixel_height_field, self.r_escape_field, h_base, r_inner, r_outer, t_offset,
-            disk_tilt
+            disk_tilt, skip_diff_i
         )
 
-        # 对吸积盘层做 bloom（卷积范围和 sigma 按分辨率比例缩放）
-        kernel_radius = int(self.width * 0.02)
-        sigma_scale = (self.width / 640.0) ** 2
-        self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4, kernel_radius, sigma_scale)
-
-        # 合并：背景 + 吸积盘 + bloom
         img = self.image_field.to_numpy()
         disk = self.disk_layer_field.to_numpy()
-        disk_bloom = self.blur_field.to_numpy()
-        final = np.clip(img + disk + disk_bloom, 0, 1)
+
+        if skip_bloom:
+            final = np.clip(img + disk, 0, 1)
+        else:
+            kernel_radius = int(self.width * 0.02)
+            sigma_scale = (self.width / 640.0) ** 2
+            self._bloom_kernel(self.disk_layer_field, self.bright_field, self.blur_field, 0, 0.4, kernel_radius, sigma_scale)
+            disk_bloom = self.blur_field.to_numpy()
+            final = np.clip(img + disk + disk_bloom, 0, 1)
 
         # Lens flare（CPU 实现）
         if self.lens_flare:
@@ -2822,6 +2894,162 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
     print(f"Done in {time.time() - t0:.1f}s")
 
     return img
+
+
+def render_interactive(renderer: TaichiRenderer, width: int, height: int,
+                       fov: float, initial_cam_pos: List[float],
+                       disk_rotation_speed: float = 0.05,
+                       disk_generation_scale: int = 1) -> None:
+    """实时交互预览模式。
+
+    使用 Taichi Legacy GUI 实时渲染黑洞场景，支持鼠标/键盘控制相机和渲染开关。
+
+    相机控制（球坐标，始终朝向原点）:
+        鼠标左键拖拽: 旋转视角 (φ, θ)
+        滚轮上/下: 缩放距离
+        ↑/↓: 调整 FOV
+
+    渲染开关:
+        D: 切换微分光线（抗锯齿基础，默认关）
+        B: 切换 Bloom 泛光（默认关）
+        L: 切换 Lens Flare（默认关）
+        S: 保存当前帧截图
+        ESC/Q: 退出
+
+    Args:
+        renderer: TaichiRenderer 实例
+        width, height: 窗口分辨率
+        fov: 初始视野角度
+        initial_cam_pos: 初始相机位置 [x, y, z]
+        disk_rotation_speed: 盘旋转速度
+        disk_generation_scale: 纹理生成倍率
+    """
+    import taichi as ti
+
+    cam_pos = np.array(initial_cam_pos, dtype=np.float64)
+    r = float(np.linalg.norm(cam_pos))
+    theta = float(np.arccos(np.clip(cam_pos[2] / r, -1, 1)))
+    phi = float(np.arctan2(cam_pos[1], cam_pos[0]))
+
+    toggle_diff = False
+    toggle_bloom = True
+    toggle_flare = False
+    renderer.lens_flare = False
+
+    # 预计算 parametric 纹理状态
+    if disk_generation_scale == 1:
+        state = build_disk_texture_rotating_state(
+            n_phi=renderer.dtex_w, n_r=renderer.dtex_h, seed=42,
+            r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
+            enable_rt=True, generation_scale=disk_generation_scale,
+        )
+        renderer.upload_parametric_state(state)
+        print("GPU 纹理合成已启用")
+
+    gui = ti.GUI('Black Hole Interactive', res=(width, height))
+    t_offset = 0.0
+    frame_count = 0
+    fps_timer = time.time()
+    fps_display = 0.0
+
+    mouse_pressed = False
+    mouse_last = (0.0, 0.0)
+
+    print(f"\n=== 交互模式 ({width}x{height}) ===")
+    print(f"鼠标拖拽: 旋转 | 滚轮: 缩放 | ↑↓: FOV")
+    print(f"D: 微分光线 | B: Bloom | L: Lens Flare | S: 截图 | ESC: 退出\n")
+
+    while gui.running:
+        # —— 事件处理 ——
+        for e in gui.get_events(ti.GUI.PRESS):
+            if e.key == ti.GUI.ESCAPE or e.key == 'q':
+                gui.running = False
+            elif e.key == 'd':
+                toggle_diff = not toggle_diff
+                print(f"微分光线: {'开' if toggle_diff else '关'}")
+            elif e.key == 'b':
+                toggle_bloom = not toggle_bloom
+                print(f"Bloom: {'开' if toggle_bloom else '关'}")
+            elif e.key == 'l':
+                toggle_flare = not toggle_flare
+                renderer.lens_flare = toggle_flare
+                print(f"Lens Flare: {'开' if toggle_flare else '关'}")
+            elif e.key == 's':
+                screenshot_path = f"output/screenshot_{int(time.time())}.png"
+                os.makedirs("output", exist_ok=True)
+                img_save = renderer.render(cam_pos.tolist(), fov, frame=0)
+                img_uint8 = (np.clip(img_save, 0, 1) * 255).astype(np.uint8)
+                Image.fromarray(img_uint8, "RGB").save(screenshot_path)
+                print(f"截图已保存: {screenshot_path}")
+            elif e.key == ti.GUI.UP:
+                fov = max(10, fov - 5)
+                print(f"FOV: {fov}°")
+            elif e.key == ti.GUI.DOWN:
+                fov = min(170, fov + 5)
+                print(f"FOV: {fov}°")
+            elif e.key == ti.GUI.LMB:
+                mouse_pressed = True
+                mouse_last = gui.get_cursor_pos()
+
+        for e in gui.get_events(ti.GUI.RELEASE):
+            if e.key == ti.GUI.LMB:
+                mouse_pressed = False
+
+        # 鼠标拖拽旋转
+        if mouse_pressed and gui.is_pressed(ti.GUI.LMB):
+            mx, my = gui.get_cursor_pos()
+            dx = mx - mouse_last[0]
+            dy = my - mouse_last[1]
+            phi -= dx * 3.0
+            theta = np.clip(theta - dy * 3.0, 0.05, np.pi - 0.05)
+            mouse_last = (mx, my)
+
+        # 滚轮缩放
+        if gui.is_pressed(ti.GUI.UP):
+            pass
+        # Taichi Legacy GUI 不直接支持滚轮，用 +/- 键代替
+        if gui.is_pressed('=') or gui.is_pressed('+'):
+            r = max(2.0, r * 0.97)
+        if gui.is_pressed('-'):
+            r *= 1.03
+
+        # 更新相机位置（球坐标 → 笛卡尔）
+        cam_pos[0] = r * np.sin(theta) * np.cos(phi)
+        cam_pos[1] = r * np.sin(theta) * np.sin(phi)
+        cam_pos[2] = r * np.cos(theta)
+
+        # —— 纹理旋转 ——
+        t_offset += disk_rotation_speed
+        if hasattr(renderer, '_parametric_gpu_ready') and renderer._parametric_gpu_ready:
+            renderer.update_disk_texture_gpu(t_offset)
+
+        # —— 渲染到 GPU field ——
+        renderer.render_to_field(
+            cam_pos.tolist(), fov, frame=0,
+            skip_differentials=not toggle_diff,
+            skip_bloom=not toggle_bloom,
+        )
+
+        # —— 显示（直接从 GPU field，无 CPU 传输）——
+        gui.set_image(renderer.final_field)
+
+        # HUD 信息
+        frame_count += 1
+        now = time.time()
+        if now - fps_timer >= 0.5:
+            fps_display = frame_count / (now - fps_timer)
+            frame_count = 0
+            fps_timer = now
+
+        toggles = f"D:{'ON' if toggle_diff else 'off'} B:{'ON' if toggle_bloom else 'off'} L:{'ON' if toggle_flare else 'off'}"
+        gui.text(f"{fps_display:.0f} FPS | {toggles}", pos=(0.01, 0.97), color=0xFFFFFF)
+        gui.text(f"r={r:.1f} fov={fov:.0f}", pos=(0.01, 0.93), color=0xCCCCCC)
+        gui.text("+/-: zoom | arrows: FOV | S: screenshot", pos=(0.01, 0.02), color=0x888888)
+
+        gui.show()
+
+    gui.close()
+    print("交互模式退出")
 
 
 def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: int, fps: int, output_path: str,
@@ -3091,6 +3319,8 @@ def parse_args() -> argparse.Namespace:
                         help="忽略 Taichi 离线缓存，强制重新编译 kernel (default: 关闭)")
     parser.add_argument("--video", action="store_true",
                         help="视频模式：渲染多帧并合成视频")
+    parser.add_argument("--interactive", action="store_true",
+                        help="交互模式：实时预览，鼠标拖拽旋转，按键切换渲染开关")
     parser.add_argument("--orbit", action="store_true",
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
     parser.add_argument("--orbit_degrees", type=float, default=360.0,
@@ -3151,7 +3381,34 @@ if __name__ == "__main__":
     width, height = resolutions[args.resolution]
     fov = args.fov % 180
 
-    if args.video:
+    if args.interactive:
+        skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
+        disk_tex = load_disk_texture(args.disk_texture)
+        if disk_tex is None:
+            disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
+                                                r_inner=args.disk_inner_radius, r_outer=args.disk_outer_radius,
+                                                seed=42,
+                                                force=args.force_regenerate_disk_texture,
+                                                generation_scale=args.disk_generation_scale)
+
+        renderer = TaichiRenderer(
+            width, height, skybox, disk_tex,
+            step_size=args.step_size, r_max=args.r_max, device="gpu",
+            r_disk_inner=args.disk_inner_radius, r_disk_outer=args.disk_outer_radius,
+            disk_tilt=args.disk_tilt,
+            lens_flare=False,
+            anti_alias="disabled",
+            disk_rotation_speed=args.disk_rotation_speed,
+            ignore_taichi_cache=args.ignore_taichi_cache
+        )
+
+        render_interactive(
+            renderer, width, height,
+            fov=fov, initial_cam_pos=args.pov,
+            disk_rotation_speed=args.disk_rotation_speed,
+            disk_generation_scale=args.disk_generation_scale,
+        )
+    elif args.video:
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         disk_tex = load_disk_texture(args.disk_texture)
         if disk_tex is None:
