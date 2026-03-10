@@ -3927,15 +3927,20 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
                   disk_rotation_speed: float = 0.1, disk_generation_scale: int = 2,
                   force_regenerate_disk_texture: bool = False, ignore_taichi_cache: bool = False) -> np.ndarray:
     """
-    使用 Taichi 渲染单帧图像（兼容旧接口）。
+    使用 Taichi 渲染单帧图像。
+
+    纹理通过实体生命周期系统在 t=0 生成，与 interactive 模式使用相同流程。
+    若提供 disk_texture_path 则直接加载外部纹理（跳过生命周期系统）。
     """
     skybox, tex_h, tex_w = load_or_generate_skybox(skybox_path, tex_w, tex_h, n_stars)
+
+    # 外部纹理优先；否则用占位纹理 + 生命周期系统生成
     disk_tex = load_disk_texture(disk_texture_path)
-    if disk_tex is None:
-        disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=cam_pos, fov=fov,
-                                            r_inner=r_disk_inner, r_outer=r_disk_outer,
-                                            seed=42, force=force_regenerate_disk_texture,
-                                            generation_scale=disk_generation_scale)
+    use_lifecycle = disk_tex is None
+    if use_lifecycle:
+        n_phi, n_r = compute_disk_texture_resolution(
+            width, height, cam_pos, fov, r_disk_inner, r_disk_outer)
+        disk_tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
 
     renderer = TaichiRenderer(
         width, height, skybox, disk_tex,
@@ -3949,6 +3954,11 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
         ignore_taichi_cache=ignore_taichi_cache
     )
 
+    if use_lifecycle:
+        factories = _init_lifecycle_system(renderer, n_r, n_phi, seed=42)
+        _advance_lifecycle_frame(renderer, factories, t=0.0, dt=0.0,
+                                 recompute_stats=True)
+
     t0 = time.time()
     print(f"Taichi: {width}x{height}, cam_pos={list(cam_pos)}, fov={fov}°, step_size={step_size}")
     img = renderer.render(cam_pos, fov, frame=0)
@@ -3957,10 +3967,83 @@ def render_image(width: int, height: int, cam_pos: List[float], fov: float, step
     return img
 
 
+def _init_lifecycle_system(renderer: TaichiRenderer, n_r: int, n_phi: int,
+                          seed: int = 42) -> dict:
+    """Initialize the entity lifecycle system for disk texture generation.
+
+    Sets up background layer (GPU noise) and entity factories (filaments,
+    hotspots, RT spikes), pre-populates entities at staggered ages, generates
+    the first frame, and computes initial normalization stats.
+
+    Args:
+        renderer: TaichiRenderer instance (must have r_disk_inner/r_disk_outer set)
+        n_r: radial resolution of disk texture
+        n_phi: azimuthal resolution of disk texture
+        seed: random seed for reproducibility
+
+    Returns:
+        dict with keys 'filament', 'hotspot', 'rt_spike', each an EntityFactory
+    """
+    renderer.init_background_layer(n_r=n_r, n_phi=n_phi, seed=seed)
+
+    r_norm_all = np.linspace(0, 1, n_r)
+    r_vals = renderer.r_disk_inner + (renderer.r_disk_outer - renderer.r_disk_inner) * r_norm_all
+    omega_all = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
+
+    factories = {
+        'filament': EntityFactory(
+            _spawn_single_filament, target_count=200,
+            lifetime_range=(20.0, 40.0), fade_in=5.0, fade_out=5.0,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 100),
+        'hotspot': EntityFactory(
+            _spawn_single_hotspot, target_count=30,
+            lifetime_range=(15.0, 30.0), fade_in=4.0, fade_out=4.0,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 200),
+        'rt_spike': EntityFactory(
+            _spawn_single_rt_spike, target_count=15,
+            lifetime_range=(15.0, 30.0), fade_in=3.0, fade_out=3.0,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 300),
+    }
+    for f in factories.values():
+        f.seed_initial(now=0.0)
+
+    renderer.generate_background(t=0.0)
+    renderer.accumulate_entity_layer(factories, now=0.0)
+    renderer.recompute_interactive_stats()
+    renderer.compose_interactive_texture()
+
+    return factories
+
+
+def _advance_lifecycle_frame(renderer: TaichiRenderer, factories: dict,
+                             t: float, dt: float,
+                             recompute_stats: bool = False,
+                             solo_idx: int = -1) -> None:
+    """Advance the lifecycle system by one frame and compose disk texture.
+
+    Args:
+        renderer: TaichiRenderer instance with lifecycle system initialized
+        factories: dict of EntityFactory instances
+        t: current simulation time in seconds
+        dt: time step since last frame (seconds)
+        recompute_stats: whether to recompute normalization stats this frame
+        solo_idx: -1 for all components, >= 0 to solo a single component
+    """
+    for f in factories.values():
+        f.tick(now=t, dt=dt)
+    renderer.generate_background(t=t)
+    renderer.accumulate_entity_layer(factories, now=t)
+    if recompute_stats:
+        renderer.recompute_interactive_stats()
+    renderer.compose_interactive_texture(solo_idx=solo_idx)
+
+
 def render_interactive(renderer: TaichiRenderer, width: int, height: int,
                        fov: float, initial_cam_pos: List[float],
-                       disk_rotation_speed: float = 0.05,
-                       disk_generation_scale: int = 1) -> None:
+                       disk_rotation_speed: float = 0.05) -> None:
     """实时交互预览模式（实体生命周期系统）。
 
     使用 Taichi Legacy GUI 实时渲染黑洞场景，支持鼠标/键盘控制相机和渲染开关。
@@ -3986,7 +4069,6 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
         fov: 初始视野角度
         initial_cam_pos: 初始相机位置 [x, y, z]
         disk_rotation_speed: 盘旋转速度
-        disk_generation_scale: 纹理生成倍率（生命周期模式下忽略）
     """
     import taichi as ti
 
@@ -4001,39 +4083,7 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
     renderer.lens_flare = False
 
     # —— 初始化实体生命周期系统 ——
-    n_r = renderer.dtex_h
-    n_phi = renderer.dtex_w
-    renderer.init_background_layer(n_r=n_r, n_phi=n_phi, seed=42)
-
-    r_norm_all = np.linspace(0, 1, n_r)
-    r_vals = renderer.r_disk_inner + (renderer.r_disk_outer - renderer.r_disk_inner) * r_norm_all
-    omega_all = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
-
-    factories = {
-        'filament': EntityFactory(
-            _spawn_single_filament, target_count=200,
-            lifetime_range=(20.0, 40.0), fade_in=5.0, fade_out=5.0,
-            n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=100),
-        'hotspot': EntityFactory(
-            _spawn_single_hotspot, target_count=30,
-            lifetime_range=(15.0, 30.0), fade_in=4.0, fade_out=4.0,
-            n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=200),
-        'rt_spike': EntityFactory(
-            _spawn_single_rt_spike, target_count=15,
-            lifetime_range=(15.0, 30.0), fade_in=3.0, fade_out=3.0,
-            n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=300),
-    }
-    for f in factories.values():
-        f.seed_initial(now=0.0)
-
-    # 生成首帧数据并计算初始统计量
-    renderer.generate_background(t=0.0)
-    renderer.accumulate_entity_layer(factories, now=0.0)
-    renderer.recompute_interactive_stats()
-    renderer.compose_interactive_texture()
+    factories = _init_lifecycle_system(renderer, renderer.dtex_h, renderer.dtex_w, seed=42)
     print("实体生命周期系统已启用 (filaments=200, hotspots=30, rt_spikes=15)")
 
     gui = ti.GUI('Black Hole Interactive', res=(width, height))
@@ -4152,20 +4202,13 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
         now_real = time.time()
         dt = min(now_real - last_frame_time, 0.1)
         last_frame_time = now_real
-        wall_time += dt * disk_rotation_speed * 20.0
+        scaled_dt = dt * disk_rotation_speed * 20.0
+        wall_time += scaled_dt
 
-        for f in factories.values():
-            f.tick(now=wall_time, dt=dt * disk_rotation_speed * 20.0)
-
-        renderer.generate_background(t=wall_time)
-        renderer.accumulate_entity_layer(factories, now=wall_time)
-
-        # 定期刷新统计量（每 60 帧）
         total_frames += 1
-        if total_frames % 60 == 1:
-            renderer.recompute_interactive_stats()
-
-        renderer.compose_interactive_texture(solo_idx=solo_idx)
+        _advance_lifecycle_frame(renderer, factories, wall_time, scaled_dt,
+                                 recompute_stats=(total_frames % 60 == 1),
+                                 solo_idx=solo_idx)
 
         # —— 渲染到 GPU field ——
         renderer.render_to_field(
@@ -4200,11 +4243,10 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
 
 def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: int, fps: int, output_path: str,
                  fov: float, static_cam_pos: List[float], orbit: bool = False, resume: bool = False,
-                 disk_rotation_algorithm: str = "baseline", disk_rotation_speed: float = 0.1,
-                 keyframes_count: int = 10, orbit_degrees: float = 360.0,
-                 disk_generation_scale: int = 2) -> None:
+                 disk_rotation_speed: float = 0.1, orbit_degrees: float = 360.0,
+                 **_deprecated_kwargs) -> None:
     """
-    渲染视频（多帧并合成视频）。
+    渲染视频（多帧并合成视频），使用实体生命周期系统生成纹理。
 
     参数:
         renderer: TaichiRenderer 实例
@@ -4216,11 +4258,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         static_cam_pos: 静态模式下的相机位置
         orbit: 是否围绕原点旋转
         resume: 是否尝试从断点恢复
-        disk_rotation_algorithm: 吸积盘旋转算法 ("baseline", "parametric", "keyframes")
         disk_rotation_speed: 旋转速度系数
-        keyframes_count: 关键帧数量（仅 keyframes 算法有效）
         orbit_degrees: 轨道模式下整段视频的总旋转角度（度）
-        disk_generation_scale: 程序生成吸积盘纹理时的降采样倍率
     """
     orbit_radius = float(np.linalg.norm(static_cam_pos))
 
@@ -4234,11 +4273,8 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
         "n_frames": n_frames,
         "fov": fov,
         "orbit": orbit,
-        "disk_rotation_algorithm": disk_rotation_algorithm,
         "disk_rotation_speed": disk_rotation_speed,
-        "keyframes_count": keyframes_count,
         "orbit_degrees": orbit_degrees,
-        "disk_generation_scale": disk_generation_scale,
     }
 
     completed = set()
@@ -4268,48 +4304,26 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
     def _save_png(path, img_uint8):
         Image.fromarray(img_uint8, "RGB").save(path)
 
-    # —— 算法 2 和 3：预计算准备 ——
-    keyframe_textures = None  # 用于关键帧插值
-    base_seed = 42  # 固定种子，保证不同帧之间结构一致
-    disk_rotation_state = None
+    # —— 初始化生命周期系统 ——
+    n_r = renderer.dtex_h
+    n_phi = renderer.dtex_w
+    factories = _init_lifecycle_system(renderer, n_r, n_phi, seed=42)
+    dt = disk_rotation_speed
+    print(f"  生命周期系统已初始化 (n_r={n_r}, n_phi={n_phi})")
 
-    if disk_rotation_algorithm in {"parametric", "keyframes"}:
-        disk_rotation_state = build_disk_texture_rotating_state(
-            n_phi=renderer.dtex_w,
-            n_r=renderer.dtex_h,
-            seed=base_seed,
-            r_inner=renderer.r_disk_inner,
-            r_outer=renderer.r_disk_outer,
-            enable_rt=True,
-            generation_scale=disk_generation_scale,
-        )
-
-    if disk_rotation_algorithm == "parametric" and disk_generation_scale == 1:
-        renderer.upload_parametric_state(disk_rotation_state)
-        print(f"  GPU 纹理合成已启用 (generation_scale=1)")
-
-    if disk_rotation_algorithm == "keyframes":
-        # 预计算关键帧纹理
-        print(f"\n预计算 {keyframes_count} 个关键帧纹理（算法 3: keyframes）...")
-        keyframe_textures = []
-        t0_precompute = time.time()
-        for i in range(keyframes_count):
-            t_offset = i * (n_frames * disk_rotation_speed) / keyframes_count
-            tex = generate_disk_texture_rotating(
-                n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
-                seed=base_seed,
-                r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-                enable_rt=True, t_offset=t_offset,
-                state=disk_rotation_state, generation_scale=disk_generation_scale,
-            )
-            keyframe_textures.append(tex)
-        precompute_time = time.time() - t0_precompute
-        print(f"关键帧预计算完成：{precompute_time:.2f}s")
+    # —— 断点恢复：快速重演模拟到 resume 点 ——
+    if completed:
+        max_completed = max(completed)
+        print(f"  快速重演模拟到帧 {max_completed}...")
+        replay_t0 = time.time()
+        for f in range(max_completed + 1):
+            t = f * dt
+            _advance_lifecycle_frame(renderer, factories, t, dt)
+        print(f"  重演完成: {time.time() - replay_t0:.1f}s")
 
     # —— 主渲染循环 ——
     for frame in range(n_frames):
-        if frame in completed:
-            continue
+        t = frame * dt
 
         if orbit:
             angle_deg = frame * angle_step
@@ -4323,49 +4337,19 @@ def render_video(renderer: TaichiRenderer, width: int, height: int, n_frames: in
             cam_pos = static_cam_pos
             status_str = "static"
 
+        if frame in completed:
+            continue
+
         t0 = time.time()
-
-        # 根据算法处理纹理
-        if disk_rotation_algorithm == "baseline":
-            # 算法 1: 固定纹理，使用 frame 参数在光线追踪时旋转
-            img = renderer.render(cam_pos, fov, frame=frame)
-
-        elif disk_rotation_algorithm == "parametric":
-            # 算法 2: parametric 纹理旋转
-            t_offset = float(frame) * disk_rotation_speed
-            if hasattr(renderer, '_parametric_gpu_ready') and renderer._parametric_gpu_ready:
-                renderer.update_disk_texture_gpu(t_offset)
-            else:
-                tex = generate_disk_texture_rotating(
-                    n_phi=renderer.dtex_w, n_r=renderer.dtex_h,
-                    seed=base_seed,
-                    r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-                    enable_rt=True, t_offset=t_offset,
-                    state=disk_rotation_state, generation_scale=disk_generation_scale,
-                )
-                renderer.update_disk_texture(tex)
-            img = renderer.render(cam_pos, fov, frame=0)
-
-        elif disk_rotation_algorithm == "keyframes":
-            # 算法 3: 关键帧插值
-            t = frame / n_frames  # [0, 1)
-            keyframe_float = t * keyframes_count
-            keyframe_idx = int(keyframe_float) % keyframes_count
-            keyframe_next = (keyframe_idx + 1) % keyframes_count
-            alpha = keyframe_float - int(keyframe_float)
-
-            # 线性插值两个关键帧
-            tex = (1 - alpha) * keyframe_textures[keyframe_idx] + alpha * keyframe_textures[keyframe_next]
-            renderer.update_disk_texture(tex)
-            img = renderer.render(cam_pos, fov, frame=0)
-
+        _advance_lifecycle_frame(renderer, factories, t, dt,
+                                 recompute_stats=(frame % 60 == 0))
+        img = renderer.render(cam_pos, fov, frame=0)
         elapsed = time.time() - t0
         rendered_this_session += 1
 
         frame_path = os.path.join(temp_dir, f"frame_{frame:04d}.png")
         img_uint8 = (np.clip(img, 0, 1) * 255).astype(np.uint8)
 
-        # 异步 PNG 保存：等待最早的 future 完成以限制内存
         if len(png_futures) >= MAX_PENDING_PNGS:
             png_futures.pop(0).result()
         png_futures.append(png_pool.submit(_save_png, frame_path, img_uint8))
@@ -4440,11 +4424,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n_stars", type=int, default=6000,
                         help="程序天空盒恒星数 (default: 6000)")
     parser.add_argument("--disk_texture", type=str, default=None,
-                        help="吸积盘纹理路径 (default: 程序生成)")
+                        help="吸积盘纹理路径 (default: 程序生成，仅静态单帧模式支持)")
     parser.add_argument("--disk_generation_scale", type=int, default=2, choices=DISK_GENERATION_SCALE_CHOICES,
-                        help="程序生成吸积盘纹理时的降采样倍率：1=原分辨率，2/4=更快但更糙 (default: 2)")
+                        help="[已废弃] 生命周期系统不使用此参数 (default: 2)")
     parser.add_argument("--force_regenerate_disk_texture", action="store_true",
-                        help="强制重新生成吸积盘纹理，忽略缓存 (default: 关闭)")
+                        help="[已废弃] 生命周期系统每次实时生成 (default: 关闭)")
     parser.add_argument("--disk_inner_radius", "--ar1", dest="disk_inner_radius", type=float, default=R_DISK_INNER_DEFAULT,
                         help=f"吸积盘内半径 (default: {R_DISK_INNER_DEFAULT})")
     parser.add_argument("--disk_outer_radius", "--ar2", dest="disk_outer_radius", type=float, default=R_DISK_OUTER_DEFAULT,
@@ -4479,11 +4463,11 @@ def parse_args() -> argparse.Namespace:
                         help="视频模式：尝试从断点恢复（默认从头开始）")
     parser.add_argument("--disk_rotation_algorithm", type=str, default="baseline",
                         choices=["baseline", "parametric", "keyframes"],
-                        help="吸积盘旋转算法：baseline(固定纹理 + 刚体旋转), parametric(每帧重新生成), keyframes(关键帧插值) (default: baseline)")
+                        help="[已废弃] 统一使用生命周期系统，此参数被忽略")
     parser.add_argument("--disk_rotation_speed", type=float, default=0.1,
                         help="吸积盘旋转速度系数 (default: 0.1)")
     parser.add_argument("--keyframes_count", type=int, default=10,
-                        help="关键帧数量（仅 keyframes 算法有效）(default: 10)")
+                        help="[已废弃] 统一使用生命周期系统，此参数被忽略")
     return parser.parse_args()
 
 
@@ -4516,7 +4500,8 @@ def validate_args(args) -> None:
     if not math.isfinite(args.orbit_degrees):
         raise ValueError(f"orbit_degrees must be finite, got {args.orbit_degrees}")
 
-    _validate_disk_generation_scale(args.disk_generation_scale)
+    if args.disk_texture and (args.video or args.interactive):
+        raise ValueError("--disk_texture 仅支持静态单帧渲染，video/interactive 模式请使用生命周期系统")
 
 
 if __name__ == "__main__":
@@ -4527,64 +4512,41 @@ if __name__ == "__main__":
     width, height = resolutions[args.resolution]
     fov = args.fov % 180
 
-    if args.interactive:
+    def _make_renderer_with_placeholder(device="cpu"):
+        """Create renderer with placeholder disk texture for lifecycle system."""
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
-        disk_tex = load_disk_texture(args.disk_texture)
-        if disk_tex is None:
-            disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
-                                                r_inner=args.disk_inner_radius, r_outer=args.disk_outer_radius,
-                                                seed=42,
-                                                force=args.force_regenerate_disk_texture,
-                                                generation_scale=args.disk_generation_scale)
-
-        renderer = TaichiRenderer(
+        n_phi, n_r = compute_disk_texture_resolution(
+            width, height, args.pov, fov,
+            args.disk_inner_radius, args.disk_outer_radius)
+        disk_tex = np.zeros((n_r, n_phi, 4), dtype=np.float32)
+        return TaichiRenderer(
             width, height, skybox, disk_tex,
-            step_size=args.step_size, r_max=args.r_max, device="gpu",
+            step_size=args.step_size, r_max=args.r_max, device=device,
             r_disk_inner=args.disk_inner_radius, r_disk_outer=args.disk_outer_radius,
             disk_tilt=args.disk_tilt,
-            lens_flare=False,
-            anti_alias="disabled",
-            disk_rotation_speed=args.disk_rotation_speed,
-            ignore_taichi_cache=args.ignore_taichi_cache
-        )
-
-        render_interactive(
-            renderer, width, height,
-            fov=fov, initial_cam_pos=args.pov,
-            disk_rotation_speed=args.disk_rotation_speed,
-            disk_generation_scale=args.disk_generation_scale,
-        )
-    elif args.video:
-        skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
-        disk_tex = load_disk_texture(args.disk_texture)
-        if disk_tex is None:
-            disk_tex = load_cached_disk_texture(width=width, height=height, cam_pos=args.pov, fov=fov,
-                                                r_inner=args.disk_inner_radius, r_outer=args.disk_outer_radius,
-                                                seed=42,
-                                                force=args.force_regenerate_disk_texture,
-                                                generation_scale=args.disk_generation_scale)
-
-        renderer = TaichiRenderer(
-            width, height, skybox, disk_tex,
-            step_size=args.step_size, r_max=args.r_max, device=args.device,
-            r_disk_inner=args.disk_inner_radius, r_disk_outer=args.disk_outer_radius,
-            disk_tilt=args.disk_tilt,
-            lens_flare=args.lens_flare,
-            anti_alias=args.anti_alias,
+            lens_flare=args.lens_flare if not args.interactive else False,
+            anti_alias=args.anti_alias if not args.interactive else "disabled",
             aa_strength=args.aa_strength,
             disk_rotation_speed=args.disk_rotation_speed,
             ignore_taichi_cache=args.ignore_taichi_cache
         )
+
+    if args.interactive:
+        renderer = _make_renderer_with_placeholder(device="gpu")
+        render_interactive(
+            renderer, width, height,
+            fov=fov, initial_cam_pos=args.pov,
+            disk_rotation_speed=args.disk_rotation_speed,
+        )
+    elif args.video:
+        renderer = _make_renderer_with_placeholder(device=args.device)
 
         print(f"Rendering video: {args.n_frames} frames at {width}x{height}")
         print(f"  orbit={args.orbit}")
         if args.orbit:
             print(f"  orbit_degrees={args.orbit_degrees}°")
         print(f"  fov={fov}°, step_size={args.step_size}, fps={args.fps}, disk_tilt={args.disk_tilt}°")
-        print(f"  disk_generation_scale={args.disk_generation_scale}x")
-        print(f"  disk_rotation_algorithm={args.disk_rotation_algorithm}, disk_rotation_speed={args.disk_rotation_speed}")
-        if args.disk_rotation_algorithm == "keyframes":
-            print(f"  keyframes_count={args.keyframes_count}")
+        print(f"  disk_rotation_speed={args.disk_rotation_speed}")
 
         render_video(
             renderer, width, height,
@@ -4592,11 +4554,8 @@ if __name__ == "__main__":
             fov=fov, static_cam_pos=args.pov,
             orbit=args.orbit,
             resume=args.resume,
-            disk_rotation_algorithm=args.disk_rotation_algorithm,
             disk_rotation_speed=args.disk_rotation_speed,
-            keyframes_count=args.keyframes_count,
             orbit_degrees=args.orbit_degrees,
-            disk_generation_scale=args.disk_generation_scale,
         )
     else:
         img = render_image(
