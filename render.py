@@ -486,6 +486,191 @@ class DiskTextureRotatingState:
     disturb_mod: np.ndarray
 
 
+# ============================================================================
+# 实体生命周期系统
+# ============================================================================
+
+@dataclass
+class EntityInstance:
+    """Single entity instance in the lifecycle system.
+
+    Stores pre-computed sparse density/temperature contributions and Keplerian
+    rotation parameters for one filament, hotspot, or RT spike.
+
+    Args:
+        row_indices: affected radial row indices, shape (n_affected,).
+            Typically 2-8 rows for filaments, 40-100 for hotspots, 10-40 for RT spikes.
+        phi_density: density contribution at affected rows, shape (n_affected, n_phi).
+            Pre-computed at birth, rotated via np.roll each frame.
+        phi_temp: temperature contribution at affected rows, shape (n_affected, n_phi).
+            Same rotation as phi_density.
+        omega: Keplerian angular velocity at entity center (rad/s).
+            Used to compute per-frame azimuthal shift.
+        birth_time: wall-clock time when entity was spawned (seconds).
+        lifetime: total alive duration excluding fade periods (seconds).
+        fade_in: fade-in duration (seconds). Entity alpha ramps 0→1.
+        fade_out: fade-out duration (seconds). Entity alpha ramps 1→0.
+
+    Physical Meaning:
+        Represents a localized structure in the accretion disk with a finite
+        lifespan. Undergoes Keplerian rotation at its radial position, fading
+        in at birth and fading out at death to avoid visual pops.
+
+    Simplifications:
+        Uses a single omega for all rows (ignores differential rotation within
+        the entity's narrow radial extent).
+    """
+    row_indices: np.ndarray
+    phi_density: np.ndarray
+    phi_temp: np.ndarray
+    omega: float
+    birth_time: float
+    lifetime: float
+    fade_in: float
+    fade_out: float
+
+    @property
+    def total_duration(self) -> float:
+        """Total time from birth to fully faded out."""
+        return self.fade_in + self.lifetime + self.fade_out
+
+    def is_dead(self, now: float) -> bool:
+        """Whether the entity has fully faded out and should be recycled."""
+        return (now - self.birth_time) >= self.total_duration
+
+    def fade_factor(self, now: float) -> float:
+        """Compute current fade alpha based on age.
+
+        Returns:
+            alpha in [0, 1]: 0 during pre-birth or post-death,
+            linear ramp during fade-in/out, 1.0 during alive phase.
+
+        Formula:
+            age = now - birth_time
+            if age < fade_in:       alpha = age / fade_in
+            elif age < fade_in + lifetime: alpha = 1.0
+            elif age < total_duration:     alpha = 1.0 - (age - fade_in - lifetime) / fade_out
+            else:                          alpha = 0.0
+        """
+        age = now - self.birth_time
+        if age < 0:
+            return 0.0
+        if age < self.fade_in:
+            return age / self.fade_in if self.fade_in > 0 else 1.0
+        age_after_fade_in = age - self.fade_in
+        if age_after_fade_in < self.lifetime:
+            return 1.0
+        age_in_fade_out = age_after_fade_in - self.lifetime
+        if age_in_fade_out < self.fade_out:
+            return 1.0 - age_in_fade_out / self.fade_out if self.fade_out > 0 else 0.0
+        return 0.0
+
+
+class EntityFactory:
+    """Manages lifecycle of entity instances — spawning, aging, and recycling.
+
+    Maintains a pool of alive entities, spawning new ones at a controlled rate
+    to maintain a target count. Dead entities are automatically removed.
+
+    Args:
+        spawn_fn: callable(rng, n_r, n_phi, r_norm_all, omega_all) -> (row_indices, phi_density, phi_temp, omega).
+            The single-instance generation function (e.g. _spawn_single_filament).
+        target_count: desired number of alive entities at steady state.
+        lifetime_range: (min_seconds, max_seconds) for entity lifetime.
+        fade_in: fade-in duration in seconds.
+        fade_out: fade-out duration in seconds.
+        n_r: radial resolution.
+        n_phi: azimuthal resolution.
+        r_norm_all: normalized radial positions, shape (n_r,).
+        omega_all: Keplerian angular velocity per row, shape (n_r,).
+        seed: random seed for reproducibility.
+
+    Physical Meaning:
+        Models the continuous birth and death of transient structures in the
+        accretion disk. The target_count and lifetime_range determine the
+        visual density and turnover rate of structures.
+    """
+
+    def __init__(self, spawn_fn, target_count: int,
+                 lifetime_range: Tuple[float, float],
+                 fade_in: float, fade_out: float,
+                 n_r: int, n_phi: int,
+                 r_norm_all: np.ndarray, omega_all: np.ndarray,
+                 seed: int = 0):
+        self.spawn_fn = spawn_fn
+        self.target_count = target_count
+        self.lifetime_range = lifetime_range
+        self.fade_in = fade_in
+        self.fade_out = fade_out
+        self.n_r = n_r
+        self.n_phi = n_phi
+        self.r_norm_all = r_norm_all
+        self.omega_all = omega_all
+        self.rng = np.random.default_rng(seed)
+        self.entities: List[EntityInstance] = []
+        self._spawn_debt = 0.0
+
+    def _spawn_one(self, now: float) -> EntityInstance:
+        """Spawn a single entity at the current time."""
+        row_indices, phi_density, phi_temp, omega = self.spawn_fn(
+            self.rng, self.n_r, self.n_phi, self.r_norm_all, self.omega_all)
+        lifetime = float(self.rng.uniform(*self.lifetime_range))
+        return EntityInstance(
+            row_indices=row_indices,
+            phi_density=phi_density,
+            phi_temp=phi_temp,
+            omega=omega,
+            birth_time=now,
+            lifetime=lifetime,
+            fade_in=self.fade_in,
+            fade_out=self.fade_out,
+        )
+
+    def seed_initial(self, now: float) -> None:
+        """Pre-populate with target_count entities at staggered ages.
+
+        Distributes entities uniformly across their lifecycle so that the
+        visual result is immediately at steady state, avoiding a "cold start"
+        where all entities fade in simultaneously.
+
+        Args:
+            now: current wall-clock time in seconds
+        """
+        for i in range(self.target_count):
+            entity = self._spawn_one(now)
+            max_age = entity.fade_in + entity.lifetime
+            stagger = max_age * (i / max(self.target_count, 1))
+            entity.birth_time = now - stagger
+            self.entities.append(entity)
+
+    def tick(self, now: float, dt: float) -> None:
+        """Advance the factory by one frame: remove dead, spawn replacements.
+
+        Args:
+            now: current wall-clock time in seconds
+            dt: time elapsed since last frame (seconds)
+        """
+        self.entities = [e for e in self.entities if not e.is_dead(now)]
+
+        deficit = self.target_count - len(self.entities)
+        if deficit <= 0:
+            return
+
+        avg_lifetime = sum(self.lifetime_range) / 2.0
+        spawn_rate = self.target_count / avg_lifetime
+        self._spawn_debt += spawn_rate * dt
+        n_spawn = min(int(self._spawn_debt), deficit)
+        self._spawn_debt -= n_spawn
+
+        for _ in range(n_spawn):
+            self.entities.append(self._spawn_one(now))
+
+    @property
+    def alive_entities(self) -> List['EntityInstance']:
+        """Return list of currently alive (not fully dead) entities."""
+        return self.entities
+
+
 def _generate_temperature_base(rng: np.random.Generator, n_r: int, n_phi: int,
                                r_norm_grid: np.ndarray) -> np.ndarray:
     """生成吸积盘基础温度场（不含动态旋转）。"""
@@ -1354,6 +1539,243 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
     return hotspot, temp_contribution
 
 
+# ============================================================================
+# 单实例生成函数（供实体生命周期系统使用）
+# ============================================================================
+
+def _spawn_single_filament(rng: np.random.Generator, n_r: int, n_phi: int,
+                           r_norm_all: np.ndarray, omega_all: np.ndarray
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Generate a single filament instance for entity lifecycle system.
+
+    Creates one filament composed of 2-4 sub-segments, computing density and
+    temperature contributions only on affected rows (sparse representation).
+    Parameters match _generate_filaments inner loop statistics.
+
+    Args:
+        rng: numpy random generator
+        n_r: total number of radial rows
+        n_phi: number of azimuthal columns
+        r_norm_all: normalized radial position for each row, shape (n_r,)
+        omega_all: Keplerian angular velocity for each row, shape (n_r,)
+
+    Returns:
+        (row_indices, phi_density, phi_temp, omega):
+        - row_indices: int array of affected row indices, shape (n_affected,)
+        - phi_density: density contribution, shape (n_affected, n_phi)
+        - phi_temp: temperature contribution, shape (n_affected, n_phi)
+        - omega: Keplerian angular velocity at entity center (rad/s)
+
+    Physical Meaning:
+        Represents a magnetic filament — a thin, arc-shaped structure formed by
+        magnetic reconnection or shear flow in the accretion disk. Each filament
+        is narrow radially (2-5 rows) but extends azimuthally (~180-430 degrees).
+    """
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+
+    base_phi = float(rng.uniform(0, 2 * np.pi))
+    r_pos = float(rng.uniform(0.05, 0.95))
+    base_r = 0.05 + r_pos ** 0.6 * 0.9
+    base_width = float(rng.uniform(0.002, 0.008))
+    total_length = float(rng.uniform(0.5, 1.2))
+    intensity = float(rng.uniform(0.7, 1.0))
+    delta_T = 0.3 + 0.6 * float(rng.power(0.3))
+
+    # 受影响行（5 sigma 截断）
+    r_min = base_r - 5 * base_width
+    r_max = base_r + 5 * base_width
+    row_mask = (r_norm_all >= r_min) & (r_norm_all <= r_max)
+    row_indices = np.where(row_mask)[0]
+
+    if len(row_indices) == 0:
+        center_idx = int(np.argmin(np.abs(r_norm_all - base_r)))
+        row_indices = np.array([center_idx])
+
+    r_subset = r_norm_all[row_indices]
+    n_rows = len(row_indices)
+
+    phi_density = np.zeros((n_rows, n_phi), dtype=np.float32)
+    phi_temp = np.zeros((n_rows, n_phi), dtype=np.float32)
+
+    sub_count = int(rng.integers(2, 5))
+    sub_fill = float(rng.uniform(0.35, 0.55))
+    sub_lengths = rng.uniform(0.08, 0.20, sub_count)
+    sub_lengths = sub_lengths / sub_lengths.sum() * total_length * sub_fill
+
+    sub_starts = np.zeros(sub_count)
+    sub_starts[0] = base_phi
+    for j in range(1, sub_count):
+        gap = float(rng.uniform(0.08, 0.20))
+        sub_starts[j] = sub_starts[j - 1] + sub_lengths[j - 1] + gap
+
+    sub_widths = np.clip(base_width * rng.uniform(0.3, 3.0, sub_count), 0.001, 0.025)
+    sub_intensities = intensity * rng.uniform(0.15, 1.0, sub_count)
+
+    for j in range(sub_count):
+        phi_range = sub_lengths[j] / (base_r + 0.01)
+        phi_half_width = max(phi_range * 0.7, 0.2)
+        kappa = 1.5 / (phi_half_width ** 2)
+        phi_prof = np.exp(kappa * (np.cos(phi - sub_starts[j]) - 1))
+
+        for k in range(n_rows):
+            r_diff = r_subset[k] - base_r
+            r_prof = np.exp(-0.5 * (r_diff / (sub_widths[j] + 1e-8)) ** 2)
+            phi_density[k] += phi_prof * r_prof * sub_intensities[j]
+            phi_temp[k] += phi_prof * r_prof * sub_intensities[j] * delta_T * 0.7
+
+    phi_density = np.clip(phi_density, 0, 1)
+    phi_temp = np.clip(phi_temp, 0, phi_density * 0.5)
+
+    center_idx = int(np.argmin(np.abs(r_norm_all - base_r)))
+    omega = float(omega_all[center_idx])
+
+    return row_indices, phi_density, phi_temp, omega
+
+
+def _spawn_single_hotspot(rng: np.random.Generator, n_r: int, n_phi: int,
+                          r_norm_all: np.ndarray, omega_all: np.ndarray
+                          ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Generate a single hotspot instance for entity lifecycle system.
+
+    Creates one hotspot — an approximately circular bright patch. Parameters
+    match _generate_hotspots statistics.
+
+    Args:
+        rng: numpy random generator
+        n_r: total number of radial rows
+        n_phi: number of azimuthal columns
+        r_norm_all: normalized radial position for each row, shape (n_r,)
+        omega_all: Keplerian angular velocity for each row, shape (n_r,)
+
+    Returns:
+        (row_indices, phi_density, phi_temp, omega):
+        - row_indices: int array of affected row indices, shape (n_affected,)
+        - phi_density: density contribution, shape (n_affected, n_phi)
+        - phi_temp: temperature contribution, shape (n_affected, n_phi)
+        - omega: Keplerian angular velocity at entity center (rad/s)
+
+    Physical Meaning:
+        Represents a localized high-temperature region in the accretion disk,
+        caused by magnetic reconnection or shock collisions. Approximately
+        circular in shape, with both radial and azimuthal Gaussian profiles.
+    """
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+
+    h_phi = float(rng.uniform(0, 2 * np.pi))
+    r_rand = float(rng.uniform(0, 1))
+    h_r = 0.1 + r_rand ** 0.6 * 0.85
+    h_phi_width = float(rng.uniform(0.08, 0.20))
+    h_r_width = 0.02 + float(rng.uniform(0, 0.03))
+    h_intensity = 0.3 + (1 - h_r) * 0.6 + float(rng.uniform(0, 0.1))
+    h_delta_T = 0.5 + 2.5 * float(rng.power(0.4))
+
+    # 受影响行（3 sigma 截断）
+    r_min = h_r - 3 * h_r_width
+    r_max = h_r + 3 * h_r_width
+    row_mask = (r_norm_all >= r_min) & (r_norm_all <= r_max)
+    row_indices = np.where(row_mask)[0]
+
+    if len(row_indices) == 0:
+        center_idx = int(np.argmin(np.abs(r_norm_all - h_r)))
+        row_indices = np.array([center_idx])
+
+    r_subset = r_norm_all[row_indices]
+    n_rows = len(row_indices)
+
+    kappa = 1.5 / (h_phi_width ** 2)
+    phi_prof = np.exp(kappa * (np.cos(phi - h_phi) - 1))
+
+    phi_density = np.zeros((n_rows, n_phi), dtype=np.float32)
+    phi_temp = np.zeros((n_rows, n_phi), dtype=np.float32)
+
+    for k in range(n_rows):
+        r_diff = r_subset[k] - h_r
+        r_prof = np.exp(-0.5 * (r_diff / (h_r_width + 1e-8)) ** 2)
+        phi_density[k] = phi_prof * r_prof * h_intensity
+        phi_temp[k] = phi_density[k] * 0.12
+
+    phi_density = np.clip(phi_density, 0, 1)
+    phi_temp = np.clip(phi_temp, 0, 1)
+
+    center_idx = int(np.argmin(np.abs(r_norm_all - h_r)))
+    omega = float(omega_all[center_idx])
+
+    return row_indices, phi_density, phi_temp, omega
+
+
+def _spawn_single_rt_spike(rng: np.random.Generator, n_r: int, n_phi: int,
+                           r_norm_all: np.ndarray, omega_all: np.ndarray
+                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Generate a single RT spike instance for entity lifecycle system.
+
+    Creates one Rayleigh-Taylor instability spike. Parameters match
+    _generate_rt_spikes statistics. RT spikes are biased toward the inner disk.
+
+    Args:
+        rng: numpy random generator
+        n_r: total number of radial rows
+        n_phi: number of azimuthal columns
+        r_norm_all: normalized radial position for each row, shape (n_r,)
+        omega_all: Keplerian angular velocity for each row, shape (n_r,)
+
+    Returns:
+        (row_indices, phi_density, phi_temp, omega):
+        - row_indices: int array of affected row indices, shape (n_affected,)
+        - phi_density: density contribution, shape (n_affected, n_phi)
+        - phi_temp: temperature contribution, shape (n_affected, n_phi)
+        - omega: Keplerian angular velocity at entity center (rad/s)
+
+    Physical Meaning:
+        Represents a Rayleigh-Taylor instability — a radial finger-like structure
+        near the inner disk edge, where denser outer material plunges inward.
+        Biased toward small r_norm (inner disk) with power-law distribution.
+    """
+    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+
+    rt_phi = float(rng.uniform(0, 2 * np.pi))
+    rt_r_base = float(np.power(rng.uniform(0.01, 0.15), 1.5))
+    rt_phi_width = float(rng.uniform(0.08, 0.20))
+    rt_r_length = float(rng.uniform(0.08, 0.20))
+    rt_intensity = float(rng.uniform(0.8, 1.0))
+    rt_delta_T = float(rng.uniform(0.5, 1.2))
+
+    # 受影响行：从 r_base 向外延伸 2*r_length
+    r_min = max(rt_r_base - 0.02, 0.0)
+    r_max = rt_r_base + rt_r_length * 2.5
+    row_mask = (r_norm_all >= r_min) & (r_norm_all <= r_max)
+    row_indices = np.where(row_mask)[0]
+
+    if len(row_indices) == 0:
+        center_idx = int(np.argmin(np.abs(r_norm_all - rt_r_base)))
+        row_indices = np.array([center_idx])
+
+    r_subset = r_norm_all[row_indices]
+    n_rows = len(row_indices)
+
+    rt_phi_kappa = 1.5 / (rt_phi_width ** 2)
+    phi_prof = np.exp(rt_phi_kappa * (np.cos(phi - rt_phi) - 1))
+
+    phi_density = np.zeros((n_rows, n_phi), dtype=np.float32)
+    phi_temp = np.zeros((n_rows, n_phi), dtype=np.float32)
+
+    for k in range(n_rows):
+        rt_r_diff = r_subset[k] - rt_r_base
+        r_fade_out = np.clip(rt_r_length * 2 - rt_r_diff, 0, 1)
+        r_fade_in = np.clip((r_subset[k] - rt_r_base) / (rt_r_length * 0.3 + 1e-8), 0, 1)
+        rt_r_prof = (np.exp(-0.5 * (rt_r_diff / (rt_r_length * 0.4 + 1e-8)) ** 2)
+                     * r_fade_out * r_fade_in)
+        phi_density[k] = phi_prof * rt_r_prof * rt_intensity
+        phi_temp[k] = phi_density[k] * rt_delta_T
+
+    phi_density = np.clip(phi_density, 0, 1)
+
+    center_r = rt_r_base + rt_r_length * 0.5
+    center_idx = int(np.argmin(np.abs(r_norm_all - center_r)))
+    omega = float(omega_all[center_idx])
+
+    return row_indices, phi_density, phi_temp, omega
+
+
 def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
                           r_inner: float = 2.0, r_outer: float = 3.5,
                           enable_rt: bool = True, color_temp: float = None,
@@ -1753,6 +2175,28 @@ class TaichiRenderer:
         self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.final_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
 
+        # Simplex noise 排列表（标准 Ken Perlin 排列，重复一次以处理溢出）
+        _perm = [
+            151,160,137,91,90,15,131,13,201,95,96,53,194,233,7,225,
+            140,36,103,30,69,142,8,99,37,240,21,10,23,190,6,148,
+            247,120,234,75,0,26,197,62,94,252,219,203,117,35,11,32,
+            57,177,33,88,237,149,56,87,174,20,125,136,171,168,68,175,
+            74,165,71,134,139,48,27,166,77,146,158,231,83,111,229,122,
+            60,211,133,230,220,105,92,41,55,46,245,40,244,102,143,54,
+            65,25,63,161,1,216,80,73,209,76,132,187,208,89,18,169,
+            200,196,135,130,116,188,159,86,164,100,109,198,173,186,3,64,
+            52,217,226,250,124,123,5,202,38,147,118,126,255,82,85,212,
+            207,206,59,227,47,16,58,17,182,189,28,42,223,183,170,213,
+            119,248,152,2,44,154,163,70,221,153,101,155,167,43,172,9,
+            129,22,39,253,19,98,108,110,79,113,224,232,178,185,112,104,
+            218,246,97,228,251,34,242,193,238,210,144,12,191,179,162,241,
+            81,51,145,235,249,14,239,107,49,192,214,31,181,199,106,157,
+            184,84,204,176,115,121,50,45,127,4,150,254,138,236,205,93,
+            222,114,67,29,24,72,243,141,128,195,78,66,215,61,156,180,
+        ]
+        self.perm_field = ti.field(ti.i32, shape=(512,))
+        self.perm_field.from_numpy(np.array(_perm + _perm, dtype=np.int32))
+
         self._compile_kernels()
 
     def update_disk_texture(self, new_disk_tex: np.ndarray) -> None:
@@ -2101,6 +2545,154 @@ class TaichiRenderer:
                     c10 * fu * (1 - fv) +
                     c01 * (1 - fu) * fv +
                     c11 * fu * fv)
+
+        # ---- 3D Simplex Noise + FBM ----
+        perm_field = self.perm_field
+
+        @ti.func
+        def _grad3_dot(hash_val, x, y, z):
+            """Compute dot product of gradient vector selected by hash with (x, y, z).
+
+            Selects one of 12 gradient directions lying along cube edges,
+            then returns the dot product with the offset vector.
+
+            Args:
+                hash_val: integer hash selecting one of 12 gradient directions
+                x, y, z: offset vector components from simplex corner
+            Returns:
+                dot product (float), contributes to final noise in approx [-1, 1]
+            """
+            h = hash_val % 12
+            u = x if h < 8 else y
+            v = y if h < 4 else (x if h == 12 or h == 14 else z)
+            r1 = u if h & 1 == 0 else -u
+            r2 = v if h & 2 == 0 else -v
+            return r1 + r2
+
+        @ti.func
+        def _simplex_noise_3d(x, y, z):
+            """3D simplex noise based on Stefan Gustavson's implementation.
+
+            Evaluates coherent gradient noise on a simplex (tetrahedral) lattice.
+            The simplex grid is obtained by skewing the input coordinate space.
+
+            Args:
+                x, y, z: input coordinates (float, any range)
+            Returns:
+                noise value in [-1, 1]
+
+            Formula:
+                n = 32 * sum_i( max(0.6 - |d_i|^2, 0)^4 * grad_i . d_i )
+                where d_i is the offset from simplex corner i,
+                grad_i is a pseudo-random gradient from a permutation table.
+
+            Physical Meaning:
+                Provides spatially coherent pseudo-random values for procedural
+                texture generation. Used as building block for FBM.
+            """
+            F3 = 1.0 / 3.0
+            G3 = 1.0 / 6.0
+
+            s = (x + y + z) * F3
+            i = ti.cast(ti.floor(x + s), ti.i32)
+            j = ti.cast(ti.floor(y + s), ti.i32)
+            k = ti.cast(ti.floor(z + s), ti.i32)
+
+            t = ti.cast(i + j + k, ti.f32) * G3
+            x0 = x - (ti.cast(i, ti.f32) - t)
+            y0 = y - (ti.cast(j, ti.f32) - t)
+            z0 = z - (ti.cast(k, ti.f32) - t)
+
+            # 确定所在单纯形（6 种排列之一）
+            i1 = 0; j1 = 0; k1 = 0
+            i2 = 0; j2 = 0; k2 = 0
+            if x0 >= y0:
+                if y0 >= z0:
+                    i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 1; k2 = 0
+                elif x0 >= z0:
+                    i1 = 1; j1 = 0; k1 = 0; i2 = 1; j2 = 0; k2 = 1
+                else:
+                    i1 = 0; j1 = 0; k1 = 1; i2 = 1; j2 = 0; k2 = 1
+            else:
+                if y0 < z0:
+                    i1 = 0; j1 = 0; k1 = 1; i2 = 0; j2 = 1; k2 = 1
+                elif x0 < z0:
+                    i1 = 0; j1 = 1; k1 = 0; i2 = 0; j2 = 1; k2 = 1
+                else:
+                    i1 = 0; j1 = 1; k1 = 0; i2 = 1; j2 = 1; k2 = 0
+
+            x1 = x0 - ti.cast(i1, ti.f32) + G3
+            y1 = y0 - ti.cast(j1, ti.f32) + G3
+            z1 = z0 - ti.cast(k1, ti.f32) + G3
+            x2 = x0 - ti.cast(i2, ti.f32) + 2.0 * G3
+            y2 = y0 - ti.cast(j2, ti.f32) + 2.0 * G3
+            z2 = z0 - ti.cast(k2, ti.f32) + 2.0 * G3
+            x3 = x0 - 1.0 + 3.0 * G3
+            y3 = y0 - 1.0 + 3.0 * G3
+            z3 = z0 - 1.0 + 3.0 * G3
+
+            ii = i & 255
+            jj = j & 255
+            kk = k & 255
+            gi0 = perm_field[ii + perm_field[jj + perm_field[kk]]]
+            gi1 = perm_field[ii + i1 + perm_field[jj + j1 + perm_field[kk + k1]]]
+            gi2 = perm_field[ii + i2 + perm_field[jj + j2 + perm_field[kk + k2]]]
+            gi3 = perm_field[ii + 1 + perm_field[jj + 1 + perm_field[kk + 1]]]
+
+            n = 0.0
+            t0 = 0.6 - x0 * x0 - y0 * y0 - z0 * z0
+            if t0 >= 0.0:
+                t0 = t0 * t0
+                n += t0 * t0 * _grad3_dot(gi0, x0, y0, z0)
+            t1 = 0.6 - x1 * x1 - y1 * y1 - z1 * z1
+            if t1 >= 0.0:
+                t1 = t1 * t1
+                n += t1 * t1 * _grad3_dot(gi1, x1, y1, z1)
+            t2 = 0.6 - x2 * x2 - y2 * y2 - z2 * z2
+            if t2 >= 0.0:
+                t2 = t2 * t2
+                n += t2 * t2 * _grad3_dot(gi2, x2, y2, z2)
+            t3 = 0.6 - x3 * x3 - y3 * y3 - z3 * z3
+            if t3 >= 0.0:
+                t3 = t3 * t3
+                n += t3 * t3 * _grad3_dot(gi3, x3, y3, z3)
+
+            return 32.0 * n
+
+        @ti.func
+        def _fbm_3d(x, y, z, octaves, persistence, lacunarity):
+            """Fractal Brownian motion using 3D simplex noise.
+
+            Accumulates multiple octaves of simplex noise with geometrically
+            decaying amplitude and increasing frequency, producing self-similar
+            fractal patterns at multiple scales.
+
+            Args:
+                x, y, z: input coordinates (float, any range)
+                octaves: number of noise layers to sum (int, typically 3-6)
+                persistence: amplitude decay per octave (float, typically 0.4-0.6;
+                    higher = more high-frequency detail)
+                lacunarity: frequency multiplier per octave (float, typically 2.0)
+            Returns:
+                accumulated noise value (float). Range depends on octaves and
+                persistence; for persistence=0.5 and 4 octaves, approx [-1.87, 1.87].
+
+            Formula:
+                fbm = sum_{i=0}^{octaves-1} persistence^i * noise(x * lac^i, y * lac^i, z * lac^i)
+
+            Physical Meaning:
+                Generates natural-looking turbulent patterns for accretion disk
+                background layer. The time coordinate (z or dedicated t axis)
+                provides smooth temporal evolution without Keplerian wrap artifacts.
+            """
+            value = 0.0
+            amplitude = 1.0
+            freq = 1.0
+            for _ in range(octaves):
+                value += amplitude * _simplex_noise_3d(x * freq, y * freq, z * freq)
+                amplitude *= persistence
+                freq *= lacunarity
+            return value
 
         @ti.kernel
         def _ray_march_kernel(image_field: ti.template(), disk_layer_field: ti.template(),
@@ -2619,6 +3211,531 @@ class TaichiRenderer:
 
         self._compose_final_kernel = _compose_final_kernel
 
+        # ---- 噪声评估 kernel（供测试和调试使用）----
+        @ti.kernel
+        def _noise_eval_kernel(out: ti.template(), coords: ti.template(),
+                               mode: ti.i32, octaves: ti.i32,
+                               persistence: ti.f32, lacunarity: ti.f32):
+            """Evaluate simplex noise or FBM at given coordinates.
+
+            Args:
+                out: output field, shape (N,), stores noise values
+                coords: input field, shape (N, 3), xyz coordinates
+                mode: 0 = simplex_noise_3d, 1 = fbm_3d
+                octaves: FBM octave count (only used when mode=1)
+                persistence: FBM persistence (only used when mode=1)
+                lacunarity: FBM lacunarity (only used when mode=1)
+            """
+            for i in out:
+                cx = coords[i, 0]
+                cy = coords[i, 1]
+                cz = coords[i, 2]
+                if mode == 0:
+                    out[i] = _simplex_noise_3d(cx, cy, cz)
+                else:
+                    out[i] = _fbm_3d(cx, cy, cz, octaves, persistence, lacunarity)
+
+        self._noise_eval_kernel = _noise_eval_kernel
+
+        # ---- 背景层实时生成 kernel（宽 r 组件）----
+        _MAX_BG_SPIRAL_ARMS = 8
+
+        @ti.kernel
+        def _generate_background_kernel(
+                comp: ti.template(),
+                spiral_params: ti.template(),
+                n_arms: ti.i32,
+                az_freq: ti.i32,
+                az_shear: ti.f32,
+                r_inner: ti.f32,
+                r_outer: ti.f32,
+                t: ti.f32):
+            """Generate wide-r background components using time-varying 3D noise.
+
+            Writes to comp_field at indices [0,1,2,3,4,11,12] for the 5 wide-r
+            components: temp_base, spiral/spiral_temp, turbulence/turb_temp,
+            az_hotspot, disturb_mod.
+
+            Noise coordinates use Keplerian-rotated phi: phi_rot = phi - omega(r)*t,
+            mapped via (cos(phi_rot), sin(phi_rot)) for seamless wrapping. This gives
+            differential rotation without pre-computed array roll or wrap artifacts.
+            The t axis in noise provides slow morphological evolution on top of rotation.
+
+            Args:
+                comp: component field (13, n_r, n_phi) — output for indices 0-4, 11, 12
+                spiral_params: per-arm parameters (MAX_ARMS, 7):
+                    [base_angle, r_start, r_end, rotations, width, intensity, delta_T]
+                n_arms: number of active spiral arms
+                az_freq: azimuthal hotspot frequency (integer, typically 2-4)
+                az_shear: azimuthal hotspot shear strength (float, typically 2-4)
+                r_inner: inner disk radius (physical units)
+                r_outer: outer disk radius (physical units)
+                t: wall-clock time in seconds for temporal evolution
+            """
+            n_r = comp.shape[1]
+            n_phi = comp.shape[2]
+            pi2 = 2.0 * ti.math.pi
+
+            for ri, phi_i in ti.ndrange(n_r, n_phi):
+                r = ti.cast(ri, ti.f32) / ti.cast(n_r, ti.f32)
+                phi = ti.cast(phi_i, ti.f32) / ti.cast(n_phi, ti.f32) * pi2
+
+                # 开普勒旋转：每行以自身角速度旋转，内快外慢
+                # phi + omega*t 使模式沿 -phi 方向移动，与实体层 np.roll(-shift) 一致
+                r_phys = r_inner + (r_outer - r_inner) * r
+                omega = ti.sqrt(0.5 / (r_phys * r_phys * r_phys + 1e-6))
+                phi_rot = phi + omega * t
+                cx = ti.cos(phi_rot)
+                cy = ti.sin(phi_rot)
+
+                # --- idx 0: temp_base ---
+                # 径向衰减 + 慢速 FBM 噪声调制
+                decay = ti.pow(ti.max(1.0 - r, 0.0), 1.3)
+                tb_noise = _fbm_3d(cx * 8.0, cy * 8.0, r * 8.0 + t * 0.05,
+                                   4, 0.6, 2.0)
+                comp[0, ri, phi_i] = decay * (0.85 + 0.15 * tb_noise) * 0.25
+
+                # --- idx 1,2: spiral / spiral_temp ---
+                # 参数化对数螺旋几何 + 噪声调制宽度/强度
+                spiral_val = 0.0
+                spiral_temp_val = 0.0
+                for arm_idx in ti.static(range(_MAX_BG_SPIRAL_ARMS)):
+                    if arm_idx < n_arms:
+                        base_angle = spiral_params[arm_idx, 0]
+                        r_start = spiral_params[arm_idx, 1]
+                        r_end = spiral_params[arm_idx, 2]
+                        rotations = spiral_params[arm_idx, 3]
+                        width = spiral_params[arm_idx, 4]
+                        intensity = spiral_params[arm_idx, 5]
+                        delta_T = spiral_params[arm_idx, 6]
+
+                        arm_angle = phi_rot - base_angle + r * rotations * pi2
+
+                        # 噪声调制宽度（低频，时变）
+                        w_n = _fbm_3d(
+                            cx * 3.0 + ti.cast(arm_idx, ti.f32) * 7.1,
+                            cy * 3.0,
+                            r * 3.0 + t * 0.03,
+                            2, 0.5, 2.0)
+                        width_mod = ti.max(0.2 + 1.5 * (0.5 + 0.5 * w_n), 0.15)
+
+                        kappa = 1.5 / (width * width + 1e-6)
+                        arm_v = ti.exp(kappa * (ti.cos(arm_angle) - 1.0) * width_mod)
+
+                        # 径向 mask（软边）
+                        fade_e = 0.02
+                        fi = ti.min(ti.max((r - r_start) / fade_e, 0.0), 1.0)
+                        fo = ti.min(ti.max((r_end - r) / fade_e, 0.0), 1.0)
+
+                        # 噪声驱动的碎片化（取代 CPU 的 sub-arm 离散分段）
+                        frag_n = _fbm_3d(
+                            cx * 2.0 + ti.cast(arm_idx, ti.f32) * 17.3,
+                            cy * 2.0,
+                            r * 4.0 + t * 0.02,
+                            2, 0.6, 2.0)
+                        frag_mask = ti.min(ti.max(frag_n * 1.5 + 0.3, 0.0), 1.0)
+
+                        # 强度调制
+                        int_n = _fbm_3d(
+                            cx * 6.0 + ti.cast(arm_idx, ti.f32) * 13.7,
+                            cy * 6.0,
+                            r * 6.0 + t * 0.08,
+                            3, 0.5, 2.0)
+                        int_mod = 0.1 + 0.9 * ti.pow(
+                            ti.max(0.5 + 0.5 * int_n, 0.001), 0.15)
+
+                        arm_v *= fi * fo * intensity * int_mod * frag_mask
+                        spiral_val += arm_v
+                        spiral_temp_val += arm_v * delta_T
+
+                spiral_val = ti.min(spiral_val, 1.0)
+                comp[1, ri, phi_i] = spiral_val
+                comp[2, ri, phi_i] = spiral_temp_val
+
+                # --- idx 3,4: turbulence / turb_temp ---
+                # 多尺度时变噪声叠加
+                t_coarse = (0.5 + 0.5 * _fbm_3d(
+                    cx * 8.0, cy * 8.0, r * 4.0 + t * 0.06,
+                    3, 0.45, 2.0)) * 0.08
+                t_mid = (0.5 + 0.5 * _fbm_3d(
+                    cx * 24.0, cy * 24.0, r * 12.0 + t * 0.08,
+                    4, 0.45, 2.0)) * 0.15
+                t_fine = (0.5 + 0.5 * _fbm_3d(
+                    cx * 80.0, cy * 80.0, r * 40.0 + t * 0.1,
+                    5, 0.45, 2.0)) * 0.25
+                t_extra = (0.5 + 0.5 * _fbm_3d(
+                    cx * 200.0, cy * 200.0, r * 100.0 + t * 0.12,
+                    4, 0.4, 2.0)) * 0.22
+                t_ultra = (0.5 + 0.5 * _fbm_3d(
+                    cx * 400.0, cy * 400.0, r * 200.0 + t * 0.15,
+                    3, 0.35, 2.0)) * 0.18
+                t_pixel = ti.max(
+                    _simplex_noise_3d(cx * 800.0, cy * 800.0,
+                                      r * 400.0 + t * 0.2),
+                    0.0) * 0.12
+                turb = ti.min(ti.max(
+                    t_coarse + t_mid + t_fine + t_extra + t_ultra + t_pixel,
+                    0.0), 1.0)
+                comp[3, ri, phi_i] = turb
+                comp[4, ri, phi_i] = 0.05 * turb
+
+                # --- idx 11: az_hotspot ---
+                # 低频正弦方位波 * 噪声调制（使用旋转后的 phi）
+                shear = ti.pow(r, 1.2) * az_shear
+                az_wave = 0.5 + 0.5 * ti.sin(
+                    (phi_rot + shear) * ti.cast(az_freq, ti.f32))
+                az_n = _fbm_3d(cx * 3.0, cy * 3.0, r * 3.0 + t * 0.04,
+                               3, 0.5, 2.0)
+                comp[11, ri, phi_i] = az_wave * ti.max(0.5 + 0.5 * az_n, 0.0)
+
+                # --- idx 12: disturb_mod ---
+                # 多层扰动调制场（t 演化极慢，旋转由 phi_rot 主导）
+                d_coarse = (0.5 + 0.5 * _fbm_3d(
+                    cx * 8.0, cy * 8.0, r * 4.0 + t * 0.003,
+                    3, 0.5, 2.0)) * 0.05
+                d_mid = (0.5 + 0.5 * _fbm_3d(
+                    cx * 32.0, cy * 32.0, r * 16.0 + t * 0.005,
+                    3, 0.5, 2.0)) * 0.15
+                d_fine = (0.5 + 0.5 * _fbm_3d(
+                    cx * 100.0, cy * 100.0, r * 50.0 + t * 0.006,
+                    4, 0.45, 2.0)) * 0.30
+                d_extra = (0.5 + 0.5 * _fbm_3d(
+                    cx * 250.0, cy * 250.0, r * 125.0 + t * 0.008,
+                    4, 0.4, 2.0)) * 0.30
+                d_pixel = ti.max(
+                    _simplex_noise_3d(cx * 500.0, cy * 500.0,
+                                      r * 250.0 + t * 0.01),
+                    0.0) * 0.20
+                disturb_raw = (d_coarse + d_mid + d_fine + d_extra + d_pixel) * 1.4
+                disturb_raw = ti.min(ti.max(disturb_raw, 0.05), 1.0)
+                radial_preserve = 0.6 + 0.4 * r
+                comp[12, ri, phi_i] = ti.min(ti.max(
+                    disturb_raw * radial_preserve, 0.1), 1.0)
+
+        self._generate_background_kernel = _generate_background_kernel
+
+        @ti.kernel
+        def _copy_entity_staging_to_comp(comp: ti.template(),
+                                         staging: ti.template()):
+            """Copy entity staging field (6, n_r, n_phi) to comp[5:10].
+
+            Args:
+                comp: component field (13, n_r, n_phi)
+                staging: entity staging field (6, n_r, n_phi), maps to:
+                    staging[0] -> comp[5]  (arcs / filaments density)
+                    staging[1] -> comp[6]  (arcs_temp)
+                    staging[2] -> comp[7]  (rt_spikes)
+                    staging[3] -> comp[8]  (rt_temp)
+                    staging[4] -> comp[9]  (hotspot)
+                    staging[5] -> comp[10] (hotspot_temp)
+            """
+            for idx, ri, phi_i in staging:
+                comp[5 + idx, ri, phi_i] = staging[idx, ri, phi_i]
+
+        self._copy_entity_staging_to_comp = _copy_entity_staging_to_comp
+
+        @ti.kernel
+        def _zero_comp_slice(comp: ti.template(), idx: ti.i32):
+            """Zero out a single component slice of comp_field."""
+            for ri, phi_i in ti.ndrange(comp.shape[1], comp.shape[2]):
+                comp[idx, ri, phi_i] = 0.0
+
+        self._zero_comp_slice = _zero_comp_slice
+
+        @ti.kernel
+        def _fill_comp_slice(comp: ti.template(), idx: ti.i32, val: ti.f32):
+            """Fill a single component slice of comp_field with a constant."""
+            for ri, phi_i in ti.ndrange(comp.shape[1], comp.shape[2]):
+                comp[idx, ri, phi_i] = val
+
+        self._fill_comp_slice = _fill_comp_slice
+
+    def init_background_layer(self, n_r: int, n_phi: int, seed: int = 42) -> None:
+        """Initialize background layer parameters for interactive mode.
+
+        Generates randomized spiral arm geometry and azimuthal hotspot parameters,
+        creates the component field for both background (GPU noise) and entity
+        (CPU lifecycle) layers.
+
+        Args:
+            n_r: radial resolution of disk texture
+            n_phi: azimuthal resolution of disk texture
+            seed: random seed for reproducible parameter generation
+        """
+        rng = np.random.default_rng(seed)
+
+        # 组件场（background kernel 写 [0-4,11,12]，entity 层写 [5-10]）
+        if not hasattr(self, '_comp_field') or self._comp_field.shape != (13, n_r, n_phi):
+            self._comp_field = ti.field(dtype=ti.f32, shape=(13, n_r, n_phi))
+
+        # 螺旋臂参数
+        n_arms = int(rng.integers(2, 5))
+        n_from_center = int(rng.integers(2, min(n_arms + 1, 5)))
+        max_arms = 8
+        params = np.zeros((max_arms, 7), dtype=np.float32)
+
+        used_angles = []
+        for arm_idx in range(n_arms):
+            if arm_idx < n_from_center:
+                r_start = 0.0
+                base_angle = arm_idx * 2 * np.pi / n_from_center
+            else:
+                r_start = float(rng.uniform(0.05, 0.5))
+                base_angle = float(rng.uniform(0, 2 * np.pi))
+
+            for existing in used_angles:
+                if abs(base_angle - existing) < 0.4:
+                    base_angle = (base_angle + 0.5) % (2 * np.pi)
+            used_angles.append(base_angle)
+
+            rotations = float(rng.uniform(2.5, 5.0))
+            width = float(rng.uniform(0.2, 0.4))
+            intensity = float(rng.uniform(0.1, 0.7))
+            delta_T = float(rng.uniform(0.1, 0.3))
+            r_length = rotations / 6.0 * (1.0 - r_start)
+            r_end = r_start + min(r_length, 1.0 - r_start)
+
+            params[arm_idx] = [base_angle, r_start, r_end, rotations,
+                               width, intensity, delta_T]
+
+        self._bg_spiral_params_field = ti.field(ti.f32, shape=(max_arms, 7))
+        self._bg_spiral_params_field.from_numpy(params)
+        self._bg_n_arms = n_arms
+
+        # 方位热点参数
+        self._bg_az_freq = int(rng.integers(2, 5))
+        self._bg_az_shear = float(rng.uniform(2.0, 4.0))
+
+        # 边缘和 omega 数据（compose kernel 需要）
+        self._edge_field = ti.field(dtype=ti.f32, shape=(n_r,))
+        self._edge_field.from_numpy(compute_edge_alpha(n_r).astype(np.float32))
+
+        r_norm = np.linspace(0, 1, n_r)
+        r_vals = self.r_disk_inner + (self.r_disk_outer - self.r_disk_inner) * r_norm
+        omega_rows = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
+        self._omega_rows_field = ti.field(dtype=ti.f32, shape=(n_r,))
+        self._omega_rows_field.from_numpy(omega_rows)
+
+        self._bg_n_r = n_r
+        self._bg_n_phi = n_phi
+
+        # 实体层 staging field（CPU 累加 → from_numpy → copy kernel → comp[5:10]）
+        self._entity_staging_field = ti.field(ti.f32, shape=(6, n_r, n_phi))
+
+        # compose kernel 所需统计量（初始值，后续由 recompute_interactive_stats 更新）
+        self._param_stats_field = ti.field(dtype=ti.f32, shape=(2,))
+        self._param_stats_field.from_numpy(np.array([0.5, 0.5], dtype=np.float32))
+
+        self._param_row_stats_field = ti.Vector.field(2, dtype=ti.f32, shape=(n_r,))
+        init_row_stats = np.column_stack([
+            np.full(n_r, 0.25, dtype=np.float32),
+            np.full(n_r, 0.10, dtype=np.float32),
+        ])
+        self._param_row_stats_field.from_numpy(init_row_stats)
+
+        self._param_enable_rt = 1
+        self._param_color_temp = float(DISK_COLOR_TEMPERATURE)
+
+        self._bg_ready = True
+
+    def generate_background(self, t: float) -> None:
+        """Generate background layer components on GPU for current time.
+
+        Writes time-evolved noise patterns to comp_field indices [0,1,2,3,4,11,12].
+        Must call init_background_layer() first.
+
+        Args:
+            t: wall-clock time in seconds
+        """
+        assert hasattr(self, '_bg_ready') and self._bg_ready, \
+            "Must call init_background_layer() first"
+        self._generate_background_kernel(
+            self._comp_field, self._bg_spiral_params_field,
+            self._bg_n_arms, self._bg_az_freq, self._bg_az_shear,
+            float(self.r_disk_inner), float(self.r_disk_outer), float(t))
+
+    def accumulate_entity_layer(self, factories: dict, now: float) -> None:
+        """Accumulate entity contributions and upload to comp_field[5:10].
+
+        For each entity type, iterates over alive entities, applies Keplerian
+        rotation (np.roll) and fade factor, then sums contributions into the
+        component arrays. Results are uploaded via staging field + copy kernel.
+
+        Args:
+            factories: dict with keys 'filament', 'hotspot', 'rt_spike',
+                values are EntityFactory instances
+            now: current wall-clock time in seconds
+
+        Notes:
+            Mapping to comp_field indices:
+                staging[0] -> comp[5]  = filaments density (arcs)
+                staging[1] -> comp[6]  = filaments temperature (arcs_temp)
+                staging[2] -> comp[7]  = RT spikes density
+                staging[3] -> comp[8]  = RT spikes temperature
+                staging[4] -> comp[9]  = hotspot density
+                staging[5] -> comp[10] = hotspot temperature
+        """
+        n_r = self._bg_n_r
+        n_phi = self._bg_n_phi
+
+        staging = np.zeros((6, n_r, n_phi), dtype=np.float32)
+
+        component_map = [
+            ('filament', 0, 1),   # density → staging[0], temp → staging[1]
+            ('rt_spike', 2, 3),   # density → staging[2], temp → staging[3]
+            ('hotspot',  4, 5),   # density → staging[4], temp → staging[5]
+        ]
+
+        for key, d_idx, t_idx in component_map:
+            factory = factories.get(key)
+            if factory is None:
+                continue
+            for entity in factory.alive_entities:
+                alpha = entity.fade_factor(now)
+                if alpha <= 0:
+                    continue
+                age = now - entity.birth_time
+                shift = int(age * entity.omega / (2 * np.pi) * n_phi)
+                for k, ri in enumerate(entity.row_indices):
+                    if 0 <= ri < n_r:
+                        staging[d_idx, ri] += np.roll(
+                            entity.phi_density[k], -shift) * alpha
+                        staging[t_idx, ri] += np.roll(
+                            entity.phi_temp[k], -shift) * alpha
+
+        self._entity_staging_field.from_numpy(staging)
+        self._copy_entity_staging_to_comp(self._comp_field,
+                                          self._entity_staging_field)
+
+    def recompute_interactive_stats(self) -> None:
+        """Recompute normalization stats from current comp_field content.
+
+        Reads comp_field from GPU, computes density_p98, struct_scale, and
+        per-row stats, then uploads to stats fields. Should be called after
+        both background and entity layers have been written to comp_field.
+
+        Notes:
+            Uses the same normalization logic as upload_parametric_state /
+            _compose_disk_texture_from_fields to ensure visual consistency.
+        """
+        comp = self._comp_field.to_numpy()  # (13, n_r, n_phi)
+        edge = self._edge_field.to_numpy()  # (n_r,)
+
+        sp = comp[1]
+        turb = comp[3]
+        arc = comp[5]
+        hs = comp[9]
+        rt = comp[7]
+        dm = comp[12]
+
+        rt_w = 0.20 if self._param_enable_rt else 0.0
+        density = (0.15 + 0.10 * sp + 0.30 * turb + 0.20 * hs
+                   + 0.30 * arc + rt_w * rt) * dm
+        density *= edge[:, None]
+        density_p98 = float(np.percentile(density, 98))
+        density_p98 = max(density_p98, 0.01)
+
+        sp_t = comp[2]
+        turb_t = comp[4]
+        arc_t = comp[6]
+        rt_t = comp[8]
+        hs_t = comp[10]
+        temp_struct = (sp_t + turb_t + arc_t + rt_t + hs_t) * dm
+        pos_mask = temp_struct > 0
+        struct_scale = (float(np.percentile(temp_struct[pos_mask], 95))
+                        if np.any(pos_mask) else 1.0)
+        struct_scale = max(struct_scale, 0.01)
+
+        temp_struct_scaled = np.clip(
+            temp_struct / (struct_scale + 1e-6) * 0.8, 0, 1.2)
+        struct_max_per_r = np.max(temp_struct_scaled, axis=1).astype(np.float32)
+        struct_p70_per_r = np.quantile(
+            temp_struct_scaled, 0.7, axis=1).astype(np.float32)
+
+        self._param_stats_field.from_numpy(
+            np.array([density_p98, struct_scale], dtype=np.float32))
+        row_stats = np.column_stack(
+            [struct_max_per_r, struct_p70_per_r]).astype(np.float32)
+        self._param_row_stats_field.from_numpy(row_stats)
+
+    def compose_interactive_texture(self, solo_idx: int = -1) -> None:
+        """Compose disk texture from comp_field and update mipmaps.
+
+        Runs the compose kernel with t_offset=0 (both layers already handle
+        rotation), then regenerates mipmaps. Called each frame in interactive mode.
+
+        Args:
+            solo_idx: -1 = show all components (normal mode).
+                >= 0: solo display the component at this index, zeroing all others.
+                Component indices: 0=temp_base, 1=spiral, 2=spiral_temp,
+                3=turbulence, 4=turb_temp, 5=arcs, 6=arcs_temp,
+                7=rt_spikes, 8=rt_temp, 9=hotspot, 10=hotspot_temp,
+                11=az_hotspot, 12=disturb_mod
+        """
+        if solo_idx >= 0:
+            # 配对关系：密度组件和对应温度组件一起保留
+            _DENSITY_TEMP_PAIRS = {
+                0: [],        # temp_base 独立
+                1: [2],       # spiral → spiral_temp
+                2: [1],       # spiral_temp → spiral
+                3: [4],       # turbulence → turb_temp
+                4: [3],       # turb_temp → turbulence
+                5: [6],       # arcs → arcs_temp
+                6: [5],       # arcs_temp → arcs
+                7: [8],       # rt_spikes → rt_temp
+                8: [7],       # rt_temp → rt_spikes
+                9: [10],      # hotspot → hotspot_temp
+                10: [9],      # hotspot_temp → hotspot
+                11: [],       # az_hotspot 独立
+                12: [],       # disturb_mod 独立
+            }
+            keep = {solo_idx} | set(_DENSITY_TEMP_PAIRS.get(solo_idx, []))
+            for i in range(13):
+                if i not in keep:
+                    if i == 12:
+                        # disturb_mod 设为 1.0（中性乘子）以免密度/温度被清零
+                        self._fill_comp_slice(self._comp_field, 12, 1.0)
+                    else:
+                        self._zero_comp_slice(self._comp_field, i)
+            self.recompute_interactive_stats()
+
+        self._compose_disk_texture_kernel(
+            self.disk_texture_field, self._comp_field,
+            self._omega_rows_field, self._edge_field,
+            self._param_stats_field, self._param_row_stats_field,
+            0.0, self._param_enable_rt, self._param_color_temp)
+
+        self._mipmap_copy_base_kernel(self.disk_mips_field,
+                                      self.disk_texture_field)
+        h, w = self._bg_n_r, self._bg_n_phi
+        for lev in range(1, self.num_mip_levels):
+            self._mipmap_downsample_kernel(self.disk_mips_field, lev, h, w)
+            h //= 2
+            w //= 2
+
+    def eval_noise(self, coords: np.ndarray, mode: str = "simplex",
+                   octaves: int = 4, persistence: float = 0.5,
+                   lacunarity: float = 2.0) -> np.ndarray:
+        """Evaluate noise at given coordinates (for testing/debugging).
+
+        Args:
+            coords: (N, 3) float32 array of xyz coordinates
+            mode: "simplex" for raw simplex noise, "fbm" for fractal Brownian motion
+            octaves: FBM octave count (ignored for simplex mode)
+            persistence: FBM amplitude decay per octave
+            lacunarity: FBM frequency multiplier per octave
+        Returns:
+            (N,) float32 array of noise values
+        """
+        n = coords.shape[0]
+        coords_field = ti.field(ti.f32, shape=(n, 3))
+        coords_field.from_numpy(coords.astype(np.float32))
+        out_field = ti.field(ti.f32, shape=(n,))
+        mode_i = 0 if mode == "simplex" else 1
+        self._noise_eval_kernel(out_field, coords_field, mode_i,
+                                octaves, persistence, lacunarity)
+        return out_field.to_numpy()
+
     def update_disk_texture_gpu(self, t_offset: float) -> None:
         """在 GPU 上合成旋转纹理并更新 mipmap（替代 CPU 路径）。
 
@@ -2900,9 +4017,12 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
                        fov: float, initial_cam_pos: List[float],
                        disk_rotation_speed: float = 0.05,
                        disk_generation_scale: int = 1) -> None:
-    """实时交互预览模式。
+    """实时交互预览模式（实体生命周期系统）。
 
     使用 Taichi Legacy GUI 实时渲染黑洞场景，支持鼠标/键盘控制相机和渲染开关。
+    吸积盘纹理由两层系统实时生成：
+        - GPU 背景层：3D simplex noise 驱动的时间演化（宽 r 组件）
+        - CPU 实体层：filament/hotspot/RT spike 的生命周期管理（窄 r 组件）
 
     相机控制（球坐标，始终朝向原点）:
         鼠标左键拖拽: 旋转视角 (φ, θ)
@@ -2922,7 +4042,7 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
         fov: 初始视野角度
         initial_cam_pos: 初始相机位置 [x, y, z]
         disk_rotation_speed: 盘旋转速度
-        disk_generation_scale: 纹理生成倍率
+        disk_generation_scale: 纹理生成倍率（生命周期模式下忽略）
     """
     import taichi as ti
 
@@ -2936,28 +4056,67 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
     toggle_flare = False
     renderer.lens_flare = False
 
-    # 预计算 parametric 纹理状态
-    if disk_generation_scale == 1:
-        state = build_disk_texture_rotating_state(
-            n_phi=renderer.dtex_w, n_r=renderer.dtex_h, seed=42,
-            r_inner=renderer.r_disk_inner, r_outer=renderer.r_disk_outer,
-            enable_rt=True, generation_scale=disk_generation_scale,
-        )
-        renderer.upload_parametric_state(state)
-        print("GPU 纹理合成已启用")
+    # —— 初始化实体生命周期系统 ——
+    n_r = renderer.dtex_h
+    n_phi = renderer.dtex_w
+    renderer.init_background_layer(n_r=n_r, n_phi=n_phi, seed=42)
+
+    r_norm_all = np.linspace(0, 1, n_r)
+    r_vals = renderer.r_disk_inner + (renderer.r_disk_outer - renderer.r_disk_inner) * r_norm_all
+    omega_all = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
+
+    factories = {
+        'filament': EntityFactory(
+            _spawn_single_filament, target_count=200,
+            lifetime_range=(10.0, 20.0), fade_in=2.0, fade_out=2.0,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=100),
+        'hotspot': EntityFactory(
+            _spawn_single_hotspot, target_count=30,
+            lifetime_range=(8.0, 15.0), fade_in=2.0, fade_out=2.0,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=200),
+        'rt_spike': EntityFactory(
+            _spawn_single_rt_spike, target_count=15,
+            lifetime_range=(8.0, 15.0), fade_in=1.5, fade_out=1.5,
+            n_r=n_r, n_phi=n_phi,
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=300),
+    }
+    for f in factories.values():
+        f.seed_initial(now=0.0)
+
+    # 生成首帧数据并计算初始统计量
+    renderer.generate_background(t=0.0)
+    renderer.accumulate_entity_layer(factories, now=0.0)
+    renderer.recompute_interactive_stats()
+    renderer.compose_interactive_texture()
+    print("实体生命周期系统已启用 (filaments=200, hotspots=30, rt_spikes=15)")
 
     gui = ti.GUI('Black Hole Interactive', res=(width, height))
-    t_offset = 0.0
+    wall_time = 0.0
     frame_count = 0
+    total_frames = 0
     fps_timer = time.time()
     fps_display = 0.0
+    last_frame_time = time.time()
 
     mouse_pressed = False
     mouse_last = (0.0, 0.0)
+    solo_idx = -1
+
+    _SOLO_NAMES = {
+        0: "temp_base", 1: "spiral", 2: "spiral_temp",
+        3: "turbulence", 4: "turb_temp",
+        5: "filaments", 6: "filaments_temp",
+        7: "rt_spikes", 8: "rt_temp",
+        9: "hotspot", 10: "hotspot_temp",
+        11: "az_hotspot", 12: "disturb_mod",
+    }
 
     print(f"\n=== 交互模式 ({width}x{height}) ===")
     print(f"鼠标拖拽: 旋转 | 滚轮: 缩放 | ↑↓: FOV")
-    print(f"D: 微分光线 | B: Bloom | L: Lens Flare | S: 截图 | ESC: 退出\n")
+    print(f"D: 微分光线 | B: Bloom | L: Lens Flare | S: 截图 | ESC: 退出")
+    print(f"1-8: solo 组件 | 0: 显示全部\n")
 
     while gui.running:
         # —— 事件处理 ——
@@ -2974,6 +4133,33 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
                 toggle_flare = not toggle_flare
                 renderer.lens_flare = toggle_flare
                 print(f"Lens Flare: {'开' if toggle_flare else '关'}")
+            elif e.key == '0':
+                solo_idx = -1
+                print("Solo: 全部组件")
+            elif e.key == '1':
+                solo_idx = 0
+                print(f"Solo: {_SOLO_NAMES[0]} (idx 0)")
+            elif e.key == '2':
+                solo_idx = 1
+                print(f"Solo: {_SOLO_NAMES[1]} (idx 1)")
+            elif e.key == '3':
+                solo_idx = 3
+                print(f"Solo: {_SOLO_NAMES[3]} (idx 3)")
+            elif e.key == '4':
+                solo_idx = 11
+                print(f"Solo: {_SOLO_NAMES[11]} (idx 11)")
+            elif e.key == '5':
+                solo_idx = 12
+                print(f"Solo: {_SOLO_NAMES[12]} (idx 12)")
+            elif e.key == '6':
+                solo_idx = 5
+                print(f"Solo: {_SOLO_NAMES[5]} (idx 5)")
+            elif e.key == '7':
+                solo_idx = 9
+                print(f"Solo: {_SOLO_NAMES[9]} (idx 9)")
+            elif e.key == '8':
+                solo_idx = 7
+                print(f"Solo: {_SOLO_NAMES[7]} (idx 7)")
             elif e.key == 's':
                 screenshot_path = f"output/screenshot_{int(time.time())}.png"
                 os.makedirs("output", exist_ok=True)
@@ -3018,10 +4204,24 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
         cam_pos[1] = r * np.sin(theta) * np.sin(phi)
         cam_pos[2] = r * np.cos(theta)
 
-        # —— 纹理旋转 ——
-        t_offset += disk_rotation_speed
-        if hasattr(renderer, '_parametric_gpu_ready') and renderer._parametric_gpu_ready:
-            renderer.update_disk_texture_gpu(t_offset)
+        # —— 实体生命周期更新 ——
+        now_real = time.time()
+        dt = min(now_real - last_frame_time, 0.1)
+        last_frame_time = now_real
+        wall_time += dt * disk_rotation_speed * 20.0
+
+        for f in factories.values():
+            f.tick(now=wall_time, dt=dt * disk_rotation_speed * 20.0)
+
+        renderer.generate_background(t=wall_time)
+        renderer.accumulate_entity_layer(factories, now=wall_time)
+
+        # 定期刷新统计量（每 60 帧）
+        total_frames += 1
+        if total_frames % 60 == 1:
+            renderer.recompute_interactive_stats()
+
+        renderer.compose_interactive_texture(solo_idx=solo_idx)
 
         # —— 渲染到 GPU field ——
         renderer.render_to_field(
@@ -3035,15 +4235,17 @@ def render_interactive(renderer: TaichiRenderer, width: int, height: int,
 
         # HUD 信息
         frame_count += 1
-        now = time.time()
-        if now - fps_timer >= 0.5:
-            fps_display = frame_count / (now - fps_timer)
+        fps_now = time.time()
+        if fps_now - fps_timer >= 0.5:
+            fps_display = frame_count / (fps_now - fps_timer)
             frame_count = 0
-            fps_timer = now
+            fps_timer = fps_now
 
+        n_entities = sum(len(f.entities) for f in factories.values())
         toggles = f"D:{'ON' if toggle_diff else 'off'} B:{'ON' if toggle_bloom else 'off'} L:{'ON' if toggle_flare else 'off'}"
-        gui.text(f"{fps_display:.0f} FPS | {toggles}", pos=(0.01, 0.97), color=0xFFFFFF)
-        gui.text(f"r={r:.1f} fov={fov:.0f}", pos=(0.01, 0.93), color=0xCCCCCC)
+        solo_txt = f" SOLO:{_SOLO_NAMES[solo_idx]}" if solo_idx >= 0 else ""
+        gui.text(f"{fps_display:.0f} FPS | {toggles} | E:{n_entities}{solo_txt}", pos=(0.01, 0.97), color=0xFFFFFF)
+        gui.text(f"r={r:.1f} fov={fov:.0f} t={wall_time:.1f}", pos=(0.01, 0.93), color=0xCCCCCC)
         gui.text("+/-: zoom | arrows: FOV | S: screenshot", pos=(0.01, 0.02), color=0x888888)
 
         gui.show()
