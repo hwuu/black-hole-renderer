@@ -44,19 +44,22 @@ def _make_full_setup():
     factories = {
         'filament': EntityFactory(
             _spawn_single_filament, target_count=200,
-            lifetime_range=(10.0, 20.0), fade_in=2.0, fade_out=2.0,
+            lifetime_range=(15.0, 60.0), fade_in=0.0, fade_out=0.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=100),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=100,
+            entity_type='filament'),
         'hotspot': EntityFactory(
             _spawn_single_hotspot, target_count=30,
             lifetime_range=(8.0, 15.0), fade_in=2.0, fade_out=2.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=200),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=200,
+            entity_type='hotspot'),
         'rt_spike': EntityFactory(
             _spawn_single_rt_spike, target_count=15,
             lifetime_range=(8.0, 15.0), fade_in=1.5, fade_out=1.5,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=300),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=300,
+            entity_type='rt_spike'),
     }
     for f in factories.values():
         f.seed_initial(now=0.0)

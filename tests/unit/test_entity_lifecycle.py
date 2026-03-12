@@ -15,6 +15,10 @@ from render import (
     _spawn_single_filament,
     _spawn_single_hotspot,
     _spawn_single_rt_spike,
+    FILAMENT_DEATH_THRESHOLD,
+    FILAMENT_MAX_LIFETIME,
+    FILAMENT_SHEAR_ALPHA,
+    FILAMENT_TAU_COOL,
 )
 
 N_R = 64
@@ -97,7 +101,10 @@ class TestEntityFactory(unittest.TestCase):
 
     def _make_factory(self, spawn_fn=_spawn_single_filament,
                       target=20, lifetime_range=(10, 20),
-                      fade_in=2.0, fade_out=2.0, seed=42):
+                      fade_in=2.0, fade_out=2.0, seed=42,
+                      entity_type=None):
+        if entity_type is None:
+            entity_type = 'filament' if spawn_fn is _spawn_single_filament else 'generic'
         return EntityFactory(
             spawn_fn=spawn_fn,
             target_count=target,
@@ -108,6 +115,7 @@ class TestEntityFactory(unittest.TestCase):
             r_norm_all=R_NORM_ALL,
             omega_all=OMEGA_ALL,
             seed=seed,
+            entity_type=entity_type,
         )
 
     def test_seed_initial_populates(self):
@@ -128,14 +136,18 @@ class TestEntityFactory(unittest.TestCase):
                                  "staggered entities should be born before 'now'")
 
     def test_seed_initial_entities_are_valid(self):
-        """seed_initial 创建的实体应有正确的稀疏数据。"""
+        """seed_initial 创建的实体应有正确数据。"""
         f = self._make_factory(target=5)
         f.seed_initial(now=0.0)
         for e in f.entities:
             self.assertGreater(len(e.row_indices), 0)
-            self.assertEqual(e.phi_density.shape[0], len(e.row_indices))
-            self.assertEqual(e.phi_density.shape[1], N_PHI)
             self.assertGreater(e.omega, 0)
+            if e.entity_type == 'filament':
+                self.assertGreater(e.blob_sigma_r, 0)
+                self.assertGreater(e.blob_peak_density, 0)
+            else:
+                self.assertEqual(e.phi_density.shape[0], len(e.row_indices))
+                self.assertEqual(e.phi_density.shape[1], N_PHI)
 
     def test_tick_removes_dead(self):
         """tick 应移除已死亡的实体。"""
@@ -198,6 +210,88 @@ class TestEntityFactory(unittest.TestCase):
         count = len(f.entities)
         self.assertGreaterEqual(count, 15, f"count={count} too low")
         self.assertLessEqual(count, 45, f"count={count} too high")
+
+
+class TestFilamentPhysicsLifecycle(unittest.TestCase):
+    """验证 filament 物理驱动的生命周期。"""
+
+    def _make_filament_entity(self, omega=0.1, sigma_phi0=0.008):
+        return EntityInstance(
+            row_indices=np.array([5, 6, 7]),
+            phi_density=np.empty((0, 0), dtype=np.float32),
+            phi_temp=np.empty((0, 0), dtype=np.float32),
+            omega=omega,
+            birth_time=0.0,
+            lifetime=60.0,
+            fade_in=0.0,
+            fade_out=0.0,
+            fade_noise=np.random.default_rng(0).random(32).astype(np.float32),
+            entity_type='filament',
+            source_phi=1.0,
+            total_extent=2 * np.pi,
+            alpha_shear=FILAMENT_SHEAR_ALPHA * omega,
+            tau_cool=FILAMENT_TAU_COOL,
+            blob_base_r=0.5,
+            blob_sigma_r=0.004,
+            blob_sigma_phi0=sigma_phi0,
+            blob_peak_density=0.8,
+            blob_peak_temp=0.2,
+        )
+
+    def test_density_factor_at_birth(self):
+        e = self._make_filament_entity()
+        self.assertAlmostEqual(e.density_factor(0.0), 1.0)
+
+    def test_density_factor_decreases(self):
+        e = self._make_filament_entity()
+        d10 = e.density_factor(10.0)
+        d30 = e.density_factor(30.0)
+        self.assertLess(d30, d10)
+        self.assertLess(d10, 1.0)
+
+    def test_density_factor_inner_disk_faster(self):
+        """内盘 filament (大 omega) 衰减更快。"""
+        e_inner = self._make_filament_entity(omega=0.118)
+        e_outer = self._make_filament_entity(omega=0.011)
+        self.assertLess(e_inner.density_factor(20.0),
+                        e_outer.density_factor(20.0))
+
+    def test_filament_is_dead_by_threshold(self):
+        e = self._make_filament_entity(omega=0.1)
+        self.assertFalse(e.is_dead(now=5.0))
+        for t in np.arange(0, FILAMENT_MAX_LIFETIME, 1.0):
+            if e.density_factor(t) < FILAMENT_DEATH_THRESHOLD:
+                self.assertTrue(e.is_dead(now=t))
+                break
+
+    def test_filament_is_dead_max_lifetime(self):
+        e = self._make_filament_entity(omega=0.001)
+        self.assertTrue(e.is_dead(now=FILAMENT_MAX_LIFETIME))
+
+    def test_filament_factory_spawns_with_type(self):
+        f = EntityFactory(
+            spawn_fn=_spawn_single_filament,
+            target_count=5,
+            lifetime_range=(60.0, 120.0),
+            fade_in=0.0, fade_out=0.0,
+            n_r=N_R, n_phi=N_PHI,
+            r_norm_all=R_NORM_ALL,
+            omega_all=OMEGA_ALL,
+            seed=42,
+            entity_type='filament',
+        )
+        f.seed_initial(now=0.0)
+        for e in f.entities:
+            self.assertEqual(e.entity_type, 'filament')
+            self.assertGreater(e.total_extent, 0)
+            self.assertGreater(e.alpha_shear, 0)
+
+    def test_non_filament_unchanged(self):
+        """hotspot/rt_spike 应继续使用固定计时器。"""
+        e = _make_entity(birth=0.0, lifetime=10.0, fade_in=2.0, fade_out=2.0)
+        self.assertEqual(e.entity_type, 'generic')
+        self.assertFalse(e.is_dead(now=5.0))
+        self.assertTrue(e.is_dead(now=14.0))
 
 
 if __name__ == "__main__":

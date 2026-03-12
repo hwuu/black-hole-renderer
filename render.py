@@ -490,35 +490,47 @@ class DiskTextureRotatingState:
 # 实体生命周期系统
 # ============================================================================
 
+FILAMENT_SHEAR_ALPHA = 0.1
+FILAMENT_TAU_COOL = 50.0
+FILAMENT_DEATH_THRESHOLD = 0.008
+FILAMENT_MAX_LIFETIME = 120.0
+FILAMENT_BIRTH_FADE_DUR = 5.0
+
+
 @dataclass
 class EntityInstance:
     """Single entity instance in the lifecycle system.
 
-    Stores pre-computed sparse density/temperature contributions and Keplerian
-    rotation parameters for one filament, hotspot, or RT spike.
+    Stores entity contributions and lifecycle parameters. Non-filament entities
+    use pre-computed phi_density/phi_temp arrays; filaments use blob parameters
+    and compute their profile each frame from physics.
 
     Args:
         row_indices: affected radial row indices, shape (n_affected,).
-            Typically 2-8 rows for filaments, 40-100 for hotspots, 10-40 for RT spikes.
-        phi_density: density contribution at affected rows, shape (n_affected, n_phi).
-            Pre-computed at birth, rotated via np.roll each frame.
-        phi_temp: temperature contribution at affected rows, shape (n_affected, n_phi).
-            Same rotation as phi_density.
+        phi_density: density contribution, shape (n_affected, n_phi).
+            Pre-computed for hotspot/RT spike; empty for filaments (blob mode).
+        phi_temp: temperature contribution, shape (n_affected, n_phi).
+            Pre-computed for hotspot/RT spike; empty for filaments (blob mode).
         omega: Keplerian angular velocity at entity center (rad/s).
-            Used to compute per-frame azimuthal shift.
         birth_time: wall-clock time when entity was spawned (seconds).
         lifetime: total alive duration excluding fade periods (seconds).
-        fade_in: fade-in duration (seconds). Entity alpha ramps 0→1.
-        fade_out: fade-out duration (seconds). Entity alpha ramps 1→0.
+        fade_in: fade-in duration (seconds). Non-filament only.
+        fade_out: fade-out duration (seconds). Non-filament only.
+        entity_type: 'filament', 'hotspot', or 'rt_spike'.
+        source_phi: filament source azimuthal position (rad).
+        alpha_shear: precomputed turbulent shear rate (rad/s).
+        tau_cool: radiative cooling timescale (seconds).
+        blob_base_r: filament radial center in r_norm units.
+        blob_sigma_r: filament radial Gaussian width (r_norm units).
+        blob_sigma_phi0: filament initial azimuthal Gaussian width (rad).
+        blob_peak_density: filament initial density peak value.
+        blob_peak_temp: filament initial temperature peak value.
 
     Physical Meaning:
-        Represents a localized structure in the accretion disk with a finite
-        lifespan. Undergoes Keplerian rotation at its radial position, fading
-        in at birth and fading out at death to avoid visual pops.
-
-    Simplifications:
-        Uses a single omega for all rows (ignores differential rotation within
-        the entity's narrow radial extent).
+        Represents a localized structure in the accretion disk. Filaments are
+        born as circular 2D Gaussian blobs that get naturally sheared into arcs
+        by differential Keplerian rotation. Non-filament entities use fixed-timer
+        fade with pre-computed profiles.
     """
     row_indices: np.ndarray
     phi_density: np.ndarray
@@ -528,19 +540,61 @@ class EntityInstance:
     lifetime: float
     fade_in: float
     fade_out: float
-    fade_noise: np.ndarray  # (n_phi,) smooth noise in [0,1] for dissolve effect
+    fade_noise: np.ndarray
+    entity_type: str = 'generic'
+    source_phi: float = 0.0
+    total_extent: float = 0.0
+    alpha_shear: float = 0.0
+    tau_cool: float = FILAMENT_TAU_COOL
+    blob_base_r: float = 0.0
+    blob_sigma_r: float = 0.0
+    blob_sigma_phi0: float = 0.0
+    blob_peak_density: float = 0.0
+    blob_peak_temp: float = 0.0
 
     @property
     def total_duration(self) -> float:
         """Total time from birth to fully faded out."""
         return self.fade_in + self.lifetime + self.fade_out
 
+    def density_factor(self, age: float) -> float:
+        """Compute density decay factor for filament blob model.
+
+        Combines turbulent shear dilution (blob stretching, mass conservation)
+        with radiative cooling (exponential energy loss).
+
+        Args:
+            age: time since birth in seconds, must be >= 0.
+
+        Returns:
+            float in (0, 1]: 1.0 at birth, monotonically decreasing.
+
+        Formula:
+            sigma_phi_t = blob_sigma_phi0 + alpha_shear * age
+            factor = (blob_sigma_phi0 / sigma_phi_t) * exp(-age / tau_cool)
+        """
+        s0 = max(self.blob_sigma_phi0, 1e-6)
+        sigma_phi_t = s0 + self.alpha_shear * age
+        shear_term = s0 / sigma_phi_t
+        cool_term = math.exp(-age / self.tau_cool) if self.tau_cool > 0 else 1.0
+        return shear_term * cool_term
+
     def is_dead(self, now: float) -> bool:
-        """Whether the entity has fully faded out and should be recycled."""
-        return (now - self.birth_time) >= self.total_duration
+        """Whether the entity should be recycled.
+
+        Filaments die when density_factor drops below FILAMENT_DEATH_THRESHOLD
+        or exceeds FILAMENT_MAX_LIFETIME. Other entity types use fixed-timer
+        lifecycle (fade_in + lifetime + fade_out).
+        """
+        age = now - self.birth_time
+        if self.entity_type == 'filament':
+            if age >= FILAMENT_MAX_LIFETIME:
+                return True
+            return age >= 0 and self.density_factor(age) < FILAMENT_DEATH_THRESHOLD
+        return age >= self.total_duration
 
     def fade_factor(self, now: float) -> float:
-        """Compute current fade alpha based on age.
+        """Compute current fade alpha based on age (non-filament entities only).
 
         Returns:
             alpha in [0, 1]: 0 during pre-birth or post-death,
@@ -597,7 +651,7 @@ class EntityFactory:
                  fade_in: float, fade_out: float,
                  n_r: int, n_phi: int,
                  r_norm_all: np.ndarray, omega_all: np.ndarray,
-                 seed: int = 0):
+                 seed: int = 0, entity_type: str = 'generic'):
         self.spawn_fn = spawn_fn
         self.target_count = target_count
         self.lifetime_range = lifetime_range
@@ -610,23 +664,58 @@ class EntityFactory:
         self.rng = np.random.default_rng(seed)
         self.entities: List[EntityInstance] = []
         self._spawn_debt = 0.0
+        self.entity_type = entity_type
 
     def _spawn_one(self, now: float) -> EntityInstance:
-        """Spawn a single entity at the current time."""
-        row_indices, phi_density, phi_temp, omega = self.spawn_fn(
+        """Spawn a single entity at the current time.
+
+        For filaments, spawn_fn returns 6 values (row_indices, phi_density,
+        phi_temp, omega, source_phi, total_extent). For other types, it
+        returns 4 values (row_indices, phi_density, phi_temp, omega).
+        """
+        result = self.spawn_fn(
             self.rng, self.n_r, self.n_phi, self.r_norm_all, self.omega_all)
         lifetime = float(self.rng.uniform(*self.lifetime_range))
-        return EntityInstance(
-            row_indices=row_indices,
-            phi_density=phi_density,
-            phi_temp=phi_temp,
-            omega=omega,
-            birth_time=now,
-            lifetime=lifetime,
-            fade_in=self.fade_in,
-            fade_out=self.fade_out,
-            fade_noise=self._make_fade_noise(),
-        )
+
+        if self.entity_type == 'filament':
+            (row_indices, phi_density, phi_temp, omega, source_phi,
+             total_extent, sigma_r, sigma_phi0, peak_density,
+             peak_temp, base_r) = result
+            return EntityInstance(
+                row_indices=row_indices,
+                phi_density=phi_density,
+                phi_temp=phi_temp,
+                omega=omega,
+                birth_time=now,
+                lifetime=lifetime,
+                fade_in=self.fade_in,
+                fade_out=self.fade_out,
+                fade_noise=self._make_fade_noise(),
+                entity_type='filament',
+                source_phi=source_phi,
+                total_extent=total_extent,
+                alpha_shear=FILAMENT_SHEAR_ALPHA * omega,
+                tau_cool=FILAMENT_TAU_COOL,
+                blob_base_r=base_r,
+                blob_sigma_r=sigma_r,
+                blob_sigma_phi0=sigma_phi0,
+                blob_peak_density=peak_density,
+                blob_peak_temp=peak_temp,
+            )
+        else:
+            row_indices, phi_density, phi_temp, omega = result
+            return EntityInstance(
+                row_indices=row_indices,
+                phi_density=phi_density,
+                phi_temp=phi_temp,
+                omega=omega,
+                birth_time=now,
+                lifetime=lifetime,
+                fade_in=self.fade_in,
+                fade_out=self.fade_out,
+                fade_noise=self._make_fade_noise(),
+                entity_type=self.entity_type,
+            )
 
     def _make_fade_noise(self) -> np.ndarray:
         """Generate smooth 1D dissolve noise along phi, range [0, 1].
@@ -656,10 +745,24 @@ class EntityFactory:
         """
         for i in range(self.target_count):
             entity = self._spawn_one(now)
-            max_age = entity.fade_in + entity.lifetime
-            stagger = max_age * (i / max(self.target_count, 1))
+            if entity.entity_type == 'filament':
+                death_age = self._filament_death_age(entity)
+                min_age = FILAMENT_BIRTH_FADE_DUR
+                age_range = max(death_age - min_age, 1.0)
+                stagger = min_age + age_range * (i / max(self.target_count, 1))
+            else:
+                max_age = entity.fade_in + entity.lifetime
+                stagger = max_age * (i / max(self.target_count, 1))
             entity.birth_time = now - stagger
             self.entities.append(entity)
+
+    @staticmethod
+    def _filament_death_age(entity) -> float:
+        """Find the age at which a filament's density_factor drops below threshold."""
+        for t in range(1, int(FILAMENT_MAX_LIFETIME) + 1):
+            if entity.density_factor(float(t)) < FILAMENT_DEATH_THRESHOLD:
+                return float(t)
+        return FILAMENT_MAX_LIFETIME
 
     def tick(self, now: float, dt: float) -> None:
         """Advance the factory by one frame: remove dead, spawn replacements.
@@ -1563,12 +1666,11 @@ def _generate_hotspots(rng: np.random.Generator, n_r: int, n_phi: int, phi_grid:
 
 def _spawn_single_filament(rng: np.random.Generator, n_r: int, n_phi: int,
                            r_norm_all: np.ndarray, omega_all: np.ndarray
-                           ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-    """Generate a single filament instance for entity lifecycle system.
+                           ) -> tuple:
+    """Generate a single filament blob for entity lifecycle system.
 
-    Creates one filament composed of 2-4 sub-segments, computing density and
-    temperature contributions only on affected rows (sparse representation).
-    Parameters match _generate_filaments inner loop statistics.
+    Creates a circular 2D Gaussian blob that will be naturally sheared into
+    an arc by differential Keplerian rotation during rendering.
 
     Args:
         rng: numpy random generator
@@ -1578,76 +1680,46 @@ def _spawn_single_filament(rng: np.random.Generator, n_r: int, n_phi: int,
         omega_all: Keplerian angular velocity for each row, shape (n_r,)
 
     Returns:
-        (row_indices, phi_density, phi_temp, omega):
+        (row_indices, phi_density, phi_temp, omega, source_phi, total_extent,
+         sigma_r, sigma_phi0, peak_density, peak_temp, base_r):
         - row_indices: int array of affected row indices, shape (n_affected,)
-        - phi_density: density contribution, shape (n_affected, n_phi)
-        - phi_temp: temperature contribution, shape (n_affected, n_phi)
+        - phi_density: empty array (blob computed at render time)
+        - phi_temp: empty array (blob computed at render time)
         - omega: Keplerian angular velocity at entity center (rad/s)
+        - source_phi: azimuthal center of the blob (rad)
+        - total_extent: set to 2*pi (blob can stretch to any length)
+        - sigma_r: radial Gaussian width (r_norm units)
+        - sigma_phi0: initial azimuthal Gaussian width (rad)
+        - peak_density: initial density peak value
+        - peak_temp: initial temperature peak value
+        - base_r: radial center in r_norm units
 
     Physical Meaning:
-        Represents a magnetic filament — a thin, arc-shaped structure formed by
-        magnetic reconnection or shear flow in the accretion disk. Each filament
-        is narrow radially (2-5 rows) but extends azimuthally (~180-430 degrees).
+        Represents a magnetic reconnection event that creates a hot, compact
+        blob. The blob is initially circular in (r, phi) space. Differential
+        Keplerian rotation + turbulent stretching naturally deform it into
+        a thin, elongated arc over time.
     """
-    phi = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
-
-    base_phi = float(rng.uniform(0, 2 * np.pi))
+    source_phi = float(rng.uniform(0, 2 * np.pi))
     r_pos = float(rng.uniform(0.05, 0.95))
     base_r = 0.05 + r_pos ** 0.6 * 0.9
-    base_width = float(rng.uniform(0.002, 0.008))
-    total_length = float(rng.uniform(0.5, 1.2))
-    intensity = float(rng.uniform(0.7, 1.0))
-    delta_T = 0.3 + 0.6 * float(rng.power(0.3))
+    sigma_r = float(rng.uniform(0.005, 0.015))
+    sigma_phi0 = float(rng.uniform(0.04, 0.10))
+    peak_density = float(rng.uniform(0.5, 1.0))
+    peak_temp = peak_density * float(rng.uniform(0.15, 0.35))
 
-    # 受影响行（5 sigma 截断）
-    r_min = base_r - 5 * base_width
-    r_max = base_r + 5 * base_width
-    row_mask = (r_norm_all >= r_min) & (r_norm_all <= r_max)
+    row_mask = np.abs(r_norm_all - base_r) < 4 * sigma_r
     row_indices = np.where(row_mask)[0]
-
     if len(row_indices) == 0:
         center_idx = int(np.argmin(np.abs(r_norm_all - base_r)))
         row_indices = np.array([center_idx])
 
-    r_subset = r_norm_all[row_indices]
-    n_rows = len(row_indices)
-
-    phi_density = np.zeros((n_rows, n_phi), dtype=np.float32)
-    phi_temp = np.zeros((n_rows, n_phi), dtype=np.float32)
-
-    sub_count = int(rng.integers(2, 5))
-    sub_fill = float(rng.uniform(0.35, 0.55))
-    sub_lengths = rng.uniform(0.08, 0.20, sub_count)
-    sub_lengths = sub_lengths / sub_lengths.sum() * total_length * sub_fill
-
-    sub_starts = np.zeros(sub_count)
-    sub_starts[0] = base_phi
-    for j in range(1, sub_count):
-        gap = float(rng.uniform(0.08, 0.20))
-        sub_starts[j] = sub_starts[j - 1] + sub_lengths[j - 1] + gap
-
-    sub_widths = np.clip(base_width * rng.uniform(0.3, 3.0, sub_count), 0.001, 0.025)
-    sub_intensities = intensity * rng.uniform(0.15, 1.0, sub_count)
-
-    for j in range(sub_count):
-        phi_range = sub_lengths[j] / (base_r + 0.01)
-        phi_half_width = max(phi_range * 0.7, 0.2)
-        kappa = 1.5 / (phi_half_width ** 2)
-        phi_prof = np.exp(kappa * (np.cos(phi - sub_starts[j]) - 1))
-
-        for k in range(n_rows):
-            r_diff = r_subset[k] - base_r
-            r_prof = np.exp(-0.5 * (r_diff / (sub_widths[j] + 1e-8)) ** 2)
-            phi_density[k] += phi_prof * r_prof * sub_intensities[j]
-            phi_temp[k] += phi_prof * r_prof * sub_intensities[j] * delta_T * 0.7
-
-    phi_density = np.clip(phi_density, 0, 1)
-    phi_temp = np.clip(phi_temp, 0, phi_density * 0.5)
-
     center_idx = int(np.argmin(np.abs(r_norm_all - base_r)))
     omega = float(omega_all[center_idx])
 
-    return row_indices, phi_density, phi_temp, omega
+    return (row_indices, np.empty((0, 0), dtype=np.float32),
+            np.empty((0, 0), dtype=np.float32), omega, source_phi, 2 * np.pi,
+            sigma_r, sigma_phi0, peak_density, peak_temp, base_r)
 
 
 def _spawn_single_hotspot(rng: np.random.Generator, n_r: int, n_phi: int,
@@ -3448,6 +3520,7 @@ class TaichiRenderer:
         self._omega_rows_field = ti.field(dtype=ti.f32, shape=(n_r,))
         self._omega_rows_field.from_numpy(omega_rows)
         self._bg_omega_all_np = omega_rows
+        self._bg_r_norm_all = r_norm
 
         self._bg_n_r = n_r
         self._bg_n_phi = n_phi
@@ -3521,23 +3594,59 @@ class TaichiRenderer:
         ]
 
         omega_np = self._bg_omega_all_np
+        r_norm_all = self._bg_r_norm_all if hasattr(self, '_bg_r_norm_all') else np.linspace(0, 1, n_r)
+        phi_arr = np.linspace(0, 2 * np.pi, n_phi, endpoint=False)
+        two_pi = 2 * np.pi
 
         for key, d_idx, t_idx in component_map:
             factory = factories.get(key)
             if factory is None:
                 continue
             for entity in factory.alive_entities:
-                alpha = entity.fade_factor(now)
-                if alpha <= 0:
-                    continue
                 age = now - entity.birth_time
-                for k, ri in enumerate(entity.row_indices):
-                    if 0 <= ri < n_r:
-                        shift_ri = int(age * omega_np[ri] / (2 * np.pi) * n_phi)
-                        staging[d_idx, ri] += np.roll(
-                            entity.phi_density[k], -shift_ri) * alpha
-                        staging[t_idx, ri] += np.roll(
-                            entity.phi_temp[k], -shift_ri) * alpha
+
+                if entity.entity_type == 'filament':
+                    decay = entity.density_factor(age)
+                    if decay < FILAMENT_DEATH_THRESHOLD:
+                        continue
+
+                    s0 = max(entity.blob_sigma_phi0, 1e-6)
+                    sigma_phi_t = s0 + entity.alpha_shear * age
+                    amplitude_d = entity.blob_peak_density * s0 / sigma_phi_t
+                    amplitude_t = entity.blob_peak_temp * s0 / sigma_phi_t
+
+                    fade_in_dur = FILAMENT_BIRTH_FADE_DUR
+                    birth_alpha = min(age / fade_in_dur, 1.0) if fade_in_dur > 0 else 1.0
+
+                    cool_factor = math.exp(-age / entity.tau_cool) if entity.tau_cool > 0 else 1.0
+                    scale_d = amplitude_d * birth_alpha * cool_factor
+                    scale_t = amplitude_t * birth_alpha * cool_factor
+
+                    inv_2sigma_phi_sq = 0.5 / (sigma_phi_t * sigma_phi_t)
+                    sigma_r = max(entity.blob_sigma_r, 1e-6)
+                    inv_2sigma_r_sq = 0.5 / (sigma_r * sigma_r)
+
+                    for k, ri in enumerate(entity.row_indices):
+                        if 0 <= ri < n_r:
+                            r_w = math.exp(-(r_norm_all[ri] - entity.blob_base_r) ** 2
+                                           * inv_2sigma_r_sq)
+                            center = (entity.source_phi - omega_np[ri] * age) % two_pi
+                            d_phi = phi_arr - center
+                            d_phi = d_phi - two_pi * np.round(d_phi / two_pi)
+                            phi_profile = np.exp(-d_phi * d_phi * inv_2sigma_phi_sq)
+                            staging[d_idx, ri] += phi_profile * (scale_d * r_w)
+                            staging[t_idx, ri] += phi_profile * (scale_t * r_w)
+                else:
+                    alpha = entity.fade_factor(now)
+                    if alpha <= 0:
+                        continue
+                    for k, ri in enumerate(entity.row_indices):
+                        if 0 <= ri < n_r:
+                            shift_ri = int(age * omega_np[ri] / (2 * np.pi) * n_phi)
+                            staging[d_idx, ri] += np.roll(
+                                entity.phi_density[k], -shift_ri) * alpha
+                            staging[t_idx, ri] += np.roll(
+                                entity.phi_temp[k], -shift_ri) * alpha
 
         self._entity_staging_field.from_numpy(staging)
         self._copy_entity_staging_to_comp(self._comp_field,
@@ -3993,19 +4102,22 @@ def _init_lifecycle_system(renderer: TaichiRenderer, n_r: int, n_phi: int,
     factories = {
         'filament': EntityFactory(
             _spawn_single_filament, target_count=200,
-            lifetime_range=(20.0, 40.0), fade_in=5.0, fade_out=5.0,
+            lifetime_range=(15.0, 60.0), fade_in=0.0, fade_out=0.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 100),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 100,
+            entity_type='filament'),
         'hotspot': EntityFactory(
             _spawn_single_hotspot, target_count=30,
             lifetime_range=(15.0, 30.0), fade_in=4.0, fade_out=4.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 200),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 200,
+            entity_type='hotspot'),
         'rt_spike': EntityFactory(
             _spawn_single_rt_spike, target_count=15,
             lifetime_range=(15.0, 30.0), fade_in=3.0, fade_out=3.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 300),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=seed + 300,
+            entity_type='rt_spike'),
     }
     for f in factories.values():
         f.seed_initial(now=0.0)

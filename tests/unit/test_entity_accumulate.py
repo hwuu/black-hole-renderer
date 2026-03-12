@@ -35,19 +35,22 @@ def _make_renderer_and_factories():
     factories = {
         'filament': EntityFactory(
             _spawn_single_filament, target_count=10,
-            lifetime_range=(10, 20), fade_in=2.0, fade_out=2.0,
+            lifetime_range=(60, 120), fade_in=0.0, fade_out=0.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=100),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=100,
+            entity_type='filament'),
         'hotspot': EntityFactory(
             _spawn_single_hotspot, target_count=5,
             lifetime_range=(8, 15), fade_in=2.0, fade_out=2.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=200),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=200,
+            entity_type='hotspot'),
         'rt_spike': EntityFactory(
             _spawn_single_rt_spike, target_count=3,
             lifetime_range=(8, 15), fade_in=1.5, fade_out=1.5,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=300),
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=300,
+            entity_type='rt_spike'),
     }
     return renderer, factories, n_r, n_phi
 
@@ -99,31 +102,29 @@ class TestAccumulateEntityLayer(unittest.TestCase):
 
     def test_fade_factor_applied(self):
         """刚出生的实体应有较小的 fade alpha。"""
-        from render import EntityFactory, _spawn_single_filament
+        from render import EntityFactory, _spawn_single_hotspot
         n_r, n_phi = self.n_r, self.n_phi
         r_norm_all = np.linspace(0, 1, n_r)
         r_vals = 2.0 + 13.0 * r_norm_all
         omega_all = np.sqrt(0.5 / (r_vals ** 3 + 1e-6)).astype(np.float32)
 
-        # 创建一个刚出生的实体（fade_in=10s，now=1s → alpha=0.1）
+        # filament 使用物理衰减而非 fade；用 hotspot 验证 fade 行为
         fresh_factory = EntityFactory(
-            _spawn_single_filament, target_count=50,
+            _spawn_single_hotspot, target_count=50,
             lifetime_range=(100, 100), fade_in=10.0, fade_out=10.0,
             n_r=n_r, n_phi=n_phi,
-            r_norm_all=r_norm_all, omega_all=omega_all, seed=42)
-        # 手动 spawn，不用 seed_initial（避免 stagger）
+            r_norm_all=r_norm_all, omega_all=omega_all, seed=42,
+            entity_type='hotspot')
         for _ in range(50):
             fresh_factory.entities.append(fresh_factory._spawn_one(now=0.0))
 
-        factories_fresh = {'filament': fresh_factory}
+        factories_fresh = {'hotspot': fresh_factory}
         self.renderer.accumulate_entity_layer(factories_fresh, now=1.0)
-        comp_1s = self.renderer._comp_field.to_numpy()[5].copy()
+        comp_1s = self.renderer._comp_field.to_numpy()[9].copy()
 
-        # 完全 alive 的实体（now=15s → alpha=1.0）
         self.renderer.accumulate_entity_layer(factories_fresh, now=15.0)
-        comp_15s = self.renderer._comp_field.to_numpy()[5].copy()
+        comp_15s = self.renderer._comp_field.to_numpy()[9].copy()
 
-        # alpha=0.1 时的总量应远小于 alpha=1.0
         ratio = comp_1s.sum() / (comp_15s.sum() + 1e-10)
         self.assertLess(ratio, 0.3,
                         f"fade ratio {ratio:.3f} too large, fade not working")
