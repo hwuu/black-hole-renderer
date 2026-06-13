@@ -1013,7 +1013,7 @@ def _generate_disk_texture_rotating_from_state(state: DiskTextureRotatingState,
 
     temp_struct = spiral_temp + turb_temp + arcs_temp + rt_temp + hotspot_temp
     rt_weight = 0.20 if state.enable_rt else 0.0
-    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.15 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
     density = density * disturb_mod
     temp_struct = temp_struct * disturb_mod
@@ -1948,7 +1948,7 @@ def generate_disk_texture(n_phi: int = 1024, n_r: int = 512, seed: int = 42,
 
     # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
-    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.15 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
 # 湍流扰动 - 降低 disturbance 强度，保留更多 spiral arm 和 filament 的分段结构
     density, temp_struct = _apply_disturbance(
@@ -2123,7 +2123,7 @@ def generate_disk_texture_rotating(n_phi: int = 1024, n_r: int = 512, seed: int 
 
     # 组合密度
     rt_weight = 0.20 if enable_rt else 0.0
-    density = 0.15 + 0.10 * spiral + 0.30 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
+    density = 0.15 + 0.10 * spiral + 0.15 * turbulence + 0.20 * hotspot + 0.30 * arcs + rt_weight * rt_spikes
 
     # 湍流扰动
     density, temp_struct = _apply_disturbance(
@@ -3221,7 +3221,7 @@ class TaichiRenderer:
                 dm = comp[12, ri, src]
 
                 # density = weighted sum * disturb_mod * edge
-                density = (0.15 + 0.10 * sp + 0.30 * turb + 0.20 * hs
+                density = (0.15 + 0.10 * sp + 0.15 * turb + 0.20 * hs
                            + 0.30 * arc + rt_w * rt) * dm * edge[ri]
                 density = ti.min(ti.max(density / (density_p98 + 1e-6), 0.0), 1.0)
 
@@ -3410,8 +3410,9 @@ class TaichiRenderer:
                 turb = ti.min(ti.max(
                     t_coarse + t_mid + t_fine + t_extra + t_ultra + t_pixel,
                     0.0), 1.0)
-                comp[3, ri, phi_i] = turb
-                comp[4, ri, phi_i] = 0.05 * turb
+                # 临时关闭 turbulence，便于单独观察其他结构。
+                comp[3, ri, phi_i] = 0.0
+                comp[4, ri, phi_i] = 0.0
 
                 # --- idx 11: az_hotspot ---
                 # 低频正弦方位波 * 噪声调制（使用旋转后的 phi）
@@ -3674,7 +3675,7 @@ class TaichiRenderer:
         dm = comp[12]
 
         rt_w = 0.20 if self._param_enable_rt else 0.0
-        density = (0.15 + 0.10 * sp + 0.30 * turb + 0.20 * hs
+        density = (0.15 + 0.10 * sp + 0.15 * turb + 0.20 * hs
                    + 0.30 * arc + rt_w * rt) * dm
         density *= edge[:, None]
         density_p98 = float(np.percentile(density, 98))
