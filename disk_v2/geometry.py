@@ -12,6 +12,10 @@ from ._array_utils import _restore_bool, _restore_shape, _to_array
 from .params import DiskV2Params
 
 
+_MIN_INNER_EDGE_SOFT_WIDTH_R_S: float = 0.3
+_MIN_OUTER_EDGE_SOFT_WIDTH_R_S: float = 0.6
+
+
 def smoothstep(edge0: float, edge1: float, x: float | np.ndarray) -> float | np.ndarray:
     """计算三次平滑插值函数 `smoothstep`。
 
@@ -120,14 +124,15 @@ def disk_radial_weight(r: float | np.ndarray, params: DiskV2Params) -> float | n
 
     ```
     W_r(r) = W_in(r) · W_out(r)
-    W_in(r)  = smoothstep(r_in, r_in + Δr, r)
-    W_out(r) = 1 - smoothstep(r_out - Δr, r_out, r)
+    W_in(r)  = smoothstep(r_in, r_in + Δr_in, r)
+    W_out(r) = 1 - smoothstep(r_out - Δr_out, r_out, r)
     ```
 
     其中：
 
     ```
-    Δr = edge_softness · (r_out - r_in)
+    Δr_in  = edge_softness · (r_out - r_in)
+    Δr_out = max(Δr_in, 0.6 r_s)
     ```
 
     含义说明：
@@ -137,7 +142,9 @@ def disk_radial_weight(r: float | np.ndarray, params: DiskV2Params) -> float | n
     - 在外边界附近，`W_r(r)` 从 1 平滑过渡到 0；
     - 在盘体外部，`W_r(r) = 0`。
 
-    该权重会被中面密度和中面温度共同复用，用于避免硬边界。
+    该权重会被中面密度和中面温度共同复用，用于避免硬边界。v2.2 起外边界
+    使用较宽的软化下限，避免小盘远景下形成刀切圆边；内边界仍保持较窄的
+    比例软化，避免削掉标准薄盘温度峰。
 
     Args:
         r: 径向坐标，可以是标量或 `np.ndarray`。其物理含义是局部盘坐标中的
@@ -154,9 +161,10 @@ def disk_radial_weight(r: float | np.ndarray, params: DiskV2Params) -> float | n
     Formula:
         ```
         W_r(r) = W_in(r) · W_out(r)
-        W_in(r)  = smoothstep(r_in, r_in + Δr, r)
-        W_out(r) = 1 - smoothstep(r_out - Δr, r_out, r)
-        Δr = edge_softness · (r_out - r_in)
+        W_in(r)  = smoothstep(r_in, r_in + Δr_in, r)
+        W_out(r) = 1 - smoothstep(r_out - Δr_out, r_out, r)
+        Δr_in  = edge_softness · (r_out - r_in)
+        Δr_out = max(Δr_in, 0.6 r_s)
         ```
 
     Physical Meaning:
@@ -169,17 +177,19 @@ def disk_radial_weight(r: float | np.ndarray, params: DiskV2Params) -> float | n
         仍然收口为 `0`。
 
     Simplifications:
-        当前的径向平滑只处理内外边界；垂向方向的平滑关闭由
-        `disk_vertical_weight()` 单独负责，二者分开定义以保持语义清晰。
+        当前的径向平滑只处理盘内 support；`r > r_out` 外的 cinematic diffuse
+        support 不在本函数中实现，留给独立步骤评审。
     """
 
     r_arr = _to_array(r)
     radial_span = params.r_out - params.r_in
-    # 将总径向跨度的一部分作为平滑过渡宽度。
-    soft_width = max(radial_span * params.edge_softness, np.finfo(np.float64).eps)
+    base_soft_width = max(radial_span * params.edge_softness, np.finfo(np.float64).eps)
+    max_width = max(radial_span * 0.49, np.finfo(np.float64).eps)
+    inner_soft_width = min(max(base_soft_width, _MIN_INNER_EDGE_SOFT_WIDTH_R_S), max_width)
+    outer_soft_width = min(max(base_soft_width, _MIN_OUTER_EDGE_SOFT_WIDTH_R_S), max_width)
     # 内边界从 0 平滑爬升到 1，外边界从 1 平滑下降到 0。
-    inner = smoothstep(params.r_in, params.r_in + soft_width, r_arr)
-    outer = 1.0 - smoothstep(params.r_out - soft_width, params.r_out, r_arr)
+    inner = smoothstep(params.r_in, params.r_in + inner_soft_width, r_arr)
+    outer = 1.0 - smoothstep(params.r_out - outer_soft_width, params.r_out, r_arr)
     weight = inner * outer
     weight = np.where((r_arr <= params.r_in) | (r_arr >= params.r_out), 0.0, weight)
     return _restore_shape(weight, r)

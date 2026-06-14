@@ -34,13 +34,17 @@ import numpy as np
 import taichi as ti
 
 from .camera import build_camera_v1_compatible
+from .imaging import reference_exposure
 from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams
 from .stats import RenderStats, compute_render_stats, hdr_luminance
 from .structure_modulations import _ClumpCenters
 from .taichi_impl import (
     DiskV2Taichi,
+    doppler_g_factor_ti,
     disk_half_thickness_ti,
     disk_volume_mask_ti,
+    schwarzschild_gravitational_g_ti,
+    schwarzschild_orbital_beta_ti,
 )
 
 
@@ -157,12 +161,16 @@ class DiskV2Renderer:
         self.print_stats = bool(print_stats)
         self.last_stats: RenderStats | None = None
         self.last_white_point: float = 1.0
+        self.last_actual_hdr_white_point: float | None = None
+        exposure_ref = reference_exposure(params, opacity_scale)
+        self.reference_white_point: float = 1.0 / max(float(exposure_ref), 1e-12)
 
         # 把基础场和 palette 包装为 Taichi 句柄。
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
             palette_params=palette_params,
+            emission_opacity_scale=opacity_scale,
             seed=seed,
             centers=centers,
         )
@@ -209,11 +217,7 @@ class DiskV2Renderer:
         g_cap = float(self.g_cap)
         enable_g = bool(self.enable_g_factor)
 
-        # Phase 5 物理常数：Schwarzschild M = 0.5（让 r_s = 2M = 1）。
-        # Schwarzschild 圆轨道角速度 Ω(r) = sqrt(M/r³) / sqrt(1 - 3M/r)。
-        # 注意 r_isco = 3 r_s = 6M = 3.0 (单位 r_s)；ISCO 内 1 - 3M/r ≤ 0，公式发散。
-        # 我们要求 r_in ≥ 3 r_s（params.py 强制），所以这里恒为正。
-        sch_M = 0.5
+        # Phase 5 g-factor 公式集中在 taichi_impl.py helper 中，避免体积/薄层路径漂移。
 
         @ti.func
         def _compute_acceleration(pos, L2):
@@ -406,15 +410,12 @@ class DiskV2Renderer:
                                 if in_disk == 1:
                                     j_em = disk.sample_emission(r_local, phi_local, z_local)
                                     T_K = disk.sample_temperature(r_local, z_local)
-                                    color = disk.sample_palette_color(T_K)
                                     atlas_color = disk.sample_atlas_color_mod_ti(r_local, phi_local)
                                     rho = disk.sample_density(r_local, phi_local, z_local)
                                     alpha_k = opacity_scale * ti.max(rho, 0.0)
                                     g_total = 1.0
                                     if ti.static(enable_g):
                                         r_safe_em = ti.max(r_local, 3.0 * rs)
-                                        denom_om = ti.sqrt(ti.max(1.0 - 3.0 * sch_M / r_safe_em, 1e-6))
-                                        omega_em = ti.sqrt(sch_M / (r_safe_em ** 3)) / denom_om
                                         inv_r = 1.0 / ti.max(r_local, 1e-6)
                                         v_hat_local = ti.Vector([
                                             -sl[1] * inv_r, sl[0] * inv_r, 0.0,
@@ -426,50 +427,28 @@ class DiskV2Renderer:
                                             v_hat_local[1] * cos_t - v_hat_local[2] * sin_t,
                                             v_hat_local[1] * sin_t + v_hat_local[2] * cos_t,
                                         ], dt=ti.f32)
-                                        lapse = ti.sqrt(ti.max(1.0 - rs / r_safe_em, 1e-6))
-                                        beta = ti.min(
-                                            r_safe_em * omega_em / ti.max(lapse, 1e-6), 0.99,
-                                        )
-                                        gamma = 1.0 / ti.sqrt(ti.max(1.0 - beta * beta, 1e-6))
                                         ray_to_cam = -dir_
                                         cos_theta = v_hat_world.dot(ray_to_cam.normalized())
-                                        denom = ti.max(1.0 - beta * cos_theta, 1e-3)
-                                        g_doppler = 1.0 / (gamma * denom)
+                                        beta = schwarzschild_orbital_beta_ti(r_safe_em, rs, 0.01, 0.99)
+                                        g_doppler = doppler_g_factor_ti(beta, cos_theta)
                                         r_obs = cp.norm()
-                                        grav_num = ti.sqrt(ti.max(1.0 - rs / ti.max(r_obs, rs + 1e-3), 1e-6))
-                                        grav_den = ti.sqrt(ti.max(1.0 - rs / ti.max(r_safe_em, rs + 1e-3), 1e-6))
-                                        g_grav = grav_num / grav_den
+                                        g_grav = schwarzschild_gravitational_g_ti(r_safe_em, r_obs, rs)
                                         g_total = ti.min(g_doppler * g_grav, g_cap)
                                     intensity_factor = ti.pow(ti.max(g_total, 0.1), lum_power)
-                                    wien_color_factor = ti.Vector([1.0, 1.0, 1.0], dt=ti.f32)
-                                    if ti.static(enable_g):
-                                        g_safe = ti.max(g_total, 0.1)
-                                        wien_arg = 1.0 - 1.0 / g_safe
-                                        T_for_wien = ti.max(T_K, 1.0e3)
-                                        x_r = 0.01439 / (650.0e-9 * T_for_wien)
-                                        x_g = 0.01439 / (530.0e-9 * T_for_wien)
-                                        x_b = 0.01439 / (460.0e-9 * T_for_wien)
-                                        wien_color_factor = ti.Vector([
-                                            ti.exp(x_r * wien_arg),
-                                            ti.exp(x_g * wien_arg),
-                                            ti.exp(x_b * wien_arg),
-                                        ], dt=ti.f32)
-                                        norm_g = wien_color_factor[1]
-                                        wien_color_factor = wien_color_factor / ti.max(norm_g, 1e-6)
-                                        wien_color_factor = ti.Vector([
-                                            ti.min(wien_color_factor[0], 3.0),
-                                            ti.min(wien_color_factor[1], 3.0),
-                                            ti.min(wien_color_factor[2], 3.0),
-                                        ], dt=ti.f32)
+                                    color = disk.sample_observed_palette_color(T_K, g_total)
                                     ds = (new_pos - old_pos).norm() / n_vol
                                     shifted_color = ti.Vector([
-                                        color[0] * wien_color_factor[0] * atlas_color,
-                                        color[1] * wien_color_factor[1] * atlas_color,
-                                        color[2] * wien_color_factor[2] * atlas_color,
+                                        color[0] * atlas_color,
+                                        color[1] * atlas_color,
+                                        color[2] * atlas_color,
                                     ], dt=ti.f32)
                                     hdr_accum += transmittance * emission_scale * j_em * shifted_color * intensity_factor * ds
                                     transmittance *= ti.exp(-alpha_k * ds)
                     else:
+                        # Thin-layer visual path:
+                        # use_visual_atlas=True 时，为保留快速视觉验收路径，这里退化为
+                        # 倾斜中面单次命中 + 表面发射/alpha 合成。它不是真正的有限厚度
+                        # 体积积分；但发射、颜色、g-factor 与 HDR/tonemap 仍走同一物理 helper。
                         f_old = old_pos[2] - old_pos[1] * tan_t
                         f_new = new_pos[2] - new_pos[1] * tan_t
                         if f_old * f_new < 0.0:
@@ -479,14 +458,12 @@ class DiskV2Renderer:
                             hit_r = ti.sqrt(hit_x * hit_x + hit_y * hit_y)
                             if hit_r >= disk._r_in and hit_r <= disk._r_out:
                                 phi_hit = ti.atan2(hit_y, hit_x)
-                                ew = disk.sample_emission_atlas_ti(hit_r, phi_hit)
                                 j_em = disk.sample_emission(hit_r, phi_hit, 0.0)
-                                color = disk.sample_visual_disk_color_ti(hit_r, phi_hit, 0.0)
+                                rho = disk.sample_density(hit_r, phi_hit, 0.0)
+                                T_K = disk.sample_temperature(hit_r, 0.0)
                                 g_total = 1.0
                                 if ti.static(enable_g):
                                     r_safe_em = ti.max(hit_r, 3.0 * rs)
-                                    denom_om = ti.sqrt(ti.max(1.0 - 3.0 * sch_M / r_safe_em, 1e-6))
-                                    omega_em = ti.sqrt(sch_M / (r_safe_em ** 3)) / denom_om
                                     inv_r = 1.0 / ti.max(hit_r, 1e-6)
                                     v_hat_local = ti.Vector([
                                         -hit_y * inv_r, hit_x * inv_r, 0.0,
@@ -498,64 +475,24 @@ class DiskV2Renderer:
                                         v_hat_local[1] * cos_t - v_hat_local[2] * sin_t,
                                         v_hat_local[1] * sin_t + v_hat_local[2] * cos_t,
                                     ], dt=ti.f32)
-                                    lapse = ti.sqrt(ti.max(1.0 - rs / r_safe_em, 1e-6))
-                                    beta = ti.min(
-                                        r_safe_em * omega_em / ti.max(lapse, 1e-6), 0.99,
-                                    )
-                                    gamma = 1.0 / ti.sqrt(ti.max(1.0 - beta * beta, 1e-6))
                                     ray_to_cam = -dir_
                                     cos_theta = v_hat_world.dot(ray_to_cam.normalized())
-                                    denom = ti.max(1.0 - beta * cos_theta, 1e-3)
-                                    g_doppler = 1.0 / (gamma * denom)
+                                    beta = schwarzschild_orbital_beta_ti(r_safe_em, rs, 0.01, 0.99)
+                                    g_doppler = doppler_g_factor_ti(beta, cos_theta)
                                     r_obs = cp.norm()
-                                    grav_num = ti.sqrt(ti.max(1.0 - rs / ti.max(r_obs, rs + 1e-3), 1e-6))
-                                    grav_den = ti.sqrt(ti.max(1.0 - rs / ti.max(r_safe_em, rs + 1e-3), 1e-6))
-                                    g_grav = grav_num / grav_den
+                                    g_grav = schwarzschild_gravitational_g_ti(r_safe_em, r_obs, rs)
                                     g_total = ti.min(g_doppler * g_grav, g_cap)
                                 intensity_factor = ti.pow(ti.max(g_total, 0.1), lum_power)
-                                wien_color_factor = ti.Vector([1.0, 1.0, 1.0], dt=ti.f32)
-                                if ti.static(enable_g):
-                                    g_safe = ti.max(g_total, 0.1)
-                                    wien_arg = 1.0 - 1.0 / g_safe
-                                    T_for_wien = 8000.0
-                                    x_r = 0.01439 / (650.0e-9 * T_for_wien)
-                                    x_g = 0.01439 / (530.0e-9 * T_for_wien)
-                                    x_b = 0.01439 / (460.0e-9 * T_for_wien)
-                                    wien_color_factor = ti.Vector([
-                                        ti.exp(x_r * wien_arg),
-                                        ti.exp(x_g * wien_arg),
-                                        ti.exp(x_b * wien_arg),
-                                    ], dt=ti.f32)
-                                    norm_g = wien_color_factor[1]
-                                    wien_color_factor = wien_color_factor / ti.max(norm_g, 1e-6)
-                                    wien_color_factor = ti.Vector([
-                                        ti.min(wien_color_factor[0], 3.0),
-                                        ti.min(wien_color_factor[1], 3.0),
-                                        ti.min(wien_color_factor[2], 3.0),
-                                    ], dt=ti.f32)
+                                color = disk.sample_observed_palette_color(T_K, g_total)
                                 shifted_color = ti.Vector([
-                                    color[0] * wien_color_factor[0],
-                                    color[1] * wien_color_factor[1],
-                                    color[2] * wien_color_factor[2],
+                                    color[0],
+                                    color[1],
+                                    color[2],
                                 ], dt=ti.f32)
-                                r_ratio = disk._r_in / ti.max(hit_r, disk._r_in)
-                                radial_falloff = ti.pow(ti.max(r_ratio, 0.0), 1.25)
-                                # Visual atlas 只提供纹理细节；半径方向仍需遵守内热外冷的发射梯度。
-                                radial_emission = 0.05 + 1.35 * radial_falloff
-                                emissivity = ti.max(
-                                    radial_emission,
-                                    0.25 * ti.pow(ti.max(j_em, 0.0), 0.55),
-                                )
                                 radiance = (
-                                    shifted_color * intensity_factor * emission_scale * emissivity
+                                    shifted_color * intensity_factor * emission_scale * j_em
                                 )
-                                radiance = ti.Vector([
-                                    ti.min(radiance[0], 1.0),
-                                    ti.min(radiance[1], 1.0),
-                                    ti.min(radiance[2], 1.0),
-                                ], dt=ti.f32)
-                                radial_alpha = 0.22 + 0.78 * ti.sqrt(radial_falloff)
-                                base_alpha = ti.min(ew * radial_alpha, 0.999)
+                                base_alpha = ti.min(opacity_scale * ti.max(rho, 0.0), 0.999)
                                 disk_alpha = 1.0 - ti.pow(1.0 - base_alpha, alpha_gain)
                                 front = 1.0 - plane_alpha_total
                                 plane_disk += radiance * disk_alpha * front
@@ -574,11 +511,6 @@ class DiskV2Renderer:
 
                 hdr_total = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
                 if ti.static(use_visual_atlas):
-                    plane_disk = ti.Vector([
-                        ti.min(ti.max(plane_disk[0], 0.0), 1.0),
-                        ti.min(ti.max(plane_disk[1], 0.0), 1.0),
-                        ti.min(ti.max(plane_disk[2], 0.0), 1.0),
-                    ], dt=ti.f32)
                     bg_color = bg_color * (1.0 - plane_alpha_total)
                     hdr_total = plane_disk + bg_color
                 else:
@@ -595,27 +527,12 @@ class DiskV2Renderer:
             wp = self.white_point_field[None]
             inv_wp = 1.0 / ti.max(wp, 1e-6)
             for i, j in self.image_field:
-                hdr = self.hdr_field[i, j] * inv_wp
+                hdr = disk.apply_exposure_ti(self.hdr_field[i, j], inv_wp)
                 ldr = disk.tonemap_reinhard(hdr)
                 ldr = disk.gamma_correct_ti(ldr)
                 self.image_field[i, j] = ldr
 
         self._tonemap_kernel = _tonemap_kernel
-
-        @ti.kernel
-        def _gamma_only_kernel():
-            """Visual atlas LDR 路径：跳过 Reinhard，仅 clamp + sRGB 伽马（对齐 V1 盘层合成）。"""
-            for i, j in self.image_field:
-                hdr = self.hdr_field[i, j]
-                ldr = ti.Vector([
-                    ti.min(ti.max(hdr[0], 0.0), 1.0),
-                    ti.min(ti.max(hdr[1], 0.0), 1.0),
-                    ti.min(ti.max(hdr[2], 0.0), 1.0),
-                ], dt=ti.f32)
-                ldr = disk.gamma_correct_ti(ldr)
-                self.image_field[i, j] = ldr
-
-        self._gamma_only_kernel = _gamma_only_kernel
 
     def _setup_camera(self, cam_pos: List[float], fov: float) -> None:
         """计算相机基向量并填到 Taichi field 中（与 V1 `build_camera` 一致）。"""
@@ -642,21 +559,71 @@ class DiskV2Renderer:
         r_escape = max(self.r_max, distance * 2.0, r_out * 1.6)
         self.r_escape_field[None] = r_escape
 
-    def _compute_white_point(self, hdr_np: np.ndarray) -> float:
+    # D3：物理 reference 与 actual HDR p99 的合理偏差窗口。
+    # ratio = actual_hdr_p99 / reference_white_point ∈ [_RATIO_TRUSTED_LO, _RATIO_TRUSTED_HI]
+    # 时，使用 reference（cinematic 曝光基线物理可控、跨场景一致）。
+    # 落在该窗口之外才视为 reference 不可信，fallback 到 HDR p99 兜底。
+    #
+    # D2 实测：默认主验收参数下 ratio ≈ 4.3（g-factor·tilt·palette·transmittance
+    # 共同贡献），完全在合理范围内。把判定窗口放宽到 [0.1, 10] 让 reference
+    # 在正常物理偏差下都生效；
+    # 进一步落到外层 [0.01, 100] 区间时打 warning，便于发现物理参数异常；
+    # 超过 [0.01, 100] 才完全 fallback 到 HDR p99，避免单帧黑掉或全白。
+    _RATIO_TRUSTED_LO: float = 0.1
+    _RATIO_TRUSTED_HI: float = 10.0
+    _RATIO_WARN_LO: float = 0.01
+    _RATIO_WARN_HI: float = 100.0
+
+    def _compute_white_point(self, hdr_np: np.ndarray) -> tuple[float, float]:
         """从 HDR buffer 计算 tonemap 用的 white point。
 
         Args:
             hdr_np: 形状 `(W, H, 3)` 的 HDR RGB。
 
         Returns:
-            非负 white point 标量。
+            `(used_white_point, actual_hdr_white_point)`：
+
+            - `used_white_point`：fallback 判定后实际用于 tonemap 的 white point。
+            - `actual_hdr_white_point`：HDR p{white_point_percentile} 原始候选值
+              （fallback 判定前）；与 `reference_white_point` 之比即 D3 ratio。
+
+        Notes:
+            判定逻辑（D3 修订）：
+
+            - 若 `actual_hdr_p{n}` 与 `reference_white_point` 比值落在
+              `[_RATIO_TRUSTED_LO, _RATIO_TRUSTED_HI]`，使用 reference。
+              这是 cinematic 曝光基线，物理可控、跨场景稳定。
+            - 比值落在 `[_RATIO_WARN_LO, _RATIO_WARN_HI]` 但越出 trusted
+              窗口时，打印 warning，但仍优先使用 reference，保持曝光稳定。
+            - 比值越出 warn 窗口才完全 fallback 到 HDR p{n}，避免极端
+              情况下出图全黑或全白。
+
+            注：`n = white_point_percentile`，默认 99；`interstellar` preset 用 96。
         """
         luma = hdr_luminance(hdr_np).ravel()
         luma = luma[np.isfinite(luma)]
         if luma.size == 0:
-            return 1.0
+            return 1.0, 1.0
         pct = float(np.clip(self.white_point_percentile, 50.0, 99.99))
-        return max(float(np.percentile(luma, pct)), 1e-6)
+        hdr_wp = max(float(np.percentile(luma, pct)), 1e-6)
+        ref_wp = max(float(self.reference_white_point), 1e-6)
+        ratio = hdr_wp / ref_wp
+
+        if self._RATIO_TRUSTED_LO <= ratio <= self._RATIO_TRUSTED_HI:
+            return ref_wp, hdr_wp
+        if self._RATIO_WARN_LO <= ratio <= self._RATIO_WARN_HI:
+            print(
+                f"[V2 exposure] warning: actual HDR p{pct:g} / reference = {ratio:.2f}, "
+                f"偏离 trusted 窗口 [{self._RATIO_TRUSTED_LO}, {self._RATIO_TRUSTED_HI}]；"
+                f"仍使用 reference 保持曝光基线稳定，请检查物理参数。"
+            )
+            return ref_wp, hdr_wp
+        # 极端偏离：reference 不可信，兜底 HDR p{n}，避免单帧异常。
+        print(
+            f"[V2 exposure] reference 不可信: actual/ref = {ratio:.2g}（HDR p{pct:g}），"
+            f"超过 [{self._RATIO_WARN_LO}, {self._RATIO_WARN_HI}]；fallback 到 HDR p{pct:g}。"
+        )
+        return hdr_wp, hdr_wp
 
     def render(self, cam_pos: List[float], fov: float) -> np.ndarray:
         """渲染单帧（含可选 Bloom）。
@@ -682,18 +649,16 @@ class DiskV2Renderer:
             self.hdr_field.from_numpy(hdr_np.astype(np.float32))
 
         hdr_for_stats = self.hdr_field.to_numpy()
-        use_atlas_ldr = bool(self.disk_ti._use_visual_atlas)
-        if use_atlas_ldr:
-            white_point = 1.0
+        if self.auto_exposure:
+            white_point, actual_hdr_wp = self._compute_white_point(hdr_for_stats)
         else:
-            white_point = self._compute_white_point(hdr_for_stats) if self.auto_exposure else 1.0
+            white_point = 1.0
+            actual_hdr_wp = None
         self.last_white_point = white_point
+        self.last_actual_hdr_white_point = actual_hdr_wp
         self.white_point_field[None] = float(white_point)
 
-        if use_atlas_ldr:
-            self._gamma_only_kernel()
-        else:
-            self._tonemap_kernel()
+        self._tonemap_kernel()
         img = self.image_field.to_numpy()  # (W, H, 3)
         img = np.transpose(img, (1, 0, 2))
         img = np.clip(img, 0.0, 1.0).astype(np.float32)
@@ -702,6 +667,11 @@ class DiskV2Renderer:
             hdr_for_stats,
             img,
             white_point=white_point if self.auto_exposure else None,
+            reference_white_point=self.reference_white_point if self.auto_exposure else None,
+            actual_hdr_white_point=actual_hdr_wp,
+            white_point_percentile=(
+                float(self.white_point_percentile) if self.auto_exposure else None
+            ),
         )
         self.last_stats = stats
         if self.print_stats:

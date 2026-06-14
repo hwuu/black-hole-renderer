@@ -4602,11 +4602,11 @@ def parse_args() -> argparse.Namespace:
                              "默认 0 避免出现大块亮斑 (default: 0.0)")
     parser.add_argument("--v2_palette_mode", type=str, default="cinematic",
                         choices=["physical", "cinematic"],
-                        help="V2 模式下调色: physical 或 cinematic (default: cinematic)")
+                        help="V2 模式下显示链: physical=诊断剖面，cinematic=log-T 可见色温 + 曝光/Bloom (default: cinematic)")
     parser.add_argument("--v2_volume_samples", type=int, default=32,
                         help="V2 模式下盘内体积积分步数 (default: 32)")
     parser.add_argument("--v2_opacity_scale", type=float, default=0.55,
-                        help="V2 模式下盘体不透明度缩放 (default: 0.55)")
+                        help="V2 模式下 effective opacity 缩放；v2.2 reference 用于 tau_eff=rho_mid*H*scale (default: 0.55)")
     parser.add_argument("--v2_emission_scale", type=float, default=1.0,
                         help="V2 模式下 HDR 发射率整体曝光缩放。调低可避免盘面饱和 (default: 1.0)")
     parser.add_argument("--v2_seed", type=int, default=42,
@@ -4620,12 +4620,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2_r_max", type=float, default=None,
                         help="V2 模式下逃逸半径下限。默认 None 表示使用 --r_max（10）；"
                              "建议在 r_out=50 默认下传 20，让大盘和远端光线有充分的绕回空间。")
-    parser.add_argument("--v2_bloom_threshold", type=float, default=1.0,
-                        help="V2 模式下 Bloom 亮度阈值（HDR 域）。仅当 --v2_bloom_intensity > 0 时生效。(default: 1.0)")
-    parser.add_argument("--v2_bloom_intensity", type=float, default=0.0,
-                        help="V2 模式下 Bloom 强度。0 关闭；推荐弱 Bloom 0.3 ~ 0.6，电影感 0.8 ~ 1.2。(default: 0.0)")
-    parser.add_argument("--v2_bloom_radius", type=float, default=4.0,
-                        help="V2 模式下 Bloom 高斯模糊半径（像素）。推荐 3 ~ 8。(default: 4.0)")
+    parser.add_argument("--v2_bloom_threshold", type=float, default=None,
+                        help="V2 模式下 Bloom 亮度阈值（HDR 域）。仅当 --v2_bloom_intensity > 0 时生效。"
+                             "默认 None：无 preset 时取 1.0，interstellar preset 取 5e-4。")
+    parser.add_argument("--v2_bloom_intensity", type=float, default=None,
+                        help="V2 模式下 Bloom 强度。0 关闭；推荐弱 Bloom 0.3 ~ 0.6，电影感 1.0 ~ 2.0。"
+                             "默认 None：无 preset 时取 0.0（关闭），interstellar preset 取 1.5。")
+    parser.add_argument("--v2_bloom_radius", type=float, default=None,
+                        help="V2 模式下 Bloom 高斯模糊半径（像素）。推荐 4 ~ 12。"
+                             "默认 None：无 preset 时取 4.0，interstellar preset 取 8.0。")
     parser.add_argument("--v2_auto_exposure", action="store_true",
                         help="V2 模式下根据 HDR p99 自动设置 white point，避免手动猜 emission_scale")
     parser.add_argument("--v2_white_point_percentile", type=float, default=99.0,
@@ -4648,7 +4651,7 @@ def parse_args() -> argparse.Namespace:
                         help="V2 关闭视觉 atlas，回退 F_shear 路径")
     parser.add_argument("--v2_visual_preset", type=str, default=None,
                         choices=["interstellar"],
-                        help="V2 视觉预设：interstellar = 验收相机 + auto exposure + 弱 bloom")
+                        help="V2 视觉预设：interstellar = 统一 V2 物理路径上的 cinematic 曝光 + 弱 bloom")
     return parser.parse_args()
 
 
@@ -4739,11 +4742,29 @@ def resolve_v2_render_options(args) -> dict:
     Returns:
         传给 `DiskV2Renderer` 的 kwargs 覆盖片段。
     """
+    # bloom 三个参数 CLI 默认 None（无 preset 时 fallback 到下面的"无 preset 默认"）。
+    # 这样 preset 才能区分"用户未指定"（None）与"用户显式传 0"（0.0）。
+    no_preset_bloom_threshold = 1.0
+    no_preset_bloom_intensity = 0.0
+    no_preset_bloom_radius = 4.0
+
     opts = {
         "auto_exposure": args.v2_auto_exposure,
-        "bloom_threshold": args.v2_bloom_threshold,
-        "bloom_intensity": args.v2_bloom_intensity,
-        "bloom_radius": args.v2_bloom_radius,
+        "bloom_threshold": (
+            args.v2_bloom_threshold
+            if args.v2_bloom_threshold is not None
+            else no_preset_bloom_threshold
+        ),
+        "bloom_intensity": (
+            args.v2_bloom_intensity
+            if args.v2_bloom_intensity is not None
+            else no_preset_bloom_intensity
+        ),
+        "bloom_radius": (
+            args.v2_bloom_radius
+            if args.v2_bloom_radius is not None
+            else no_preset_bloom_radius
+        ),
         "palette_mode": args.v2_palette_mode,
         "opacity_scale": args.v2_opacity_scale,
         "emission_scale": args.v2_emission_scale,
@@ -4753,18 +4774,28 @@ def resolve_v2_render_options(args) -> dict:
         "white_point_percentile": args.v2_white_point_percentile,
     }
     if args.v2_visual_preset == "interstellar":
-        opts["auto_exposure"] = False
+        opts["auto_exposure"] = True
         opts["palette_mode"] = "cinematic"
-        if args.v2_bloom_intensity == 0.0:
-            opts["bloom_intensity"] = 0.45
-        if args.v2_bloom_threshold == 1.0:
-            opts["bloom_threshold"] = 0.15
+        # bloom：用 None 判定，让用户的 `--v2_bloom_intensity 0` 显式关闭仍然有效
+        if args.v2_bloom_intensity is None:
+            # 修 C：D3 reference 路径下 HDR max ≈ 0.025，旧默认 intensity=0.45 偏弱。
+            # 1.5 让 bloom 有明显 halo 效果但不喧宾夺主。
+            opts["bloom_intensity"] = 1.5
+        if args.v2_bloom_threshold is None:
+            # 修 C：HDR p99.5 ≈ 5e-4，旧默认 0.15 完全过滤掉 bloom。
+            # 5e-4 让"盘核心 + 最亮细丝"进入 bloom，外缘暗区不进。
+            opts["bloom_threshold"] = 5e-4
+        if args.v2_bloom_radius is None:
+            # 修 C：r=4 halo 太窄不明显，r=8 有适度铺开。
+            opts["bloom_radius"] = 8.0
         if args.v2_opacity_scale == 0.55:
             opts["opacity_scale"] = 0.08
         if args.v2_emission_scale == 1.0:
             opts["emission_scale"] = 1.85
-        if args.v2_lum_power == 4.0:
-            opts["lum_power"] = 2.5
+        # 注意：不再覆盖 lum_power。D2+D3 之前曾把 lum_power 从 4 降到 2.5 以避免
+        # HDR 饱和，但这等于把 plan Step 4 严格 g^4 物理变成 g^2.5，吃掉了多普勒
+        # 视觉显著性。D3 后曝光 reference 物理可控，HDR 由 Reinhard 自然压缩，
+        # 不再需要这个 hack。
         if args.v2_volume_samples == 16:
             opts["volume_samples"] = 32
         if args.v2_r_max is None:
@@ -4812,6 +4843,11 @@ if __name__ == "__main__":
             raise ValueError(
                 "--disk_model v2 当前仅推荐并支持 --device gpu。CPU 路径在小图下也可能耗时数分钟且无进度输出；"
                 "请加上 '--device gpu' 后重试。"
+            )
+        if args.v2_lum_power != 4.0:
+            print(
+                f"[V2] 警告：--v2_lum_power={args.v2_lum_power} 不等于 4；"
+                "这会偏离 I_obs = g^4 I_em 的相对论强度变换，仅建议用于实验/调试。"
             )
         from disk_v2.params import (
             DiskV2PaletteParams,

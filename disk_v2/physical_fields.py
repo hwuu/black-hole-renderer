@@ -18,6 +18,7 @@ import numpy as np
 from ._array_utils import _restore_shape, _to_array
 from .geometry import disk_half_thickness, disk_radial_weight, disk_vertical_weight, disk_volume_mask
 from .params import DiskV2Params
+from .relativity import omega_norm
 
 
 # 标准薄盘启发式 T_raw(r) = (r/r_in)^(-3/4) · [1 - sqrt(r_in/r)]^(1/4)
@@ -61,7 +62,7 @@ def angular_velocity_field(r: float | np.ndarray, params: DiskV2Params) -> float
 
     r_arr = _to_array(r)
     safe_r = np.maximum(r_arr, params.r_in)
-    omega = params.omega_scale * np.power(safe_r / params.r_in, -1.5)
+    omega = params.omega_scale * _to_array(omega_norm(safe_r, params.r_in))
     return _restore_shape(omega, r)
 
 
@@ -140,6 +141,39 @@ def midplane_density_field(r: float | np.ndarray, params: DiskV2Params) -> float
     return _restore_shape(density_mid, r)
 
 
+def raw_midplane_density_field(r: float | np.ndarray, params: DiskV2Params) -> float | np.ndarray:
+    """计算未乘径向 support 的中面密度剖面 `ρ_raw(r)`。
+
+    Args:
+        r: 局部盘坐标中的径向距离，可以是标量或数组。
+        params: `DiskV2Params` 参数对象。
+
+    Returns:
+        与 `r` 同形状的非负密度剖面。`r <= r_in` 时为 0；外边界外不做
+        `W_r` 收口，调用方应单独乘 support。
+
+    Formula:
+        ```
+        ρ_raw(r) = (r / r_in)^(-rho_power) · [1 - sqrt(r_in / r)]^(1/2)
+        ```
+
+    Physical Meaning:
+        用于 v2.2 成像主链，避免 `ρ_mid` 与 `T_mid` 中已经包含的 `W_r`
+        在 `F_phys` 中被重复乘成 `W_r^5`。
+
+    Simplifications:
+        不包含外边界 support；这是调用方的职责。
+    """
+    r_arr = _to_array(r)
+    safe_r = np.maximum(r_arr, params.r_in)
+    inner_term = np.clip(1.0 - np.sqrt(params.r_in / safe_r), 0.0, None)
+    density_raw = np.power(safe_r / params.r_in, -params.rho_power) * np.power(
+        inner_term, 0.5,
+    )
+    density_raw = np.where(r_arr <= params.r_in, 0.0, density_raw)
+    return _restore_shape(density_raw, r)
+
+
 def midplane_temperature_field(r: float | np.ndarray, params: DiskV2Params) -> float | np.ndarray:
     """计算中面温度剖面 `T_mid(r)`（v2.1 改为带量纲，单位为 K）。
 
@@ -188,6 +222,37 @@ def midplane_temperature_field(r: float | np.ndarray, params: DiskV2Params) -> f
     )
     temperature_mid = np.where(r_arr <= params.r_in, 0.0, temperature_mid)
     return _restore_shape(temperature_mid, r)
+
+
+def raw_midplane_temperature_field(r: float | np.ndarray, params: DiskV2Params) -> float | np.ndarray:
+    """计算未乘径向 support 的中面温度剖面 `T_raw_mid(r)`。
+
+    Args:
+        r: 局部盘坐标中的径向距离，可以是标量或数组。
+        params: `DiskV2Params` 参数对象。
+
+    Returns:
+        与 `r` 同形状的温度（K）。`r <= r_in` 时为 0；外边界外不做 `W_r`
+        收口，调用方应单独乘 support。
+
+    Formula:
+        ```
+        T_raw_mid(r) = T_peak_K · norm_factor
+                     · (r / r_in)^(-3/4)
+                     · [1 - sqrt(r_in / r)]^(1/4)
+        ```
+
+    Physical Meaning:
+        用于 v2.2 成像主链，使 support 只在最终 `F_phys` 中出现一次。
+
+    Simplifications:
+        不包含径向 support；这是调用方的职责。
+    """
+    r_arr = _to_array(r)
+    raw = _thin_disk_temperature_raw(r_arr, params.r_in)
+    temperature_raw = params.T_peak_K * _THIN_DISK_NORM_FACTOR * raw
+    temperature_raw = np.where(r_arr <= params.r_in, 0.0, temperature_raw)
+    return _restore_shape(temperature_raw, r)
 
 
 def density_field(

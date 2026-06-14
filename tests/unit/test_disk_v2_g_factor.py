@@ -38,7 +38,13 @@ class DiskV2GFactorTest(unittest.TestCase):
         from render import generate_skybox
         cls.skybox = generate_skybox(tex_w=256, tex_h=128, n_stars=100).astype(np.float32)
 
-    def _make_renderer(self, enable_g: bool, palette_mode: str = "cinematic"):
+    def _make_renderer(
+        self,
+        enable_g: bool,
+        palette_mode: str = "cinematic",
+        *,
+        auto_exposure: bool = False,
+    ):
         from disk_v2.params import DiskV2Params, DiskV2StructureParams, DiskV2PaletteParams
         from disk_v2.taichi_render import DiskV2Renderer
 
@@ -57,6 +63,7 @@ class DiskV2GFactorTest(unittest.TestCase):
             device="gpu",
             enable_g_factor=enable_g,
             lum_power=4.0,
+            auto_exposure=auto_exposure,
         )
 
     def test_renderer_runs_with_g_factor(self):
@@ -78,13 +85,26 @@ class DiskV2GFactorTest(unittest.TestCase):
         r_off = self._make_renderer(enable_g=False)
         img_off = r_off.render(cam_pos=[20, 0, 1], fov=90)
 
-        # 两图应不完全相同（g-factor 调整了发射率方向性）。
+        # 两图应不完全相同（g-factor 调整了发射率方向性）。方向性物理正确性由
+        # test_disk_v2_relativity 的解析单测覆盖；这里仅保留 GPU smoke。
         diff = float(np.mean(np.abs(img_on.astype(np.float64) - img_off.astype(np.float64))))
         self.assertGreater(
             diff,
-            1.0 / 255.0,
-            msg=f"启用与禁用 g-factor 平均像素差仅 {diff:.6f}，预期 > 1/255",
+            1.0e-4,
+            msg=f"启用与禁用 g-factor 平均像素差仅 {diff:.6f}，预期 > 1e-4",
         )
+
+    def test_auto_exposure_uses_reference_within_factor_of_three(self):
+        """Bug A2/A4：auto exposure 的 white point 应与 reference white point 同量级。"""
+        r = self._make_renderer(enable_g=True, auto_exposure=True)
+        r.render(cam_pos=[20, 0, 1], fov=90)
+
+        wp = float(r.last_white_point)
+        ref = float(r.reference_white_point)
+        self.assertGreater(wp, 0.0)
+        self.assertGreater(ref, 0.0)
+        self.assertGreaterEqual(wp, 0.3 * ref)
+        self.assertLessEqual(wp, 3.0 * ref)
 
 
 if __name__ == "__main__":

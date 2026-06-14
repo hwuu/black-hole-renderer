@@ -25,10 +25,13 @@ from disk_v2.geometry import (
 )
 from disk_v2.params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams
 from disk_v2.palette import (
+    apply_exposure,
     blackbody_color,
     cinematic_color,
+    cinematic_visual_temperature,
     tonemap,
 )
+from disk_v2.imaging import observed_visible_temperature
 from disk_v2.physical_fields import (
     density_field,
     midplane_density_field,
@@ -351,6 +354,89 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
         )
         np.testing.assert_allclose(ti_rgb, np_rgb, rtol=2e-3, atol=2e-3)
 
+    def test_parity_observed_palette_color_cinematic(self):
+        ti_obj = self.ti_cine
+        g_samples = np.linspace(0.5, 1.8, self.n).astype(np.float64)
+
+        @ti.kernel
+        def compute(out_r: ti.template(), out_g: ti.template(), out_b: ti.template(),
+                    T_f: ti.template(), g_f: ti.template(), obj: ti.template()):
+            for i in range(out_r.shape[0]):
+                rgb = obj.sample_observed_palette_color(T_f[i], g_f[i])
+                out_r[i] = rgb[0]
+                out_g[i] = rgb[1]
+                out_b[i] = rgb[2]
+
+        T_f = ti.field(dtype=ti.f32, shape=self.n)
+        g_f = ti.field(dtype=ti.f32, shape=self.n)
+        T_f.from_numpy(self.T_samples.astype(np.float32))
+        g_f.from_numpy(g_samples.astype(np.float32))
+        out_r = ti.field(dtype=ti.f32, shape=self.n)
+        out_g = ti.field(dtype=ti.f32, shape=self.n)
+        out_b = ti.field(dtype=ti.f32, shape=self.n)
+        compute(out_r, out_g, out_b, T_f, g_f, ti_obj)
+        ti_rgb = np.stack([
+            out_r.to_numpy(), out_g.to_numpy(), out_b.to_numpy()
+        ], axis=-1).astype(np.float64)
+
+        t_visible = observed_visible_temperature(
+            # 先用 public 函数得到发射可见色温，再手工应用 g-factor 与
+            # cinematic saturation/warm。
+            cinematic_visual_temperature(
+                self.T_samples,
+                self.params.T_peak_K,
+                self.palette_params_cine,
+            ),
+            g_samples,
+            self.palette_params_cine,
+        )
+        np_rgb = blackbody_color(t_visible)
+        luma = (
+            0.2126 * np_rgb[..., 0]
+            + 0.7152 * np_rgb[..., 1]
+            + 0.0722 * np_rgb[..., 2]
+        )[..., None]
+        np_rgb = luma + self.palette_params_cine.cinematic_saturation * (np_rgb - luma)
+        np_rgb = np.clip(np_rgb, 0.0, 1.0)
+        warm = np.array([
+            1.0 + self.palette_params_cine.cinematic_warm_shift,
+            1.0,
+            1.0 - self.palette_params_cine.cinematic_warm_shift,
+        ])
+        np_rgb = np.clip(np_rgb * warm, 0.0, 1.0)
+
+        np.testing.assert_allclose(ti_rgb, np_rgb, rtol=2e-3, atol=2e-3)
+
+    def test_parity_observed_palette_color_physical_does_not_double_count_g(self):
+        ti_obj = self.ti_phys
+
+        @ti.kernel
+        def compute(out_r: ti.template(), out_g: ti.template(), out_b: ti.template(),
+                    T_f: ti.template(), g_f: ti.template(), obj: ti.template()):
+            for i in range(out_r.shape[0]):
+                rgb = obj.sample_observed_palette_color(T_f[i], g_f[i])
+                out_r[i] = rgb[0]
+                out_g[i] = rgb[1]
+                out_b[i] = rgb[2]
+
+        T_const = np.full(self.n, 6500.0, dtype=np.float64)
+        g_samples = np.linspace(0.5, 2.0, self.n).astype(np.float64)
+        T_f = ti.field(dtype=ti.f32, shape=self.n)
+        g_f = ti.field(dtype=ti.f32, shape=self.n)
+        T_f.from_numpy(T_const.astype(np.float32))
+        g_f.from_numpy(g_samples.astype(np.float32))
+        out_r = ti.field(dtype=ti.f32, shape=self.n)
+        out_g = ti.field(dtype=ti.f32, shape=self.n)
+        out_b = ti.field(dtype=ti.f32, shape=self.n)
+        compute(out_r, out_g, out_b, T_f, g_f, ti_obj)
+        ti_rgb = np.stack([
+            out_r.to_numpy(), out_g.to_numpy(), out_b.to_numpy()
+        ], axis=-1).astype(np.float64)
+
+        expected = blackbody_color(T_const)
+        np.testing.assert_allclose(ti_rgb, expected, rtol=1e-3, atol=1e-3)
+        np.testing.assert_allclose(ti_rgb[0], ti_rgb[-1], rtol=1e-6, atol=1e-6)
+
     def test_parity_tonemap_reinhard(self):
         ti_obj = self.ti_phys
 
@@ -376,6 +462,126 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
 
         np_ldr = np.asarray(tonemap(hdr, self.palette_params_phys), dtype=np.float64)
         np.testing.assert_allclose(ti_ldr, np_ldr, rtol=1e-5, atol=1e-6)
+
+    def test_parity_apply_exposure(self):
+        ti_obj = self.ti_phys
+
+        @ti.kernel
+        def compute(out_r: ti.template(), out_g: ti.template(), out_b: ti.template(),
+                    in_r: ti.template(), in_g: ti.template(), in_b: ti.template(),
+                    obj: ti.template()):
+            for i in range(out_r.shape[0]):
+                v = ti.Vector([in_r[i], in_g[i], in_b[i]], dt=ti.f32)
+                vt = obj.apply_exposure_ti(v, 2.5)
+                out_r[i] = vt[0]
+                out_g[i] = vt[1]
+                out_b[i] = vt[2]
+
+        rng = np.random.default_rng(321)
+        hdr = rng.uniform(0.0, 10.0, (self.n, 3))
+        in_fs = [ti.field(dtype=ti.f32, shape=self.n) for _ in range(3)]
+        out_fs = [ti.field(dtype=ti.f32, shape=self.n) for _ in range(3)]
+        for c in range(3):
+            in_fs[c].from_numpy(hdr[:, c].astype(np.float32))
+        compute(out_fs[0], out_fs[1], out_fs[2], in_fs[0], in_fs[1], in_fs[2], ti_obj)
+        ti_hdr = np.stack([f.to_numpy() for f in out_fs], axis=-1).astype(np.float64)
+
+        np_hdr = np.asarray(apply_exposure(hdr, 2.5), dtype=np.float64)
+        np.testing.assert_allclose(ti_hdr, np_hdr, rtol=1e-5, atol=1e-5)
+
+    def test_parity_volume_emission_integral(self):
+        """D3 公式对齐：在纯物理基线下，Taichi sample_emission 沿 z 数值积分
+        应等于 NumPy physical_baseline_volume_flux。
+
+        这只证明"reference 与 ray-march 的物理公式已对齐"：reference 是 NumPy
+        沿 z 解析积分的"surface 总通量"；Taichi 渲染器走"逐 ds 累积 emissivity
+        per unit volume"，两者在结构调制全部关闭下应同量级（相对误差 < 5%）。
+
+        **不能从此推论 actual HDR 与 reference 已严格匹配** —— 实际渲染叠加
+        g-factor、cinematic palette、transmittance 累积、构图相关 percentile
+        取值后，actual HDR p{n} 与 reference 之间仍会偏离一个数量级，由
+        `_compute_white_point` 的策略性 trusted/warn 窗口吸收。
+
+        为隔离结构调制影响：构造一个"无 atlas / shear=0 / mode=0 / hotspot=0"
+        的 DiskV2Taichi，让 sample_emission 退化为纯物理基线。
+        """
+        from disk_v2.imaging import physical_baseline_volume_flux
+        from disk_v2.taichi_impl import DiskV2Taichi
+
+        # 关闭所有结构调制，让 Taichi sample_emission 退化为
+        # support · opacity · rho_envelope · T_norm^4。
+        flat_structure = DiskV2StructureParams(
+            mode1_strength=0.0,
+            mode2_strength=0.0,
+            shear_strength=0.0,
+            hotspot_strength=0.0,
+            clump_strength=0.0,
+            clump_emission_weight=0.0,
+            use_visual_atlas=False,
+        )
+        opacity = 0.55
+        ti_flat = DiskV2Taichi(
+            params=self.params,
+            structure_params=flat_structure,
+            palette_params=self.palette_params_phys,
+            emission_opacity_scale=opacity,
+            seed=7,
+        )
+
+        # 在固定 r 上沿 z 用 Gauss-Legendre 数值积分 Taichi sample_emission。
+        n_r = 16
+        radii = np.linspace(
+            self.params.r_in + 0.5,
+            self.params.r_out - 0.5,
+            n_r,
+        ).astype(np.float64)
+        # 用与 NumPy 一致的 32 点 Gauss-Legendre。
+        n_z = 32
+        xi_arr, w_arr = np.polynomial.legendre.leggauss(n_z)
+
+        from disk_v2.geometry import disk_half_thickness as np_disk_half_thickness
+        h_arr = np.asarray(np_disk_half_thickness(radii, self.params))
+
+        # Taichi 端用 kernel 读 sample_emission(r, 0, z)。
+        n_total = n_r * n_z
+        r_field = ti.field(dtype=ti.f32, shape=n_total)
+        z_field = ti.field(dtype=ti.f32, shape=n_total)
+        j_field = ti.field(dtype=ti.f32, shape=n_total)
+        r_flat = np.repeat(radii, n_z)
+        z_flat = np.empty(n_total, dtype=np.float64)
+        for i, r in enumerate(radii):
+            z_flat[i * n_z:(i + 1) * n_z] = xi_arr * h_arr[i]
+        r_field.from_numpy(r_flat.astype(np.float32))
+        z_field.from_numpy(z_flat.astype(np.float32))
+
+        @ti.kernel
+        def compute(out: ti.template(),
+                    r_f: ti.template(),
+                    z_f: ti.template(),
+                    obj: ti.template()):
+            for i in range(out.shape[0]):
+                out[i] = obj.sample_emission(r_f[i], 0.0, z_f[i])
+
+        compute(j_field, r_field, z_field, ti_flat)
+        j_arr = j_field.to_numpy().astype(np.float64).reshape(n_r, n_z)
+
+        # Taichi 端积分：∫_{-H}^{H} j(r, z) dz ≈ H · Σ w_xi · j(r, xi·H)
+        ti_volume_flux = h_arr * np.sum(w_arr[None, :] * j_arr, axis=-1)
+
+        # NumPy reference
+        np_volume_flux = np.asarray(
+            physical_baseline_volume_flux(radii, self.params, opacity),
+            dtype=np.float64,
+        )
+
+        # 相对容差：fp32 Taichi vs fp64 NumPy，加上数值积分误差，取 5%。
+        # 不要求严格精确（W_r 在 fp32/fp64 边界处微差也会引入误差），
+        # 但量纲必须一致——否则差几倍。
+        np.testing.assert_allclose(
+            ti_volume_flux, np_volume_flux,
+            rtol=0.05, atol=1e-10,
+            err_msg="D3 量纲一致性破坏：Taichi sample_emission 沿 z 积分 ≠ NumPy reference",
+        )
 
 
 if __name__ == "__main__":

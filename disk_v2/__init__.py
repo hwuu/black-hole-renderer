@@ -12,6 +12,8 @@ from .physical_fields import (
     density_field,
     midplane_density_field,
     midplane_temperature_field,
+    raw_midplane_density_field,
+    raw_midplane_temperature_field,
     temperature_field,
 )
 from .geometry import disk_half_thickness, disk_radial_mask, disk_radial_weight, disk_vertical_weight, disk_volume_mask
@@ -31,6 +33,7 @@ from .params import (
     DiskV2StructureParams,
 )
 from .palette import (
+    apply_exposure,
     apply_palette,
     blackbody_color,
     cinematic_color,
@@ -38,6 +41,21 @@ from .palette import (
     palette_color,
     render_hdr_to_ldr,
     tonemap,
+)
+from .imaging import (
+    observed_visible_temperature,
+    physical_baseline_flux,
+    physical_baseline_volume_flux,
+    reference_exposure,
+    tau_effective_midplane,
+)
+from .relativity import (
+    doppler_g_factor,
+    gravitational_g_factor,
+    omega_kep,
+    omega_norm,
+    orbital_beta_local,
+    total_g_factor,
 )
 
 __all__ = [
@@ -53,6 +71,8 @@ __all__ = [
     "density_field",
     "midplane_density_field",
     "midplane_temperature_field",
+    "raw_midplane_density_field",
+    "raw_midplane_temperature_field",
     "angular_velocity_field",
     "temperature_field",
     "weak_mode_modulation",
@@ -65,8 +85,20 @@ __all__ = [
     "blackbody_color",
     "cinematic_color",
     "palette_color",
+    "apply_exposure",
     "tonemap",
     "gamma_correct",
     "render_hdr_to_ldr",
     "apply_palette",
+    "tau_effective_midplane",
+    "physical_baseline_flux",
+    "physical_baseline_volume_flux",
+    "reference_exposure",
+    "observed_visible_temperature",
+    "omega_kep",
+    "omega_norm",
+    "gravitational_g_factor",
+    "orbital_beta_local",
+    "doppler_g_factor",
+    "total_g_factor",
 ]

@@ -48,7 +48,13 @@ class RenderStats:
         ldr_black_ratio: LDR 像素亮度 `< 1/255` 的比例。
         ldr_near_white_ratio: LDR 像素三通道均 `>= 250/255` 的比例。
         ldr_white_ratio: LDR 像素三通道均 `== 255` 的比例。
-        white_point: 若启用 auto exposure，记录使用的 white point；否则为 `None`。
+        white_point: 实际用于 tonemap 的 white point（fallback 判定后的结果）。
+        reference_white_point: v2.2 物理场域 reference 推导的 white point。
+        actual_hdr_white_point: 当前帧 HDR 亮度按 `white_point_percentile` 取的
+            原始候选值（fallback 判定前）。与 `reference_white_point` 之比可以
+            直接读出 D3 的 `ratio = actual / reference`，用于检查曝光基线漂移。
+        white_point_percentile: 用于计算 `actual_hdr_white_point` 的分位数
+            （v2.2 主验收用 96，单独 CLI 调用通常用 99）。
     """
 
     hdr_min: float
@@ -61,6 +67,9 @@ class RenderStats:
     ldr_near_white_ratio: float
     ldr_white_ratio: float
     white_point: float | None = None
+    reference_white_point: float | None = None
+    actual_hdr_white_point: float | None = None
+    white_point_percentile: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """转为可打印 / 可序列化的字典。"""
@@ -75,15 +84,33 @@ class RenderStats:
             "ldr_near_white_ratio": self.ldr_near_white_ratio,
             "ldr_white_ratio": self.ldr_white_ratio,
             "white_point": self.white_point,
+            "reference_white_point": self.reference_white_point,
+            "actual_hdr_white_point": self.actual_hdr_white_point,
+            "white_point_percentile": self.white_point_percentile,
         }
 
     def format_summary(self) -> str:
         """格式化为单行摘要，便于 CLI 打印。"""
         wp = f", white_point={self.white_point:.6g}" if self.white_point is not None else ""
+        rwp = (
+            f", reference_white_point={self.reference_white_point:.6g}"
+            if self.reference_white_point is not None
+            else ""
+        )
+        actual = (
+            f", actual_hdr_wp={self.actual_hdr_white_point:.6g}"
+            if self.actual_hdr_white_point is not None
+            else ""
+        )
+        pct = (
+            f" (p{self.white_point_percentile:g})"
+            if self.white_point_percentile is not None
+            else ""
+        )
         return (
             f"[V2 stats] HDR luma: min={self.hdr_min:.6g} p50={self.hdr_p50:.6g} "
             f"p90={self.hdr_p90:.6g} p95={self.hdr_p95:.6g} p99={self.hdr_p99:.6g} "
-            f"max={self.hdr_max:.6g}{wp} | "
+            f"max={self.hdr_max:.6g}{wp}{rwp}{actual}{pct} | "
             f"LDR: black={self.ldr_black_ratio:.4f} near_white={self.ldr_near_white_ratio:.4f} "
             f"white={self.ldr_white_ratio:.4f}"
         )
@@ -94,13 +121,19 @@ def compute_render_stats(
     ldr_rgb: np.ndarray,
     *,
     white_point: float | None = None,
+    reference_white_point: float | None = None,
+    actual_hdr_white_point: float | None = None,
+    white_point_percentile: float | None = None,
 ) -> RenderStats:
     """从 HDR buffer 与最终 LDR 图像计算诊断统计。
 
     Args:
         hdr_rgb: Taichi `hdr_field.to_numpy()` 结果，形状 `(W, H, 3)` 或 `(H, W, 3)`。
         ldr_rgb: 最终 uint8 或 float LDR，形状 `(H, W, 3)`。
-        white_point: 可选，记录 auto exposure 使用的白点。
+        white_point: 可选，记录 auto exposure 实际使用的 white point。
+        reference_white_point: 可选，记录物理场域 reference white point。
+        actual_hdr_white_point: 可选，记录原始 HDR p{n} 候选值（fallback 判定前）。
+        white_point_percentile: 可选，用于计算 `actual_hdr_white_point` 的分位数。
 
     Returns:
         `RenderStats` 对象。
@@ -132,4 +165,7 @@ def compute_render_stats(
         ldr_near_white_ratio=float(np.sum(near_white_mask)) / n,
         ldr_white_ratio=float(np.sum(white_mask)) / n,
         white_point=white_point,
+        reference_white_point=reference_white_point,
+        actual_hdr_white_point=actual_hdr_white_point,
+        white_point_percentile=white_point_percentile,
     )

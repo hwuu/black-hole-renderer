@@ -179,6 +179,26 @@ class DiskV2PhysicalFieldsTest(unittest.TestCase):
         self.assertGreater(weight[3], 0.0)
         self.assertEqual(weight[4], 0.0)
 
+    def test_small_disk_outer_edge_uses_wider_softening_than_inner_edge(self):
+        """v2.2：小盘外缘使用更宽软化带，内缘仍保持窄软化以保护 SS 温度峰。"""
+        params = DiskV2Params(r_in=3.0, r_out=15.0, edge_softness=0.02)
+
+        # 内边界软化仍很窄：r_in + 0.30 已应接近平台。
+        self.assertGreater(disk_radial_weight(params.r_in + 0.30, params), 0.95)
+
+        # 外边界软化有 0.6 r_s 下限：r_out - 0.30 位于 soft edge 中间。
+        mid_outer_weight = disk_radial_weight(params.r_out - 0.30, params)
+        self.assertGreater(mid_outer_weight, 0.35)
+        self.assertLess(mid_outer_weight, 0.65)
+
+    def test_default_temperature_peak_survives_inner_soft_edge(self):
+        """v2.2：内边界 soft edge 不应削掉默认 SS 温度峰。"""
+        params = DiskV2Params(T_peak_K=1.0e7)
+        radii = np.linspace(params.r_in + 1e-3, params.r_out - 1e-3, 4096)
+        peak = float(np.max(midplane_temperature_field(radii, params)))
+
+        self.assertGreaterEqual(peak, 0.95 * params.T_peak_K)
+
     # --- 基础场 ---
 
     def test_angular_velocity_field_monotonically_decreases_with_radius(self):

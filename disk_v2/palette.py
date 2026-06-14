@@ -304,6 +304,23 @@ def tonemap(
     return _restore_shape(out, rgb_hdr)
 
 
+def apply_exposure(
+    rgb_hdr: np.ndarray,
+    exposure_scale: float,
+) -> np.ndarray:
+    """对 HDR 线性强度应用曝光缩放。
+
+    Args:
+        rgb_hdr: HDR RGB 数组或标量数组。
+        exposure_scale: 曝光缩放，通常等于 `1 / white_point`。
+
+    Returns:
+        与输入同形状的曝光后 HDR 数组。
+    """
+    out = _to_array(rgb_hdr) * float(exposure_scale)
+    return _restore_shape(out.astype(np.float64), rgb_hdr)
+
+
 def gamma_correct(
     rgb_linear: np.ndarray,
     params: DiskV2PaletteParams,

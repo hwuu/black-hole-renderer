@@ -141,7 +141,7 @@ class DiskV2StructureParams:
 
     Physical Meaning:
         这些参数控制盘体表面与体内的细节层次：弱模态调制只提供轻微不对称性，
-        剪切纹理调制提供丝状/絮状细节，**视觉 atlas（F_turbulence）为主结构来源**，
+        剪切纹理和 visual atlas 只提供有界扰动，不能接管主发射、主色温或 alpha；
         团块调制（clump）仅提供弱体积自遮挡。
         所有调制都是围绕 `1` 波动的乘性因子，盘外返回中性值 `1`。
 
@@ -167,6 +167,8 @@ class DiskV2StructureParams:
     hotspot_logr_sigma: float = 0.12
     hotspot_inner_bias: float = 2.0
     # --- 视觉 atlas（V1 云雾 + Blender 径向扭曲） ---
+    # use_visual_atlas=True 时主光追使用倾斜中面单次命中的 thin-layer 快速路径；
+    # False 时走有限厚度体积积分。v2.2 起 atlas 只能作为 bounded turbulence 输入。
     use_visual_atlas: bool = True
     atlas_n_r: int = 512
     atlas_n_phi: int = 1024
@@ -254,23 +256,27 @@ class DiskV2PaletteParams:
     """Disk V2 调色与色调映射参数（v2.1 新增）。
 
     Args:
-        palette_mode: 颜色映射模式。`"physical"` 直接用黑体色查表；`"cinematic"`
-            在 physical 基础上增强饱和度，用于演示输出。
+        palette_mode: 颜色映射模式。`"physical"` 用于诊断物理剖面；`"cinematic"`
+            使用 log-T 可见色温映射 + 饱和度/暖色调整，用于最终视觉验收。
         tonemap_mode: 色调映射算法。当前实现仅支持 `"reinhard"`，预留 `"aces"`
             作为后续切换选项。
         gamma: sRGB 伽马校正指数。色调映射后输出 LDR 用 `x^(1/gamma)`。
-        opacity_scale: 有限厚度积分的不透明度缩放，决定光学厚度 `α = opacity_scale · ρ`。
+        opacity_scale: 有效 opacity 缩放。v2.2 reference 中用于
+            `tau_effective(r) = opacity_scale · rho_mid(r) · H(r)`；当该值全盘
+            显著小于 1 时，应解释为 optically-thin effective opacity，而不是真实
+            photosphere。
         cinematic_saturation: cinematic 模式下的饱和度增强系数。`1.0` 等价于
             physical 模式；典型取值 `1.2 ~ 1.6`。
         cinematic_warm_shift: cinematic 模式下的暖色偏移，对 R 通道做 `* (1 + warm_shift)`、
             对 B 通道做 `* (1 - warm_shift)` 的乘性调整。典型取值 `0.0 ~ 0.15`。
-        visual_temp_outer_K: cinematic 模式下，物理温度归一化后映射到的可见色温下限（K）。
-        visual_temp_inner_K: cinematic 模式下，物理温度归一化后映射到的可见色温上限（K）。
+        visual_temp_outer_K: cinematic 模式下，物理温度 log 映射到的可见色温下限（K）。
+        visual_temp_inner_K: cinematic 模式下，物理温度 log 映射到的可见色温上限（K）。
 
     Physical Meaning:
-        这一层不影响物理场定义，只把物理量映射成像素颜色。
-        cinematic 模式先把物理 Kelvin 重映射到可见色温区间，再查 Helland 黑体色，
-        避免 `T_peak_K ~ 1e7` 直接白化。
+        这一层不改变基础物理场，只定义显示链。cinematic 模式先把物理 Kelvin
+        重映射到可见色温区间，再查 Helland 黑体色，避免 `T_peak_K ~ 1e7`
+        直接白化。g-factor 的颜色偏移也应作用在该可见色温链上，而不是把
+        `g · T_phys` 直接送入 LDR 色温公式。
 
     Simplifications:
         - tonemap 第一版只实现 Reinhard，结构上预留可扩展 ACES Filmic。

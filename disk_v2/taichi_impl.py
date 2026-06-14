@@ -38,7 +38,6 @@ from .structure_modulations import (
     hotspot_modulation,
     shear_modulation,
 )
-from .palette import physical_temperature_outer_K
 
 
 # Disk V2 物理常数（与 disk_v2.physical_fields 一致）。
@@ -48,6 +47,35 @@ _THIN_DISK_PEAK_VALUE_RAW: float = (
     * (1.0 - 1.0 / math.sqrt(_THIN_DISK_PEAK_OVER_R_IN)) ** 0.25
 )
 _THIN_DISK_NORM_FACTOR: float = 1.0 / _THIN_DISK_PEAK_VALUE_RAW
+
+
+@ti.func
+def schwarzschild_gravitational_g_ti(r_em, r_obs, rs):
+    """Schwarzschild 静态引力红移因子 `nu_obs / nu_em`。"""
+    em = ti.max(r_em, rs + 1e-6)
+    obs = ti.max(r_obs, rs + 1e-6)
+    numerator = ti.sqrt(ti.max(1.0 - rs / em, 1e-12))
+    denominator = ti.sqrt(ti.max(1.0 - rs / obs, 1e-12))
+    return numerator / denominator
+
+
+@ti.func
+def schwarzschild_orbital_beta_ti(r, rs, eps, beta_cap):
+    """局部静止观测者测得的 Schwarzschild 圆轨道速度近似。"""
+    safe_r = ti.max(r, rs + 1e-6)
+    mass = 0.5 * rs
+    denom = ti.sqrt(ti.max(1.0 - 3.0 * mass / safe_r, eps))
+    beta = ti.sqrt(mass / safe_r) / denom
+    return ti.min(ti.max(beta, 0.0), beta_cap)
+
+
+@ti.func
+def doppler_g_factor_ti(beta, cos_theta):
+    """特殊相对论 Doppler 因子。"""
+    beta_safe = ti.min(ti.max(beta, 0.0), 0.999999)
+    cos_safe = ti.min(ti.max(cos_theta, -1.0), 1.0)
+    gamma = 1.0 / ti.sqrt(ti.max(1.0 - beta_safe * beta_safe, 1e-12))
+    return 1.0 / ti.max(gamma * (1.0 - beta_safe * cos_safe), 1e-12)
 
 
 @ti.func
@@ -104,11 +132,15 @@ def disk_radial_weight_ti(r, r_in, r_out, edge_softness):
 
     Returns:
         `W_r(r) ∈ [0, 1]`。盘外（含精确边界）返回 0，盘内中部返回 1。
+        外边界使用 `0.6 r_s` 的最小软化宽度，内边界保持比例软化。
     """
     radial_span = r_out - r_in
-    soft_width = ti.max(radial_span * edge_softness, 1e-12)
-    inner = _ti_smoothstep(r_in, r_in + soft_width, r)
-    outer = 1.0 - _ti_smoothstep(r_out - soft_width, r_out, r)
+    base_soft_width = ti.max(radial_span * edge_softness, 1e-12)
+    max_width = ti.max(radial_span * 0.49, 1e-12)
+    inner_soft_width = ti.min(ti.max(base_soft_width, 0.3), max_width)
+    outer_soft_width = ti.min(ti.max(base_soft_width, 0.6), max_width)
+    inner = _ti_smoothstep(r_in, r_in + inner_soft_width, r)
+    outer = 1.0 - _ti_smoothstep(r_out - outer_soft_width, r_out, r)
     w = inner * outer
     # 盘外严格为 0。
     if r <= r_in or r >= r_out:
@@ -181,6 +213,18 @@ def midplane_density_ti(r, r_in, r_out,
 
 
 @ti.func
+def raw_midplane_density_ti(r, r_in, rho_power):
+    """Taichi 版本的 `raw_midplane_density_field`（不乘径向 support）。"""
+    result = 0.0
+    if r > r_in:
+        safe_r = ti.max(r, r_in)
+        ratio = safe_r / r_in
+        inner_term = ti.max(1.0 - ti.sqrt(r_in / safe_r), 0.0)
+        result = ti.pow(ratio, -rho_power) * ti.sqrt(inner_term)
+    return result
+
+
+@ti.func
 def midplane_temperature_ti(r, r_in, r_out,
                             T_peak_K, edge_softness):
     """Taichi 版本的 `midplane_temperature_field`。
@@ -200,6 +244,19 @@ def midplane_temperature_ti(r, r_in, r_out,
         w_r = disk_radial_weight_ti(r, r_in, r_out, edge_softness)
         raw = ti.pow(ratio, -0.75) * ti.pow(inner_term, 0.25)
         result = T_peak_K * _THIN_DISK_NORM_FACTOR * raw * w_r
+    return result
+
+
+@ti.func
+def raw_midplane_temperature_ti(r, r_in, T_peak_K):
+    """Taichi 版本的 `raw_midplane_temperature_field`（不乘径向 support）。"""
+    result = 0.0
+    if r > r_in:
+        safe_r = ti.max(r, r_in)
+        ratio = safe_r / r_in
+        inner_term = ti.max(1.0 - ti.sqrt(r_in / safe_r), 0.0)
+        raw = ti.pow(ratio, -0.75) * ti.pow(inner_term, 0.25)
+        result = T_peak_K * _THIN_DISK_NORM_FACTOR * raw
     return result
 
 
@@ -296,6 +353,7 @@ class DiskV2Taichi:
         params: `DiskV2Params`。
         structure_params: `DiskV2StructureParams`。
         palette_params: `DiskV2PaletteParams`。
+        emission_opacity_scale: 用于 v2.2 effective emission 的 opacity 缩放。
         seed: 用于生成 clump centers 的随机种子。
         centers: 可选预生成的 `_ClumpCenters`（用于 parity 测试）。
 
@@ -310,6 +368,7 @@ class DiskV2Taichi:
         params: DiskV2Params,
         structure_params: DiskV2StructureParams,
         palette_params: DiskV2PaletteParams,
+        emission_opacity_scale: float = 1.0,
         seed: int = 42,
         centers: Optional[_ClumpCenters] = None,
     ) -> None:
@@ -329,6 +388,7 @@ class DiskV2Taichi:
         self._edge_softness = float(params.edge_softness)
         self._alpha_density = float(params.alpha_density)
         self._beta_temperature = float(params.beta_temperature)
+        self._emission_opacity_scale = float(emission_opacity_scale)
         self._clump_strength = float(structure_params.clump_strength)
         self._clump_emission_weight = float(structure_params.clump_emission_weight)
         self._shear_strength = float(structure_params.shear_strength)
@@ -342,7 +402,14 @@ class DiskV2Taichi:
         self._cinematic_warm_shift = float(palette_params.cinematic_warm_shift)
         self._visual_temp_outer_K = float(palette_params.visual_temp_outer_K)
         self._visual_temp_inner_K = float(palette_params.visual_temp_inner_K)
-        t_outer_phys = physical_temperature_outer_K(self._T_peak_K)
+        outer_ratio = max(self._r_out / max(self._r_in, 1e-6), 1.0 + 1e-6)
+        outer_inner_term = max(1.0 - math.sqrt(1.0 / outer_ratio), 1e-6)
+        outer_raw = (
+            (outer_ratio ** -0.75)
+            * (outer_inner_term ** 0.25)
+            * _THIN_DISK_NORM_FACTOR
+        )
+        t_outer_phys = max(self._T_peak_K * outer_raw, 1.0)
         self._log_t_peak = float(math.log(max(self._T_peak_K, t_outer_phys + 1.0)))
         self._log_t_outer = float(math.log(max(t_outer_phys, 1.0)))
         self._visual_log_span = float(
@@ -672,84 +739,61 @@ class DiskV2Taichi:
 
     @ti.func
     def sample_emission(self, r, phi, z):
-        """采样发射率。
+        """采样发射率（单位体积 emissivity per unit volume）。
 
-        视觉 atlas 开启时：
-        `j = ρ_envelope^α · T^β · emission_atlas · F_mode · F_hotspot`。
+        v2.2 默认（D3 修订）：
+        `j(r, z) = support · opacity · rho_envelope(r, z) · (T(r, z)/T_peak)^4 · F_turb · F_mode · F_hotspot`
+
+        其中 ρ_envelope 与 T 都是真 z 函数：
+
+        - `rho_envelope(r, z) = rho_raw(r) · exp(-0.5 (z/H)²) · W_z(z)`
+        - `T(r, z) = T_raw(r) · V_T(|z|/H) · W_z(z)`
+
+        Notes:
+            返回的是"单位体积发射率"，沿光线 `ds` 累积才得到屏幕 HDR 强度。
+            face-on 视线下 `∫ j(r, z) dz` 等价于 NumPy
+            `physical_baseline_volume_flux(r)`（D3 reference 量纲一致）。
+
+            v2.2.2 前 sample_emission 在 z 方向是常数（盘内取中面值），
+            违反 thin disk emissivity 的真实物理：emissivity ∝ ρ(r,z) · T(r,z)^4，
+            两者都沿 z 高斯衰减。v2.2.3 改为真 z 函数：
+
+            - 与 NumPy `physical_baseline_volume_flux` 的被积函数一致
+            - edge-on / 大倾角下盘体厚度感、自遮挡、垂向 emission 衰减自然呈现
+            - 仍保持 A1 的 `W_r` 只乘一次约定（`support = disk_radial_weight`）
         """
-        rho_e = density_field_ti(
-            r, z, self._r_in, self._r_out, self._rho_power,
-            self._h0, self._beta_h, self._edge_softness,
+        rho_raw = raw_midplane_density_ti(r, self._r_in, self._rho_power)
+        t_raw = raw_midplane_temperature_ti(r, self._r_in, self._T_peak_K)
+        h = ti.max(disk_half_thickness_ti(r, self._h0, self._beta_h, self._r_in), 1e-12)
+        zh = z / h
+        # 垂向高斯密度衰减（与 NumPy `density_field` 一致）
+        v_density = ti.exp(-0.5 * zh * zh)
+        # 垂向温度衰减（与 NumPy `temperature_field` 一致）
+        v_temp = ti.max(1.0 - 0.25 * ti.abs(zh), 0.0)
+        # 几何垂向 support 关闭
+        w_z = disk_vertical_weight_ti(
+            r, z, self._h0, self._beta_h, self._r_in, self._r_out,
         )
-        t = temperature_field_ti(
-            r, z, self._r_in, self._r_out, self._T_peak_K,
-            self._h0, self._beta_h, self._edge_softness,
+        # ρ_envelope(r, z) = ρ_raw(r) · exp(-0.5 (z/H)²) · W_z(z)
+        rho_envelope = ti.max(rho_raw, 0.0) * v_density * w_z
+        # T(r, z) = T_raw(r) · V_T · W_z，归一化为 [T/T_peak]
+        t_norm = t_raw * v_temp * w_z / ti.max(self._T_peak_K, 1.0)
+        # 单位体积发射率（emissivity per unit volume）
+        emissivity = self._emission_opacity_scale * rho_envelope * ti.pow(
+            ti.max(t_norm, 0.0), 4.0,
         )
-        t_norm = t / ti.max(self._T_peak_K, 1.0)
-        j_base = 0.0
+        # 径向 support 只乘一次（A1）
+        support = disk_radial_weight_ti(r, self._r_in, self._r_out, self._edge_softness)
+        j_base = support * emissivity
         if ti.static(self._use_visual_atlas):
             ew = self.sample_emission_atlas_ti(r, phi)
-            # 视觉模式：atlas 承载主亮度，物理场只做弱径向调制（避免外圈过暗）。
-            rho_vis = ti.pow(ti.max(rho_e, 0.0), 0.25)
-            t_vis = ti.pow(ti.max(t_norm, 0.0), 0.35)
-            j_base = rho_vis * t_vis * ti.max(ew, 0.0)
+            # v2.2：atlas 只做有限扰动，不再决定主径向亮度。
+            f_turb = 0.75 + 0.5 * ti.min(ti.max(ew, 0.0), 1.0)
+            j_base *= f_turb
         else:
-            rho_tex = rho_e * self.shear_modulation_ti(r, phi)
-            j_base = ti.pow(ti.max(rho_tex, 0.0), self._alpha_density) * ti.pow(
-                ti.max(t_norm, 0.0), self._beta_temperature,
-            )
+            j_base *= self.shear_modulation_ti(r, phi)
         f_struct = self.mode_modulation_ti(r, phi) * self.hotspot_modulation_ti(r, phi)
         return j_base * f_struct
-
-    @ti.func
-    def sample_visual_disk_color_ti(self, r, phi, z):
-        """视觉 atlas 模式盘面 RGB（V1 纹理思路：atlas 驱动色温 + 物理 T 弱混合）。
-
-        Args:
-            r, phi, z: 盘坐标。
-
-        Returns:
-            RGB 向量，每通道 `[0, 1]`。
-        """
-        ew = self.sample_emission_atlas_ti(r, phi)
-        t_aniso = ti.pow(ti.min(ti.max(ew, 0.0), 1.0), 0.55)
-        t_vis = self._visual_temp_outer_K + t_aniso * (
-            self._visual_temp_inner_K - self._visual_temp_outer_K
-        )
-        rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
-        if ti.static(self._is_cinematic):
-            t = t_vis / 100.0
-            t_safe = ti.max(t, 1e-6)
-            t_m60 = ti.max(t - 60.0, 1e-6)
-            t_m10 = ti.max(t - 10.0, 1e-6)
-            r_c = 1.0
-            if t > 66.0:
-                r_c = ti.min(ti.max(1.292936 * ti.pow(t_m60, -0.1332047592), 0.0), 1.0)
-            g_c = 0.0
-            if t <= 66.0:
-                g_c = ti.min(ti.max(0.390082 * ti.log(t_safe) - 0.631841, 0.0), 1.0)
-            else:
-                g_c = ti.min(ti.max(1.129891 * ti.pow(t_m60, -0.0755148492), 0.0), 1.0)
-            b_c = 1.0
-            if t < 66.0:
-                if t <= 19.0:
-                    b_c = 0.0
-                else:
-                    b_c = ti.min(ti.max(0.543207 * ti.log(t_m10) - 1.19625, 0.0), 1.0)
-            sat = self._cinematic_saturation
-            warm = self._cinematic_warm_shift
-            luma = 0.2126 * r_c + 0.7152 * g_c + 0.0722 * b_c
-            r_c = ti.min(ti.max(luma + sat * (r_c - luma), 0.0), 1.0)
-            g_c = ti.min(ti.max(luma + sat * (g_c - luma), 0.0), 1.0)
-            b_c = ti.min(ti.max(luma + sat * (b_c - luma), 0.0), 1.0)
-            r_c = ti.min(r_c * (1.0 + warm), 1.0)
-            b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
-            rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
-            rgb[2] = ti.min(rgb[2], rgb[0])
-        else:
-            rgb = self.sample_palette_color(t_vis)
-        filament = 0.28 + 0.72 * ti.pow(ti.max(ew, 0.0), 0.38)
-        return rgb * filament
 
     @ti.func
     def sample_palette_color(self, T_K):
@@ -810,6 +854,72 @@ class DiskV2Taichi:
         return rgb
 
     @ti.func
+    def sample_observed_palette_color(self, T_K, g_factor):
+        """温度 + g-factor → RGB（cinematic 在可见色温链上做频移）。
+
+        Args:
+            T_K: 发射位置物理温度（K）。
+            g_factor: `nu_obs / nu_em`。
+
+        Returns:
+            RGB 向量，每通道 `[0, 1]`。
+
+        Notes:
+            cinematic 模式不把 `g*T_phys≈1e7K` 直接送入 LDR 色温公式，而是先把
+            `T_phys` log 映射到可见色温，再做 `T_visible_obs = clamp(g*T_visible)`。
+        """
+        rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+        if T_K > 0.0:
+            t_source = T_K
+            if ti.static(self._is_cinematic):
+                safe_T = ti.max(T_K, ti.exp(self._log_t_outer))
+                log_span = ti.max(self._log_t_peak - self._log_t_outer, 1e-6)
+                t_norm = (ti.log(safe_T) - self._log_t_outer) / log_span
+                t_norm = ti.min(ti.max(t_norm, 0.0), 1.0)
+                t_visible = self._visual_temp_outer_K + t_norm * (
+                    self._visual_temp_inner_K - self._visual_temp_outer_K
+                )
+                t_source = ti.min(
+                    ti.max(t_visible * ti.max(g_factor, 0.1), self._visual_temp_outer_K),
+                    self._visual_temp_inner_K,
+                )
+            t = t_source / 100.0
+            t_safe = ti.max(t, 1e-6)
+            t_m60 = ti.max(t - 60.0, 1e-6)
+            t_m10 = ti.max(t - 10.0, 1e-6)
+
+            r_c = 1.0
+            if t > 66.0:
+                r_c = ti.min(ti.max(1.292936 * ti.pow(t_m60, -0.1332047592), 0.0), 1.0)
+
+            g_c = 0.0
+            if t <= 66.0:
+                g_c = ti.min(ti.max(0.390082 * ti.log(t_safe) - 0.631841, 0.0), 1.0)
+            else:
+                g_c = ti.min(ti.max(1.129891 * ti.pow(t_m60, -0.0755148492), 0.0), 1.0)
+
+            b_c = 1.0
+            if t < 66.0:
+                if t <= 19.0:
+                    b_c = 0.0
+                else:
+                    b_c = ti.min(ti.max(0.543207 * ti.log(t_m10) - 1.19625, 0.0), 1.0)
+
+            if ti.static(self._is_cinematic):
+                sat = self._cinematic_saturation
+                warm = self._cinematic_warm_shift
+                luma = 0.2126 * r_c + 0.7152 * g_c + 0.0722 * b_c
+                r_c = ti.min(ti.max(luma + sat * (r_c - luma), 0.0), 1.0)
+                g_c = ti.min(ti.max(luma + sat * (g_c - luma), 0.0), 1.0)
+                b_c = ti.min(ti.max(luma + sat * (b_c - luma), 0.0), 1.0)
+                r_c = ti.min(ti.max(r_c * (1.0 + warm), 0.0), 1.0)
+                g_c = ti.min(ti.max(g_c * 1.0, 0.0), 1.0)
+                b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
+
+            rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
+        return rgb
+
+    @ti.func
     def tonemap_reinhard(self, rgb_hdr):
         """Reinhard 色调映射：`x → x / (1 + x)`，逐通道。
 
@@ -825,6 +935,11 @@ class DiskV2Taichi:
             ti.max(rgb_hdr[2], 0.0),
         ], dt=ti.f32)
         return safe / (1.0 + safe)
+
+    @ti.func
+    def apply_exposure_ti(self, rgb_hdr, exposure_scale):
+        """对 HDR RGB 应用曝光缩放。"""
+        return rgb_hdr * exposure_scale
 
     @ti.func
     def gamma_correct_ti(self, rgb_lin):
