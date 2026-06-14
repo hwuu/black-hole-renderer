@@ -197,15 +197,15 @@
 
 | 阶段 | 标题 | 解决根因 | 状态 | 验收口径真源 | 证据 / 说明 |
 |------|------|----------|------|-------------|-----------|
-| Phase 0 | 建立问题基线 | P1 ~ P5 | 未开始 | 本计划 §7.1 | 暂无 |
-| Phase 1 | V2 基础物理场调整（温度量纲、密度内边界、ISCO、r_out=50） | P2 | 未开始 | [`design_ad_v2.md` §7.1](../design_ad_v2.md) | 暂无 |
-| Phase 2 | V2 三维结构调制与团块项 | P3、P1 部分 | 未开始 | [`design_ad_v2.md` §7.2](../design_ad_v2.md) | 暂无 |
-| Phase 3 | V2 调色与色调映射 | P2、为 P4 兜底 | 未开始 | [`design_ad_v2.md` §7.3](../design_ad_v2.md) | 暂无 |
-| Phase 4 | V2 Taichi 实现 + parity 测试 + 接入主光追 | P1 完整 + 集成 | 未开始 | [`design_ad_v2.md` §7.4](../design_ad_v2.md) | 暂无 |
-| **Checkpoint** | Phase 4 后重评 | — | 未开始 | 本计划 §7.6 | 暂无 |
-| Phase 5 | 相对论亮度与颜色 | P4 | 未开始 | 本计划 §7.7 | 暂无 |
-| Phase 6 | 高阶像、光子环、天空盒 | P5 | 未开始 | 本计划 §7.8 | 暂无 |
-| Phase 7 | 后处理校准 | P5 | 未开始 | 本计划 §7.9 | 暂无 |
+| Phase 0 | 建立问题基线 | P1 ~ P5 | 未开始 | 本计划 §7.1 | 留作视觉验收阶段执行；本轮代码推进未做基线截图 |
+| Phase 1 | V2 基础物理场调整（温度量纲、密度内边界、ISCO、r_out=50） | P2 | 完成 | [`design_ad_v2.md` §7.1](../design_ad_v2.md) | `disk_v2/params.py`、`disk_v2/physical_fields.py`；新增 `test_v2_temperature_range_default` 等单测 |
+| Phase 2 | V2 三维结构调制与团块项 | P3、P1 部分 | 完成 | [`design_ad_v2.md` §7.2](../design_ad_v2.md) | `disk_v2/structure_modulations.py` 升级到 (r,φ,z)、新增 `F_clump` 显式点云团；`tests/unit/test_disk_v2_clump.py` |
+| Phase 3 | V2 调色与色调映射 | P2、为 P4 兜底 | 完成 | [`design_ad_v2.md` §7.3](../design_ad_v2.md) | `disk_v2/palette.py` 新建（blackbody + Reinhard + sRGB + cinematic）；`tests/unit/test_disk_v2_palette.py` |
+| Phase 4 | V2 Taichi 实现 + parity 测试 + 接入主光追 | P1 完整 + 集成 | 完成 | [`design_ad_v2.md` §7.4](../design_ad_v2.md) | `disk_v2/taichi_impl.py`、`disk_v2/taichi_render.py`、`disk_v2/preview.py`；`tests/unit/test_disk_v2_numpy_taichi_parity.py`；`render.py` 加 `--disk_model {v1,v2}` CLI 开关 |
+| **Checkpoint** | Phase 4 后重评 | — | **跳过** | 本计划 §7.6 | 本轮按用户指示连续推进 Phase 1~7；视觉验收交由用户在 V2 输出图上做 |
+| Phase 5 | 相对论亮度与颜色 | P4 | 完成 | 本计划 §7.7 | `DiskV2Renderer` 内联 g-factor（Schwarzschild Ω + Doppler + 引力红移 + Wien 偏移 + g^4 beaming）；`tests/unit/test_disk_v2_g_factor.py` GPU smoke |
+| Phase 6 | 高阶像、光子环、天空盒 | P5 | 完成（接口） | 本计划 §7.8 | `--v2_r_max` 加入；天空盒 `--texture` V2 路径已支持；高阶像/photon ring 视觉指标依赖 Phase 0 基线，留 TODO |
+| Phase 7 | 后处理校准 | P5 | 完成（接口） | 本计划 §7.9 | V2 渲染管线改为 HDR 中间结果 + 可选 HDR-domain Bloom；Bloom 默认值依赖视觉验收，留 TODO |
 
 每个 Phase 完成后，请在 **状态** 列改为"进行中 / 完成"，并在 **证据 / 说明** 列追加 PR 链接、关键命令、或关键文件路径，使新读者无需翻历史也能复核进度。
 
@@ -518,6 +518,8 @@ v1.0 阶段的 V2 已实施 `disk_v2/{geometry, physical_fields, structure_modul
 
 ## 变更记录
 
+- **v0.7 (2026-06-14)**：**V2 视觉恢复分支**。失败复盘：`F_clump` 主发射 → 鬣狗斑；高频 `F_shear` → 斑马纹；`save_image` uint8 误 clip → 全白。修复：新增 `disk_v2/visual_atlas.py` 预烘焙 V1 云雾 + Blender 思路（spiral warp、alpha clip）；Taichi 双线性采样；发射 `j ∝ ρ^α T^β · emission_atlas · F_mode · F_hotspot`，密度 `ρ ∝ ρ_envelope · density_atlas · F_clump_weak`；`shear_strength` 默认 0。CLI 增加 `--v2_visual_preset interstellar` 与 atlas 参数；`scripts/v2_visual_acceptance.sh` 固定验收相机 `ar1=2, ar2=15`。Filament 首版不做。详见 [`v2_visual_recovery_plan.md`](v2_visual_recovery_plan.md)。
+- **v0.6 (2026-06-14)**：Phase 1~Phase 7 实施落地。`disk_v2/` 新增 `palette.py`、`taichi_impl.py`、`taichi_render.py`、`preview.py`；现有 `params.py`、`physical_fields.py`、`structure_modulations.py` 升级到 v2.1 语义。`render.py` 加 `--disk_model {v1,v2}` + 13 个 `--v2_*` 参数；V1 路径不变。新增 85 个 V2 单测、10 个 NumPy/Taichi parity 测试、g-factor GPU smoke。AGENTS.md 增加 4 条 V2 实施踩坑记录（24-26）。README 增加 Disk V2 用法与参数表。Phase 0（基线截图）与 Phase 6/7 的视觉指标留 TODO，等用户视觉验收。Checkpoint §7.6 因连续推进被跳过。
 - **v0.5 (2026-06-13)**：吸收 gpt 5.5 修订 + 版本号同步。P2 诊断和 Phase 1 验收明确测未乘 `W_r` 的 raw temperature profile（避免完整 `T_mid(r_out)=0` 与 `T_peak/T_at_r_out ∈ [4.0, 4.6]` 字面冲突）。正文 6 处真源版本号统一引用 `design_ad_v2.md` v2.1。
 - **v0.4 (2026-06-13)**：按 gpt 反馈修正硬伤。修正温度跨度伪具体（v0.3 写"3 个数量级"，实算 1.89 倍，要求 `r_out=50` 才能到 4.32 倍）。范围边界句拆开：V2 盘体改动落 `disk_v2/`，主光追接线和后处理按阶段改 `render.py`。第 6 节跟踪表加"证据 / 说明"列。Phase 0 命令同步改 `--ar2 50`，相机距离 `--pov` 同步拉远。Phase 1 验收指标从不可能的 `≥100` 改为基于实算的 `[4.0, 4.6]`。Phase 4 加 NumPy/Taichi parity 测试。风险表 F_clump 改为决策点（显式点云团首选、Worley 回退）。第 11 节经验沉淀加"写'跨 X 个数量级'之前先实算"。
 - **v0.3 (2026-06-13)**：基于"V2 v1.0 实物诊断"重大修订。删除"V3 备选"等所有 V3 描述。Phase 1 ~ Phase 4 重排为对接 `design_ad_v2.md` v2.0 的五项大改。新增第 11 节回顾 V1.0 V2 的实施经验。删除原 "Phase 6 HDR" 独立阶段（合并进 V2 Phase 3）。`--ar1` 默认值在 Phase 0 基线命令里改为 3.0。

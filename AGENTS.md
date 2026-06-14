@@ -129,7 +129,7 @@ python -m unittest tests/e2e_render.py
       - 文件位置：`render.py:716-741` 的 `apply_g_factor` 函数
 
 23. **`parametric` 模式下动态旋转方向不一致** (已修复)
-    - 现象：视频中吸积盘不同组件旋转方向不一致，部分结构看起来“反着转”
+    - 现象：视频中吸积盘不同组件旋转方向不一致，部分结构看起来"反着转"
     - 根因：`phi_grid = phi_grid_base + t_offset * omega_grid` 与 `np.roll(..., +rotation_pixels)` 使用了相反的方向约定
     - 最终修正：
       - 统一以 `phi_grid` / `baseline` 采样方向为准
@@ -137,11 +137,53 @@ python -m unittest tests/e2e_render.py
     - 重点文件：`render.py`
     - 保护测试：`tests/unit/test_parametric_rotation_direction.py`
 
+24. **Taichi `@ti.func` 不接受 dataclass 实例作为常量** (V2 实施时踩到)
+    - 现象：在 `@ti.func` 内访问 `self.params.r_in` 抛 `TaichiTypeError: Invalid constant scalar data type`
+    - 根因：Taichi 1.7.4 只允许 Python float/int/bool 作为 runtime 常量，不接受任意 dataclass 字段
+    - 修复：在 `__init__` 里把 dataclass 字段平铺为 `self._r_in = float(params.r_in)`，
+      `@ti.func` 内只访问平铺字段
+    - 文件位置：`disk_v2/taichi_impl.py:DiskV2Taichi.__init__`
+
+25. **Taichi `@ti.func` 不接受类型注解** (V2 实施时踩到)
+    - 现象：`def foo(x: ti.f32) -> ti.f32:` 抛 `TaichiSyntaxError: Invalid type annotation`
+    - 根因：Taichi 1.7.4 的 `@ti.func` 解析参数注解时拒绝直接的 `ti.f32` / `ti.types.vector(...)` 标注
+    - 修复：去掉所有 `@ti.func` 的参数和返回类型注解；类型由 Taichi 编译期推断
+    - 参考：`render.py` 现有 `@ti.func` 同样无注解
+
+26. **V2 模式下 CLI 默认 `--ar1` / `--ar2` 不匹配 V2 推荐范围** (V2 接入时踩到)
+    - 现象：`--disk_model v2` 未传 `--ar2` 时使用 V1 默认 `15`，导致温度跨度只有 ~2.5 倍
+      （V2 推荐 `r_out=50` 可达 ~4.3 倍）
+    - 根因：CLI `--ar1` / `--ar2` 的默认值是 V1 全局常量 `R_DISK_INNER_DEFAULT=2`、`R_DISK_OUTER_DEFAULT=15`
+    - 当前修复：V2 路径检测 `--ar2 < 20` 时打印 warning，提示用户加上 `--ar2 50`
+    - 文件位置：`render.py` 的 `if args.disk_model == "v2"` 分支
+
+27. **V2 团块 / 纯 Fourier shear 不适合做主发射纹理** (视觉恢复 2026-06-14)
+    - 现象：`F_clump` 全强度进发射 → 鬣狗斑；高频 `F_shear` 试验 → 斑马纹；二者叠加易全白/灰脏
+    - 修复：主结构改预烘焙 `visual_atlas`（V1 云雾 + spiral warp + alpha clip）；`F_clump` 仅弱密度自遮挡（`clump_strength≈0.12`, `clump_emission_weight=0`）；`shear_strength` 默认 0
+ - 验收：`bash scripts/v2_visual_acceptance.sh`；固定相机 `pov=24 0 8, ar1=2, ar2=15`
+    - 文件：`disk_v2/visual_atlas.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py`
+
 ---
 
 ### 常用命令
 
 ```bash
-# 渲染测试图像
+# V1 默认渲染
 python render.py --pov 20 0 2 --fov 60 --ar1 2 --ar2 10 --disk_tilt 20 --resolution hd -o output/*.png
+
+# V2 推荐渲染（HD GPU ~1.5s）
+python render.py --disk_model v2 --pov 30 0 10 --fov 90 \
+                 --ar1 3 --ar2 50 --disk_tilt 20 \
+                 -r hd --device gpu \
+                 -o output/v2.png
+
+# V2 单测全部
+python -m unittest tests/unit/test_disk_v2_array_utils tests/unit/test_disk_v2_clump \
+  tests/unit/test_disk_v2_g_factor tests/unit/test_disk_v2_numpy_taichi_parity \
+  tests/unit/test_disk_v2_palette tests/unit/test_disk_v2_physical_fields \
+  tests/unit/test_disk_v2_structure_modulations tests/unit/test_disk_v2_visual_atlas \
+  tests/unit/test_disk_v2_stats
+
+# V2 视觉验收（GPU）
+bash scripts/v2_visual_acceptance.sh
 ```

@@ -16,7 +16,9 @@ from disk_v2.structure_modulations import (
 
 class DiskV2StructureModulationsTest(unittest.TestCase):
     def setUp(self):
-        self.params = DiskV2Params(r_in=2.0, r_out=10.0, edge_softness=0.1)
+        # v2.1 ISCO 钳制要求 r_in ≥ 3.0；为了不触发 warning 又保留旧测试形态，
+        # 这里 r_in 用 3.0；几何尺度与 v1.0 相当。
+        self.params = DiskV2Params(r_in=3.0, r_out=10.0, edge_softness=0.1)
         self.structure_params = DiskV2StructureParams()
         r_values = np.linspace(self.params.r_in + 1e-3, self.params.r_out - 1e-3, 48)
         phi_values = np.linspace(0.0, 2.0 * np.pi, 96, endpoint=False)
@@ -49,9 +51,11 @@ class DiskV2StructureModulationsTest(unittest.TestCase):
         self.assertLess(float(np.max(mode) - np.min(mode)), 0.25)
 
     def test_shear_modulation_is_deterministic_for_same_seed(self):
-        shear_a = shear_modulation(self.r_grid, self.phi_grid, self.params, self.structure_params, seed=123)
-        shear_b = shear_modulation(self.r_grid, self.phi_grid, self.params, self.structure_params, seed=123)
-        shear_c = shear_modulation(self.r_grid, self.phi_grid, self.params, self.structure_params, seed=456)
+        # shear_strength 默认 0（视觉恢复后关闭）；种子测试需显式开启 shear。
+        sp = DiskV2StructureParams(shear_strength=0.3)
+        shear_a = shear_modulation(self.r_grid, self.phi_grid, self.params, sp, seed=123)
+        shear_b = shear_modulation(self.r_grid, self.phi_grid, self.params, sp, seed=123)
+        shear_c = shear_modulation(self.r_grid, self.phi_grid, self.params, sp, seed=456)
 
         self.assertTrue(np.allclose(shear_a, shear_b))
         self.assertFalse(np.allclose(shear_a, shear_c))

@@ -418,9 +418,17 @@ def sample_skybox_bilinear(texture: np.ndarray, directions: np.ndarray) -> np.nd
 # ============================================================================
 
 def save_image(image: np.ndarray, path: str) -> None:
-    """保存图像为 PNG 文件"""
+    """保存图像为 PNG 文件。
+
+    Args:
+        image: float LDR `[0, 1]` 或 uint8 `[0, 255]` RGB，形状 `(H, W, 3)`。
+        path: 输出 PNG 路径。
+    """
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    img_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
+    if image.dtype == np.uint8:
+        img_uint8 = image
+    else:
+        img_uint8 = (np.clip(image, 0, 1) * 255).astype(np.uint8)
     Image.fromarray(img_uint8, "RGB").save(path)
     print(f"Saved: {path}")
 
@@ -4581,6 +4589,66 @@ def parse_args() -> argparse.Namespace:
                         help="吸积盘旋转速度系数 (default: 0.1)")
     parser.add_argument("--keyframes_count", type=int, default=10,
                         help="[已废弃] 统一使用生命周期系统，此参数被忽略")
+    # --- Disk V2 路径开关与参数（Phase 4 接入） ---
+    parser.add_argument("--disk_model", type=str, default="v1",
+                        choices=["v1", "v2"],
+                        help="吸积盘模型: v1（默认，零厚度倾斜平面 + 程序纹理）或 v2（有限厚度发射-吸收积分）")
+    parser.add_argument("--v2_T_peak_K", type=float, default=1.0e7,
+                        help="V2 模式下中面温度峰值 T_peak_K，单位 K (default: 1e7)")
+    parser.add_argument("--v2_clump_count", type=int, default=280,
+                        help="V2 模式下显式团块数（仅体积自遮挡，默认 280）")
+    parser.add_argument("--v2_clump_emission_weight", type=float, default=0.0,
+                        help="V2 团块在独立发射调制中的权重 [0,1]；主光追发射已改用 F_shear，"
+                             "默认 0 避免出现大块亮斑 (default: 0.0)")
+    parser.add_argument("--v2_palette_mode", type=str, default="cinematic",
+                        choices=["physical", "cinematic"],
+                        help="V2 模式下调色: physical 或 cinematic (default: cinematic)")
+    parser.add_argument("--v2_volume_samples", type=int, default=32,
+                        help="V2 模式下盘内体积积分步数 (default: 32)")
+    parser.add_argument("--v2_opacity_scale", type=float, default=0.55,
+                        help="V2 模式下盘体不透明度缩放 (default: 0.55)")
+    parser.add_argument("--v2_emission_scale", type=float, default=1.0,
+                        help="V2 模式下 HDR 发射率整体曝光缩放。调低可避免盘面饱和 (default: 1.0)")
+    parser.add_argument("--v2_seed", type=int, default=42,
+                        help="V2 模式下团块随机种子 (default: 42)")
+    parser.add_argument("--v2_lum_power", type=float, default=4.0,
+                        help="V2 模式下 g-factor 亮度指数（Phase 5；g^lum_power 相对论强度变换）(default: 4)")
+    parser.add_argument("--v2_g_cap", type=float, default=6.0,
+                        help="V2 模式下 g-factor 上限，避免极端蓝移侧饱和 (default: 6)")
+    parser.add_argument("--v2_disable_g_factor", action="store_true",
+                        help="V2 模式下关闭相对论 g-factor，仅输出无方向性发射率")
+    parser.add_argument("--v2_r_max", type=float, default=None,
+                        help="V2 模式下逃逸半径下限。默认 None 表示使用 --r_max（10）；"
+                             "建议在 r_out=50 默认下传 20，让大盘和远端光线有充分的绕回空间。")
+    parser.add_argument("--v2_bloom_threshold", type=float, default=1.0,
+                        help="V2 模式下 Bloom 亮度阈值（HDR 域）。仅当 --v2_bloom_intensity > 0 时生效。(default: 1.0)")
+    parser.add_argument("--v2_bloom_intensity", type=float, default=0.0,
+                        help="V2 模式下 Bloom 强度。0 关闭；推荐弱 Bloom 0.3 ~ 0.6，电影感 0.8 ~ 1.2。(default: 0.0)")
+    parser.add_argument("--v2_bloom_radius", type=float, default=4.0,
+                        help="V2 模式下 Bloom 高斯模糊半径（像素）。推荐 3 ~ 8。(default: 4.0)")
+    parser.add_argument("--v2_auto_exposure", action="store_true",
+                        help="V2 模式下根据 HDR p99 自动设置 white point，避免手动猜 emission_scale")
+    parser.add_argument("--v2_white_point_percentile", type=float, default=99.0,
+                        help="V2 auto exposure 使用的 HDR 亮度分位数 (default: 99.0)")
+    parser.add_argument("--v2_print_stats", action="store_true",
+                        help="V2 模式下渲染完成后打印 HDR/LDR 诊断统计")
+    parser.add_argument("--v2_turbulence_strength", type=float, default=None,
+                        help="V2 视觉 atlas 云雾强度 (default: 结构参数默认 0.35)")
+    parser.add_argument("--v2_spiral_warp_strength", type=float, default=None,
+                        help="V2 径向 spiral warp 强度 (default: 1.8)")
+    parser.add_argument("--v2_alpha_clip_threshold", type=float, default=None,
+                        help="V2 atlas Alpha Clip 阈值 (default: 0.01)")
+    parser.add_argument("--v2_atlas_n_r", type=int, default=None,
+                        help="V2 视觉 atlas 径向分辨率 (default: 512)")
+    parser.add_argument("--v2_atlas_n_phi", type=int, default=None,
+                        help="V2 视觉 atlas 角向分辨率 (default: 1024)")
+    parser.add_argument("--v2_shear_strength", type=float, default=None,
+                        help="V2 傅里叶剪切强度，默认 0（关闭）")
+    parser.add_argument("--v2_disable_visual_atlas", action="store_true",
+                        help="V2 关闭视觉 atlas，回退 F_shear 路径")
+    parser.add_argument("--v2_visual_preset", type=str, default=None,
+                        choices=["interstellar"],
+                        help="V2 视觉预设：interstellar = 验收相机 + auto exposure + 弱 bloom")
     return parser.parse_args()
 
 
@@ -4617,6 +4685,95 @@ def validate_args(args) -> None:
         raise ValueError("--disk_texture 仅支持静态单帧渲染，video/interactive 模式请使用生命周期系统")
 
 
+def build_v2_structure_params(args) -> "DiskV2StructureParams":
+    """从 CLI 参数构建 `DiskV2StructureParams`（含 visual atlas 覆盖项）。
+
+    Args:
+        args: `parse_args()` 返回的命名空间。
+
+    Returns:
+        合并 CLI 覆盖后的结构参数对象。
+    """
+    from dataclasses import replace
+
+    from disk_v2.params import DiskV2StructureParams
+
+    sp = DiskV2StructureParams(
+        clump_count=args.v2_clump_count,
+        clump_emission_weight=args.v2_clump_emission_weight,
+    )
+    replacements = {}
+    if args.v2_turbulence_strength is not None:
+        replacements["turbulence_strength"] = args.v2_turbulence_strength
+    if args.v2_spiral_warp_strength is not None:
+        replacements["spiral_warp_strength"] = args.v2_spiral_warp_strength
+    if args.v2_alpha_clip_threshold is not None:
+        replacements["alpha_clip_threshold"] = args.v2_alpha_clip_threshold
+    if args.v2_atlas_n_r is not None:
+        replacements["atlas_n_r"] = args.v2_atlas_n_r
+    if args.v2_atlas_n_phi is not None:
+        replacements["atlas_n_phi"] = args.v2_atlas_n_phi
+    if args.v2_shear_strength is not None:
+        replacements["shear_strength"] = args.v2_shear_strength
+    if args.v2_disable_visual_atlas:
+        replacements["use_visual_atlas"] = False
+    if args.v2_visual_preset == "interstellar":
+        if args.v2_turbulence_strength is None:
+            replacements["turbulence_strength"] = 0.82
+        if args.v2_alpha_clip_threshold is None:
+            replacements["alpha_clip_threshold"] = 0.006
+    if replacements:
+        sp = replace(sp, **replacements)
+    return sp
+
+
+def resolve_v2_render_options(args) -> dict:
+    """解析 V2 渲染选项，应用 `--v2_visual_preset` 推荐参数。
+
+    preset 只覆盖未显式指定的 bloom / exposure / palette / 体积积分推荐值；
+    显式 CLI 参数始终优先。
+
+    Args:
+        args: `parse_args()` 返回的命名空间。
+
+    Returns:
+        传给 `DiskV2Renderer` 的 kwargs 覆盖片段。
+    """
+    opts = {
+        "auto_exposure": args.v2_auto_exposure,
+        "bloom_threshold": args.v2_bloom_threshold,
+        "bloom_intensity": args.v2_bloom_intensity,
+        "bloom_radius": args.v2_bloom_radius,
+        "palette_mode": args.v2_palette_mode,
+        "opacity_scale": args.v2_opacity_scale,
+        "emission_scale": args.v2_emission_scale,
+        "lum_power": args.v2_lum_power,
+        "volume_samples": args.v2_volume_samples,
+        "r_max": args.v2_r_max if args.v2_r_max is not None else args.r_max,
+        "white_point_percentile": args.v2_white_point_percentile,
+    }
+    if args.v2_visual_preset == "interstellar":
+        opts["auto_exposure"] = False
+        opts["palette_mode"] = "cinematic"
+        if args.v2_bloom_intensity == 0.0:
+            opts["bloom_intensity"] = 0.45
+        if args.v2_bloom_threshold == 1.0:
+            opts["bloom_threshold"] = 0.15
+        if args.v2_opacity_scale == 0.55:
+            opts["opacity_scale"] = 0.08
+        if args.v2_emission_scale == 1.0:
+            opts["emission_scale"] = 1.85
+        if args.v2_lum_power == 4.0:
+            opts["lum_power"] = 2.5
+        if args.v2_volume_samples == 16:
+            opts["volume_samples"] = 32
+        if args.v2_r_max is None:
+            opts["r_max"] = 25.0
+        if args.v2_white_point_percentile == 99.0:
+            opts["white_point_percentile"] = 96.0
+    return opts
+
+
 if __name__ == "__main__":
     args = parse_args()
     validate_args(args)
@@ -4644,7 +4801,88 @@ if __name__ == "__main__":
             ignore_taichi_cache=args.ignore_taichi_cache
         )
 
-    if args.interactive:
+    if args.disk_model == "v2":
+        # V2 路径：独立 DiskV2Renderer，不复用 V1 的 TaichiRenderer。
+        # 当前仅支持单帧渲染（无 Bloom / 视频 / 交互；Phase 7 再扩展）。
+        if args.video or args.interactive:
+            raise NotImplementedError(
+                "--disk_model v2 当前仅支持单帧渲染；视频和交互模式将在后续 Phase 接入。"
+            )
+        if args.device != "gpu":
+            raise ValueError(
+                "--disk_model v2 当前仅推荐并支持 --device gpu。CPU 路径在小图下也可能耗时数分钟且无进度输出；"
+                "请加上 '--device gpu' 后重试。"
+            )
+        from disk_v2.params import (
+            DiskV2PaletteParams,
+            DiskV2Params,
+            DiskV2StructureParams,
+        )
+        from disk_v2.taichi_render import DiskV2Renderer
+
+        # 初始化 Taichi（在 DiskV2Renderer 内部也会按需 init，但 V2 入口
+        # 不通过 TaichiRenderer，所以这里显式触发一次更稳）。
+        arch = ti.cpu if args.device == "cpu" else ti.gpu
+        ti.init(arch=arch, default_fp=ti.f32)
+
+        skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
+        # V2 默认半径建议为 r_in=3, r_out=50；CLI --ar1 / --ar2 的 V1 默认值
+        # （2 / 15）落在 V2 推荐之外。当用户没有显式调整时给出 warning，
+        # 并尊重用户的实际取值（V1 默认下会被 DiskV2Params 自动钳制 r_in≥3）。
+        if args.disk_outer_radius < 20.0:
+            print(
+                f"[V2] 警告：--ar2={args.disk_outer_radius} 小于 V2 推荐 r_out (≥ 20)；"
+                f"温度跨度会受限，建议加上 '--ar2 50'。"
+            )
+        v2_params = DiskV2Params(
+            r_in=args.disk_inner_radius,
+            r_out=args.disk_outer_radius,
+            T_peak_K=args.v2_T_peak_K,
+        )
+        v2_structure = build_v2_structure_params(args)
+        v2_render_opts = resolve_v2_render_options(args)
+        if args.v2_visual_preset == "interstellar":
+            v2_palette = DiskV2PaletteParams(
+                palette_mode="cinematic",
+                cinematic_saturation=1.58,
+                cinematic_warm_shift=0.18,
+                visual_temp_outer_K=2800.0,
+                visual_temp_inner_K=11500.0,
+            )
+        else:
+            v2_palette = DiskV2PaletteParams(palette_mode=v2_render_opts["palette_mode"])
+
+        v2_r_max = v2_render_opts["r_max"]
+
+        renderer = DiskV2Renderer(
+            width=width,
+            height=height,
+            params=v2_params,
+            structure_params=v2_structure,
+            palette_params=v2_palette,
+            skybox=skybox,
+            step_size=args.step_size,
+            r_max=v2_r_max,
+            disk_tilt_deg=args.disk_tilt,
+            volume_samples=v2_render_opts["volume_samples"],
+            opacity_scale=v2_render_opts["opacity_scale"],
+            emission_scale=v2_render_opts["emission_scale"],
+            lum_power=v2_render_opts["lum_power"],
+            g_cap=args.v2_g_cap,
+            enable_g_factor=not args.v2_disable_g_factor,
+            bloom_threshold=v2_render_opts["bloom_threshold"],
+            bloom_intensity=v2_render_opts["bloom_intensity"],
+            bloom_radius=v2_render_opts["bloom_radius"],
+            auto_exposure=v2_render_opts["auto_exposure"],
+            white_point_percentile=v2_render_opts["white_point_percentile"],
+            print_stats=args.v2_print_stats,
+            seed=args.v2_seed,
+            device=args.device,
+            ignore_taichi_cache=args.ignore_taichi_cache,
+        )
+        img = renderer.render(cam_pos=args.pov, fov=fov)
+        save_image(img, args.output)
+    elif args.interactive:
         renderer = _make_renderer_with_placeholder(device="gpu")
         render_interactive(
             renderer, width, height,
