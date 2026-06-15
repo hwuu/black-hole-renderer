@@ -15,6 +15,7 @@ def _make_args(**overrides) -> argparse.Namespace:
 
     注意：bloom 三个参数 CLI 默认是 None（修 C），让 preset 能区分
     "用户未指定"与"用户显式传 0"。
+    tonemap_mode 也是 None（X1），让 preset 区分。
     """
     defaults = {
         "v2_visual_preset": None,
@@ -23,6 +24,7 @@ def _make_args(**overrides) -> argparse.Namespace:
         "v2_bloom_intensity": None,
         "v2_bloom_radius": None,
         "v2_palette_mode": "cinematic",
+        "v2_tonemap_mode": None,
         "v2_opacity_scale": 0.55,
         "v2_emission_scale": 1.0,
         "v2_lum_power": 4.0,
@@ -109,12 +111,12 @@ class ResolveV2RenderOptionsTest(unittest.TestCase):
         # 用户未指定 bloom（CLI 默认 None）
         args = _make_args(v2_visual_preset="interstellar")
         opts = resolve_v2_render_options(args)
-        self.assertEqual(opts["bloom_intensity"], 1.5)
-        self.assertEqual(opts["bloom_threshold"], 5e-4)
+        self.assertEqual(opts["bloom_intensity"], 0.4)
+        self.assertEqual(opts["bloom_threshold"], 0.0)
         self.assertEqual(opts["bloom_radius"], 8.0)
 
     def test_interstellar_preset_respects_user_bloom_intensity_zero(self):
-        """修 C：用户显式 `--v2_bloom_intensity 0` 必须能覆盖 preset 的 1.5。
+        """修 C：用户显式 `--v2_bloom_intensity 0` 必须能覆盖 preset 的 0.4。
 
         旧的 `if args.v2_bloom_intensity == 0.0` 判定无法区分"用户显式 0"
         与"用户未指定"，导致用户关 bloom 的请求被 preset 默默忽略。

@@ -288,9 +288,18 @@ class DiskV2PaletteParams:
     gamma: float = 2.2
     opacity_scale: float = 0.5
     cinematic_saturation: float = 1.3
-    cinematic_warm_shift: float = 0.08
+    # X1 + V1 着色：default 0 让"高温偏白"成立；之前 0.08 让所有颜色偏暖，
+    # 与"高温偏白"矛盾。用户仍可通过 CLI 显式启用 warm shift。
+    cinematic_warm_shift: float = 0.0
     visual_temp_outer_K: float = 2500.0
     visual_temp_inner_K: float = 12000.0
+    # V1 着色：温度依赖的亮度系数（"低温偏暗、高温偏亮"）。
+    # 在 cinematic palette 里按 t_norm ∈ [0, 1] 线性插值：
+    #   value = value_low_T + t_norm · (value_high_T - value_low_T)
+    # 取 0.7 / 1.2 是 V1 行为的轻量近似（Stefan-Boltzmann 等价 T^4 在
+    # 归一化空间下太陡，1.2/0.7 ≈ 1.71 倍跨度足够视觉可辨）。
+    cinematic_value_low_T: float = 0.7
+    cinematic_value_high_T: float = 1.2
 
     def __post_init__(self) -> None:
         """校验调色参数的合法范围。
@@ -308,10 +317,13 @@ class DiskV2PaletteParams:
                 f"tonemap_mode must be 'reinhard' or 'aces', got {self.tonemap_mode!r}"
             )
         if self.tonemap_mode == "aces":
-            # ACES 留作后续扩展，首版不允许直接使用。
+            # X1 已撤回（2026-06-14）：ACES Filmic 的低值响应曲线 (x→0 时斜率≈0.21)
+            # 让"99% 黑底 + 1% 高亮"的黑洞场景被严重抬亮，背景灰雾。
+            # `tonemap_aces` 函数本体保留在 palette.py / taichi_impl.py，未来若
+            # 解决了 background pedestal 问题再启用。
             raise NotImplementedError(
-                "tonemap_mode='aces' is reserved for future implementation; "
-                "use 'reinhard' for v2.1."
+                "tonemap_mode='aces' is reserved; ACES + ref_wp 让黑色背景被抬亮。"
+                "use 'reinhard' (default)."
             )
         if self.gamma <= 0.0:
             raise ValueError("gamma must be positive")
@@ -325,3 +337,8 @@ class DiskV2PaletteParams:
             raise ValueError("visual_temp_outer_K must be positive")
         if self.visual_temp_inner_K <= self.visual_temp_outer_K:
             raise ValueError("visual_temp_inner_K must be greater than visual_temp_outer_K")
+        # V1 着色：温度依赖亮度系数
+        if self.cinematic_value_low_T <= 0.0:
+            raise ValueError("cinematic_value_low_T must be positive")
+        if self.cinematic_value_high_T <= 0.0:
+            raise ValueError("cinematic_value_high_T must be positive")

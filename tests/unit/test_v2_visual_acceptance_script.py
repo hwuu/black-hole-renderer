@@ -37,11 +37,11 @@ def _command_for_output(script_text: str, output_name: str) -> str:
 
 
 # v2.2 推荐主验收参数：r_out=50 让标准薄盘温度跨度达到 4.32 倍。
-# 相机距离 ~100 r_s 让 r_out=50 的盘完整可见，留出黑洞透镜余地。
+# 相机距离 ~74 r_s 让 r_out=50 的盘可见且占画面 ~40%（X4 拉近后调整）。
 # 见 docs/design_ad_v2.md §2.4 与 v2.1 变更记录。
 _EXPECTED_ACCEPT_AR1 = "3"
 _EXPECTED_ACCEPT_AR2 = "50"
-_EXPECTED_ACCEPT_POV = "95 0 32"
+_EXPECTED_ACCEPT_POV = "70 0 24"
 
 # v1 默认行为对应的小盘参数，留作对照。
 _EXPECTED_COMPAT_AR1 = "2"

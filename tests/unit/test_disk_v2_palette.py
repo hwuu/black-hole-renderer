@@ -41,6 +41,7 @@ class DiskV2PaletteTest(unittest.TestCase):
             DiskV2PaletteParams(palette_mode="cinematicX")
 
     def test_aces_is_not_yet_implemented(self):
+        """X1 已撤回 (2026-06-14)：ACES 让黑底场景灰雾，重新拦截。"""
         with self.assertRaises(NotImplementedError):
             DiskV2PaletteParams(tonemap_mode="aces")
 
@@ -102,11 +103,16 @@ class DiskV2PaletteTest(unittest.TestCase):
         self.assertGreater(diff_cine, diff_phys)
 
     def test_cinematic_color_at_1e7_not_saturated_white(self):
-        """cinematic 重映射后，1e7 K 不应再变成纯白。"""
+        """cinematic 重映射后，1e7 K 不应再变成纯白（仍保留色相差异）。
+
+        V1 着色规格（高温偏白偏亮）让 max 接近 1.0，但 R/G/B 仍有差异：
+        - 1e7 K → 紫蓝白（R<G≤B），std > 0.01
+        - 而不是纯白 R=G=B=1.0
+        """
         rgb = cinematic_color(1.0e7, self.cinematic, T_peak_K=1.0e7)
         self.assertTrue(np.all(rgb >= 0.0))
         self.assertTrue(np.all(rgb <= 1.0))
-        self.assertLess(float(np.max(rgb)), 0.98)
+        # 不能完全饱和成纯白：R/G/B 三通道仍有差异
         self.assertGreater(float(np.std(rgb)), 0.01)
 
     def test_cinematic_color_returns_clamped_rgb(self):

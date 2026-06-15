@@ -53,6 +53,7 @@ def _acceptance_args() -> argparse.Namespace:
         v2_bloom_intensity=None,
         v2_bloom_radius=None,
         v2_palette_mode="cinematic",
+        v2_tonemap_mode=None,
         v2_opacity_scale=0.55,
         v2_emission_scale=1.0,
         v2_lum_power=4.0,
@@ -165,11 +166,11 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         # warn 窗口下 used_wp 必须 == ref_wp（策略选择）
         self.assertAlmostEqual(used_wp, ref_wp, places=8)
 
-    def test_acceptance_with_bloom_changes_actual_hdr(self):
-        """修 C：开启 bloom 时，actual HDR p{n} 应显著上升（vs no-bloom）。
+    def test_acceptance_with_bloom_changes_ldr_output(self):
+        """V1 风格 LDR bloom：开启 bloom 时，最终 LDR 图与 no-bloom 不同。
 
-        这条测试保护 bloom 真的在干活——之前默认参数下 bloom_threshold=0.15 >
-        HDR max=0.025，bloom 完全被过滤；修 C 让 threshold=5e-4 后 bloom 生效。
+        bloom 现在在 LDR 域做（不改 HDR），所以 actual_hdr_wp 不再变化。
+        改测 LDR 输出差异来验证 bloom 在工作。
         """
         import argparse
         # Bloom off baseline
@@ -177,21 +178,21 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         args_off.v2_bloom_intensity = 0.0
         r_off = self._make_acceptance_renderer(args=args_off)
         with redirect_stdout(io.StringIO()):
-            r_off.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
-        actual_off = r_off.last_actual_hdr_white_point
+            img_off = r_off.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
 
-        # Bloom on（preset 默认 i=1.5, t=5e-4, r=8）
+        # Bloom on（preset 默认 i=0.4）
         args_on = _acceptance_args()
-        # args_on.v2_bloom_intensity = None → preset 给 1.5
+        # args_on.v2_bloom_intensity = None → preset 给 0.4
         r_on = self._make_acceptance_renderer(args=args_on)
         with redirect_stdout(io.StringIO()):
-            r_on.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
-        actual_on = r_on.last_actual_hdr_white_point
+            img_on = r_on.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
 
-        # bloom 应让 actual HDR p{n} 至少提升 5%
+        # bloom 应让 LDR 输出明显不同
+        diff = np.abs(img_on.astype(float) - img_off.astype(float))
+        max_diff = diff.max()
         self.assertGreater(
-            actual_on / actual_off, 1.05,
-            msg=f"bloom on 应让 actual_hdr_wp 显著上升：off={actual_off:.4e}, on={actual_on:.4e}",
+            max_diff, 0.01,
+            msg=f"bloom on 应让 LDR 输出显著变化：max_pixel_diff={max_diff:.4f}",
         )
 
     def test_acceptance_stats_exposes_actual_hdr_white_point(self):

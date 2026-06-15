@@ -178,6 +178,30 @@ class DiskV2Renderer:
         # 输出图像 field（HDR 浮点；Bloom + tonemap 在 Python 端 / 简化 kernel 完成）。
         self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        # 方向 1（2026-06-14）：背景与盘分离处理
+        # - disk_hdr_field: 盘的物理通量（参与曝光 + tonemap + bloom）
+        # - disk_alpha_field: 盘 + 事件视界的累积不透明度（合成时分配 disk vs sky）
+        # - sky_hdr_field: 背景天空原始颜色（**不**参与曝光、tonemap、bloom）
+        # 解决 cinematic auto_exposure 把暗背景 (luma~0.02) ×exposure_scale(~1400)
+        # 抬到 HDR~30 → Reinhard 0.97 → 全图灰白的问题。
+        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(width, height))
+        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        # V1 风格 LDR bloom 所需 fields：
+        # - disk_ldr_field: 盘经 exposure+tonemap+gamma 后的 LDR，bloom 输入输出
+        # - bright_field: 高亮提取缓冲
+        # - blur_field: separable 高斯中间缓冲
+        self.disk_ldr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.bright_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        # V1 bloom 参数 fields（Taichi 闭包 kernel 不接受任何参数注解，
+        # 只能通过 field 传递 runtime 值）
+        self.bloom_threshold_field = ti.field(dtype=ti.f32, shape=())
+        self.bloom_intensity_field = ti.field(dtype=ti.f32, shape=())
+        self.bloom_kernel_radius_field = ti.field(dtype=ti.i32, shape=())
+        self.bloom_sigma_scale_field = ti.field(dtype=ti.f32, shape=())
+        # event_horizon mask：bloom 后强制黑洞内部为黑色
+        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(width, height))
 
         # 上传 skybox。
         sky_h, sky_w = skybox.shape[:2]
@@ -509,30 +533,197 @@ class DiskV2Renderer:
                 elif escaped:
                     bg_color = _sample_skybox(escape_dir)
 
+                # 方向 1：分通道写入，sky 不参与曝光，disk 走 cinematic 链
+                # disk_hdr: 盘的纯发射（不含 sky 也不含 sky × transmittance）
+                # disk_alpha: 盘（+ event horizon）的累积不透明度
+                #   - event_horizon_hit: alpha=1，完全遮挡 sky
+                #   - use_visual_atlas:  alpha=plane_alpha_total（atlas 累积透明度）
+                #   - volume 路径:       alpha=1-transmittance（积分累积透明度）
+                # sky_hdr: 原始 sky 颜色，不参与曝光
+                disk_hdr_value = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+                disk_alpha_value = 0.0
+                sky_hdr_value = bg_color  # 已经处理过 event_horizon_hit（黑色）和 escape
+                if event_horizon_hit:
+                    # 黑洞剪影：alpha=1，背景完全被遮挡
+                    disk_alpha_value = 1.0
+                    self.event_horizon_field[i, j] = 1
+                elif ti.static(use_visual_atlas):
+                    disk_hdr_value = plane_disk
+                    disk_alpha_value = plane_alpha_total
+                    self.event_horizon_field[i, j] = 0
+                else:
+                    disk_hdr_value = hdr_accum
+                    disk_alpha_value = 1.0 - transmittance
+                    self.event_horizon_field[i, j] = 0
+
+                self.disk_hdr_field[i, j] = disk_hdr_value
+                self.disk_alpha_field[i, j] = ti.min(ti.max(disk_alpha_value, 0.0), 1.0)
+                self.sky_hdr_field[i, j] = sky_hdr_value
+
+                # 保留 hdr_field 作为"近似传统合成"用于向后兼容（stats / fallback）。
+                # 注意：bloom 现在只跑在 disk_hdr_field 上，不再修改 hdr_field。
                 hdr_total = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
                 if ti.static(use_visual_atlas):
-                    bg_color = bg_color * (1.0 - plane_alpha_total)
-                    hdr_total = plane_disk + bg_color
+                    hdr_total = plane_disk + bg_color * (1.0 - plane_alpha_total)
                 else:
-                    bg_color = bg_color * transmittance
-                    hdr_total = hdr_accum + bg_color
-                # 存 HDR；后续 Python 端做可选 Bloom，再 tonemap + gamma。
+                    hdr_total = hdr_accum + bg_color * transmittance
                 self.hdr_field[i, j] = hdr_total
 
         self._ray_march_kernel = _ray_march_kernel
 
         @ti.kernel
-        def _tonemap_kernel():
-            """把 hdr_field 经 white point 缩放 + Reinhard + sRGB 伽马后写入 image_field。"""
+        def _disk_tonemap_kernel():
+            """disk_hdr → disk_ldr：exposure × tonemap × gamma，写入 disk_ldr_field。
+
+            bloom 将在 disk_ldr_field（LDR 域）上做，与 V1 行为一致。
+            event_horizon 像素强制输出黑色。
+            """
             wp = self.white_point_field[None]
             inv_wp = 1.0 / ti.max(wp, 1e-6)
-            for i, j in self.image_field:
-                hdr = disk.apply_exposure_ti(self.hdr_field[i, j], inv_wp)
-                ldr = disk.tonemap_reinhard(hdr)
-                ldr = disk.gamma_correct_ti(ldr)
-                self.image_field[i, j] = ldr
+            for i, j in self.disk_ldr_field:
+                if self.event_horizon_field[i, j] == 1:
+                    self.disk_ldr_field[i, j] = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+                else:
+                    disk_hdr_raw = self.disk_hdr_field[i, j]
+                    disk_hdr = disk.apply_exposure_ti(disk_hdr_raw, inv_wp)
+                    disk_ldr = disk.tonemap_reinhard(disk_hdr)
+                    disk_ldr = disk.gamma_correct_ti(disk_ldr)
+                    self.disk_ldr_field[i, j] = disk_ldr
 
-        self._tonemap_kernel = _tonemap_kernel
+        self._disk_tonemap_kernel = _disk_tonemap_kernel
+
+        @ti.kernel
+        def _bloom_kernel():
+            """V1 风格 LDR bloom：逐通道独立 sigma 模拟相机色散。
+
+            直接从 V1 `_bloom_kernel` 复制，在 disk_ldr_field 上操作。
+            三通道 sigma²：R=25, G=80, B=1600（×sigma_scale），
+            让蓝光扩散远 8× → halo 边缘呈明显蓝色。
+
+            流程：亮度提取 → 水平高斯 → 垂直高斯 → 加回 disk_ldr_field。
+
+            参数通过 field 传入（Taichi 闭包 kernel 不接受运行时参数注解）：
+            bloom_threshold_field, bloom_intensity_field, bloom_kernel_radius_field,
+            bloom_sigma_scale_field。
+            """
+            threshold = self.bloom_threshold_field[None]
+            intensity = self.bloom_intensity_field[None]
+            kernel_radius = self.bloom_kernel_radius_field[None]
+            sigma_scale = self.bloom_sigma_scale_field[None]
+
+            w = ti.cast(self.disk_ldr_field.shape[0], ti.i32)
+            h = ti.cast(self.disk_ldr_field.shape[1], ti.i32)
+
+            # 1. 提取高亮像素
+            for i, j in self.disk_ldr_field:
+                col = self.disk_ldr_field[i, j]
+                lum = col[0] * 0.2126 + col[1] * 0.7152 + col[2] * 0.0722
+                if lum > threshold:
+                    self.bright_field[i, j] = col
+                else:
+                    self.bright_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+
+            # 2. 水平方向模糊（逐通道独立 sigma）
+            for i, j in self.blur_field:
+                sum_r = 0.0
+                sum_g = 0.0
+                sum_b = 0.0
+                weight_r = 0.0
+                weight_g = 0.0
+                weight_b = 0.0
+                dx = -kernel_radius
+                while dx <= kernel_radius:
+                    ni = i + dx
+                    if 0 <= ni < w:
+                        dist_sq = ti.cast(dx * dx, ti.f32)
+                        col = self.bright_field[ni, j]
+                        w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
+                        w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
+                        sum_r += col[0] * w_r
+                        sum_g += col[1] * w_g
+                        sum_b += col[2] * w_b
+                        weight_r += w_r
+                        weight_g += w_g
+                        weight_b += w_b
+                    dx += 1
+                if weight_r > 0.0:
+                    self.blur_field[i, j] = ti.Vector([
+                        sum_r / weight_r, sum_g / weight_g, sum_b / weight_b,
+                    ])
+                else:
+                    self.blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+
+            # 3. 复制到 bright_field 供垂直 pass 读取
+            for i, j in self.bright_field:
+                self.bright_field[i, j] = self.blur_field[i, j]
+
+            # 4. 垂直方向模糊
+            for i, j in self.blur_field:
+                sum_r = 0.0
+                sum_g = 0.0
+                sum_b = 0.0
+                weight_r = 0.0
+                weight_g = 0.0
+                weight_b = 0.0
+                dy = -kernel_radius
+                while dy <= kernel_radius:
+                    nj = j + dy
+                    if 0 <= nj < h:
+                        dist_sq = ti.cast(dy * dy, ti.f32)
+                        col = self.bright_field[i, nj]
+                        w_r = ti.exp(-dist_sq / (25.0 * sigma_scale))
+                        w_g = ti.exp(-dist_sq / (80.0 * sigma_scale))
+                        w_b = ti.exp(-dist_sq / (1600.0 * sigma_scale))
+                        sum_r += col[0] * w_r
+                        sum_g += col[1] * w_g
+                        sum_b += col[2] * w_b
+                        weight_r += w_r
+                        weight_g += w_g
+                        weight_b += w_b
+                    dy += 1
+                if weight_r > 0.0:
+                    self.blur_field[i, j] = ti.Vector([
+                        sum_r / weight_r, sum_g / weight_g, sum_b / weight_b,
+                    ])
+                else:
+                    self.blur_field[i, j] = ti.Vector([0.0, 0.0, 0.0])
+
+            # 5. 加回 disk_ldr_field（逐通道加性合成）
+            # 三通道 sigma 差距大（R=10, G≈18, B≈80），归一化加权平均让
+            # G/B 在核心区跟 R 一样强 → bloom 变绿/蓝而不是暖白。
+            # 逐通道 intensity 衰减让核心保持暖色，外缘才显现淡蓝：
+            #   R × 1.0:  红光 sigma 最小，只在核心亮——主导暖色
+            #   G × 0.35: 绿光 sigma 中等，压制避免偏绿
+            #   B × 0.15: 蓝光 sigma 最大，极轻量——只在远处淡淡可见
+            for i, j in self.disk_ldr_field:
+                orig = self.disk_ldr_field[i, j]
+                bloom_val = self.blur_field[i, j]
+                r = orig[0] + bloom_val[0] * intensity * 1.0
+                g = orig[1] + bloom_val[1] * intensity * 0.35
+                b = orig[2] + bloom_val[2] * intensity * 0.15
+                self.disk_ldr_field[i, j] = ti.Vector([
+                    ti.min(ti.max(r, 0.0), 1.0),
+                    ti.min(ti.max(g, 0.0), 1.0),
+                    ti.min(ti.max(b, 0.0), 1.0),
+                ], dt=ti.f32)
+
+        self._bloom_kernel = _bloom_kernel
+
+        @ti.kernel
+        def _compose_kernel():
+            """disk_ldr（含 bloom）+ sky + alpha → 最终 image_field。
+
+            sky 不做 gamma（与 V1 一致，背景 PNG 已经是 sRGB encoded）。
+            event_horizon 像素 disk_alpha=1 + disk_ldr=黑色 → 最终黑色。
+            """
+            for i, j in self.image_field:
+                alpha = self.disk_alpha_field[i, j]
+                disk_ldr = self.disk_ldr_field[i, j]
+                sky_ldr = self.sky_hdr_field[i, j]
+                self.image_field[i, j] = disk_ldr * alpha + sky_ldr * (1.0 - alpha)
+
+        self._compose_kernel = _compose_kernel
 
     def _setup_camera(self, cam_pos: List[float], fov: float) -> None:
         """计算相机基向量并填到 Taichi field 中（与 V1 `build_camera` 一致）。"""
@@ -575,21 +766,25 @@ class DiskV2Renderer:
     _RATIO_WARN_HI: float = 100.0
 
     def _compute_white_point(self, hdr_np: np.ndarray) -> tuple[float, float]:
-        """从 HDR buffer 计算 tonemap 用的 white point。
+        """从 disk-only HDR buffer 计算 tonemap 用的 white point。
 
         Args:
-            hdr_np: 形状 `(W, H, 3)` 的 HDR RGB。
+            hdr_np: 形状 `(W, H, 3)` 的 disk HDR RGB（方向 1：不含 sky）。
 
         Returns:
             `(used_white_point, actual_hdr_white_point)`：
 
             - `used_white_point`：fallback 判定后实际用于 tonemap 的 white point。
-            - `actual_hdr_white_point`：HDR p{white_point_percentile} 原始候选值
-              （fallback 判定前）；与 `reference_white_point` 之比即 D3 ratio。
+            - `actual_hdr_white_point`：盘内像素 p{n} 原始候选值（fallback 判定前）；
+              与 `reference_white_point` 之比即 D3 ratio。
 
         Notes:
-            判定逻辑（D3 修订）：
+            判定逻辑（D3 修订 + 方向 1 修订）：
 
+            - **方向 1 (2026-06-14)**：percentile 只在 `disk_alpha > 0` 的像素上算，
+              避免大量背景 0 像素把 p96 拖到接近 0。否则 r_out=50 大盘下，
+              背景占屏 > 95%，p96 = 0 → ratio = 0 → 进入 warn 区，但用户场景
+              其实是正常的。
             - 若 `actual_hdr_p{n}` 与 `reference_white_point` 比值落在
               `[_RATIO_TRUSTED_LO, _RATIO_TRUSTED_HI]`，使用 reference。
               这是 cinematic 曝光基线，物理可控、跨场景稳定。
@@ -600,8 +795,24 @@ class DiskV2Renderer:
 
             注：`n = white_point_percentile`，默认 99；`interstellar` preset 用 96。
         """
-        luma = hdr_luminance(hdr_np).ravel()
-        luma = luma[np.isfinite(luma)]
+        luma_full = hdr_luminance(hdr_np).ravel()
+        # 方向 1：只统计盘像素，避免背景 0 像素污染分位数。
+        # disk_alpha_field 拷回 CPU 做 mask。若 mask 后无任何盘像素（测试场景
+        # 或 disk_alpha 全 0），fallback 到整张 HDR 统计。
+        try:
+            alpha_np = self.disk_alpha_field.to_numpy().ravel()
+        except AttributeError:
+            alpha_np = None
+        luma: np.ndarray
+        if alpha_np is not None and alpha_np.size == luma_full.size:
+            mask = (alpha_np > 1e-4) & np.isfinite(luma_full)
+            if mask.any():
+                luma = luma_full[mask]
+            else:
+                # 测试场景：disk_alpha 全 0 但 HDR 非 0 → 用整图，保持旧行为
+                luma = luma_full[np.isfinite(luma_full)]
+        else:
+            luma = luma_full[np.isfinite(luma_full)]
         if luma.size == 0:
             return 1.0, 1.0
         pct = float(np.clip(self.white_point_percentile, 50.0, 99.99))
@@ -613,20 +824,20 @@ class DiskV2Renderer:
             return ref_wp, hdr_wp
         if self._RATIO_WARN_LO <= ratio <= self._RATIO_WARN_HI:
             print(
-                f"[V2 exposure] warning: actual HDR p{pct:g} / reference = {ratio:.2f}, "
+                f"[V2 exposure] warning: actual HDR p{pct:g} (disk-only) / reference = {ratio:.2f}, "
                 f"偏离 trusted 窗口 [{self._RATIO_TRUSTED_LO}, {self._RATIO_TRUSTED_HI}]；"
                 f"仍使用 reference 保持曝光基线稳定，请检查物理参数。"
             )
             return ref_wp, hdr_wp
         # 极端偏离：reference 不可信，兜底 HDR p{n}，避免单帧异常。
         print(
-            f"[V2 exposure] reference 不可信: actual/ref = {ratio:.2g}（HDR p{pct:g}），"
+            f"[V2 exposure] reference 不可信: actual/ref = {ratio:.2g}（HDR p{pct:g} disk-only），"
             f"超过 [{self._RATIO_WARN_LO}, {self._RATIO_WARN_HI}]；fallback 到 HDR p{pct:g}。"
         )
         return hdr_wp, hdr_wp
 
     def render(self, cam_pos: List[float], fov: float) -> np.ndarray:
-        """渲染单帧（含可选 Bloom）。
+        """渲染单帧（含可选 V1 风格 LDR bloom）。
 
         Args:
             cam_pos: 相机位置 `[x, y, z]`，单位为 r_s。
@@ -636,21 +847,22 @@ class DiskV2Renderer:
             `(height, width, 3)` uint8 RGB 数组。
 
         Notes:
-            管线为：HDR 体积积分 → 可选 HDR Bloom → tonemap → gamma → LDR 输出。
-            Bloom 在 HDR 域做，符合 docs/design_ad_v2.md §3.6 的要求。
+            管线（方向 1 + V1 bloom）：
+
+            1. `_ray_march_kernel`：HDR 体积积分 → disk_hdr / disk_alpha / sky_hdr
+            2. `_compute_white_point`：disk-only HDR 统计 → wp
+            3. `_disk_tonemap_kernel`：disk_hdr → disk_ldr（exposure + tonemap + gamma）
+            4. `_bloom_kernel`（可选）：V1 风格 LDR 域 bloom，逐通道独立 sigma
+               模拟相机色散，B 通道 sigma 8× → 蓝色 halo 边缘
+            5. `_compose_kernel`：disk_ldr（含 bloom）+ sky + alpha → 最终 image_field
         """
         self._setup_camera(cam_pos, fov)
         self._ray_march_kernel()
 
-        if self.bloom_intensity > 0.0:
-            # Python 端 Bloom：在 HDR 域做亮度提取 + 高斯模糊 + 加回。
-            hdr_np = self.hdr_field.to_numpy()  # (W, H, 3)
-            hdr_np = self._apply_bloom(hdr_np)
-            self.hdr_field.from_numpy(hdr_np.astype(np.float32))
-
-        hdr_for_stats = self.hdr_field.to_numpy()
+        # stats / white_point 只看 disk_hdr_field（不含 sky）
+        disk_hdr_for_stats = self.disk_hdr_field.to_numpy()
         if self.auto_exposure:
-            white_point, actual_hdr_wp = self._compute_white_point(hdr_for_stats)
+            white_point, actual_hdr_wp = self._compute_white_point(disk_hdr_for_stats)
         else:
             white_point = 1.0
             actual_hdr_wp = None
@@ -658,13 +870,28 @@ class DiskV2Renderer:
         self.last_actual_hdr_white_point = actual_hdr_wp
         self.white_point_field[None] = float(white_point)
 
-        self._tonemap_kernel()
+        # disk_hdr → disk_ldr（LDR 域）
+        self._disk_tonemap_kernel()
+
+        # V1 风格 LDR bloom（可选）
+        if self.bloom_intensity > 0.0:
+            kernel_radius = int(self.width * 0.02)
+            sigma_scale = (self.width / 640.0) ** 2
+            self.bloom_threshold_field[None] = 0.0
+            self.bloom_intensity_field[None] = float(self.bloom_intensity)
+            self.bloom_kernel_radius_field[None] = kernel_radius
+            self.bloom_sigma_scale_field[None] = float(sigma_scale)
+            self._bloom_kernel()
+
+        # disk_ldr + sky + alpha → 最终合成
+        self._compose_kernel()
+
         img = self.image_field.to_numpy()  # (W, H, 3)
         img = np.transpose(img, (1, 0, 2))
         img = np.clip(img, 0.0, 1.0).astype(np.float32)
 
         stats = compute_render_stats(
-            hdr_for_stats,
+            disk_hdr_for_stats,
             img,
             white_point=white_point if self.auto_exposure else None,
             reference_white_point=self.reference_white_point if self.auto_exposure else None,
@@ -680,40 +907,4 @@ class DiskV2Renderer:
         # 与 V1 `TaichiRenderer.render` 一致：返回 float32 LDR `[0, 1]`，由 `save_image` 量化。
         return img
 
-    def _apply_bloom(self, hdr: np.ndarray) -> np.ndarray:
-        """在 HDR 域做 Bloom：提取超过阈值的亮度 → 高斯模糊 → 加回原图。
-
-        Args:
-            hdr: 形状 `(W, H, 3)` 的 HDR RGB 数组。
-
-        Returns:
-            同形状的 HDR RGB 数组，叠加 Bloom 后。
-
-        Notes:
-            高斯模糊用 separable 1D 卷积（scipy.ndimage 风格的纯 NumPy 实现）。
-        """
-        threshold = self.bloom_threshold
-        intensity = self.bloom_intensity
-        radius = max(self.bloom_radius, 0.5)
-
-        luma = (
-            0.2126 * hdr[..., 0]
-            + 0.7152 * hdr[..., 1]
-            + 0.0722 * hdr[..., 2]
-        )
-        bright_mask = np.maximum(luma - threshold, 0.0) / (luma + 1e-6)
-        bright = hdr * bright_mask[..., None]
-
-        # 1D 高斯核。
-        size = int(max(3, math.ceil(radius * 3.0)) | 1)  # 奇数
-        x = np.arange(size) - size // 2
-        kernel = np.exp(-(x ** 2) / (2.0 * radius * radius))
-        kernel /= kernel.sum()
-
-        # Separable 1D 卷积：先 X 后 Y。
-        blurred = np.empty_like(bright)
-        for c in range(3):
-            tmp = np.apply_along_axis(lambda v: np.convolve(v, kernel, mode="same"), 0, bright[..., c])
-            blurred[..., c] = np.apply_along_axis(lambda v: np.convolve(v, kernel, mode="same"), 1, tmp)
-
-        return hdr + intensity * blurred
+    # _apply_bloom 已删除（2026-06-14）：替换为 V1 风格 LDR 域 Taichi _bloom_kernel。

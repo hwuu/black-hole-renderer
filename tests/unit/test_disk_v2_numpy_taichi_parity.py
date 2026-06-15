@@ -30,6 +30,8 @@ from disk_v2.palette import (
     cinematic_color,
     cinematic_visual_temperature,
     tonemap,
+    tonemap_aces,
+    tonemap_reinhard,
 )
 from disk_v2.imaging import observed_visible_temperature
 from disk_v2.physical_fields import (
@@ -404,6 +406,19 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
             1.0 - self.palette_params_cine.cinematic_warm_shift,
         ])
         np_rgb = np.clip(np_rgb * warm, 0.0, 1.0)
+        # V1 着色系数：t_norm = (t_visible - outer) / (inner - outer)，value 线性插值
+        visual_outer = float(self.palette_params_cine.visual_temp_outer_K)
+        visual_inner = float(self.palette_params_cine.visual_temp_inner_K)
+        visual_span = max(visual_inner - visual_outer, 1e-6)
+        t_norm = np.clip((np.asarray(t_visible) - visual_outer) / visual_span, 0.0, 1.0)
+        value = (
+            self.palette_params_cine.cinematic_value_low_T
+            + t_norm * (
+                self.palette_params_cine.cinematic_value_high_T
+                - self.palette_params_cine.cinematic_value_low_T
+            )
+        )
+        np_rgb = np.clip(np_rgb * value[..., None], 0.0, 1.0)
 
         np.testing.assert_allclose(ti_rgb, np_rgb, rtol=2e-3, atol=2e-3)
 
@@ -462,6 +477,18 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
 
         np_ldr = np.asarray(tonemap(hdr, self.palette_params_phys), dtype=np.float64)
         np.testing.assert_allclose(ti_ldr, np_ldr, rtol=1e-5, atol=1e-6)
+
+    def test_tonemap_aces_function_still_exposed(self):
+        """X1 撤回后，tonemap_aces 函数本体保留可调（未来 + black pedestal）。"""
+        x = np.array([0.0, 0.5, 1.0, 5.0])
+        out = tonemap_aces(x)
+        # 单调递增
+        self.assertTrue(np.all(np.diff(out) > 0))
+        # x=0 → 0
+        self.assertAlmostEqual(float(out[0]), 0.0, places=10)
+        # x=1 → ~0.77（中调比 Reinhard 的 0.5 高）
+        self.assertGreater(float(out[2]), 0.6)
+        self.assertLess(float(out[2]), 0.9)
 
     def test_parity_apply_exposure(self):
         ti_obj = self.ti_phys

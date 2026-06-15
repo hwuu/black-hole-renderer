@@ -198,6 +198,10 @@ def reference_exposure(
 
     Simplifications:
         使用 p99 而不是 max，避免单个采样点或扰动尖峰主导曝光。
+
+    Notes:
+        当前仅支持 Reinhard tonemap：X1 ACES 已撤回，因此不再需要 `tonemap_mode`
+        参数。若未来恢复 ACES，需要按 tonemap 反解 target_hdr。
     """
     if not 0.0 < target_ldr < 1.0:
         raise ValueError("target_ldr must be in (0, 1)")

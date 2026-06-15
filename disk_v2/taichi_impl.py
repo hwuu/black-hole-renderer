@@ -402,6 +402,9 @@ class DiskV2Taichi:
         self._cinematic_warm_shift = float(palette_params.cinematic_warm_shift)
         self._visual_temp_outer_K = float(palette_params.visual_temp_outer_K)
         self._visual_temp_inner_K = float(palette_params.visual_temp_inner_K)
+        # V1 风格 cinematic 亮度系数
+        self._cinematic_value_low_T = float(palette_params.cinematic_value_low_T)
+        self._cinematic_value_high_T = float(palette_params.cinematic_value_high_T)
         outer_ratio = max(self._r_out / max(self._r_in, 1e-6), 1.0 + 1e-6)
         outer_inner_term = max(1.0 - math.sqrt(1.0 / outer_ratio), 1e-6)
         outer_raw = (
@@ -418,6 +421,8 @@ class DiskV2Taichi:
         )
         # 字符串模式不能进 @ti.func，必须在 Python 端做模式分发。
         self._is_cinematic = (palette_params.palette_mode == "cinematic")
+        # X1: tonemap_mode 平铺为 Python bool 供 @ti.func 静态分支
+        self._is_aces_tonemap = (palette_params.tonemap_mode == "aces")
 
         if centers is None:
             centers = _sample_clump_centers(params, structure_params, seed)
@@ -797,22 +802,33 @@ class DiskV2Taichi:
 
     @ti.func
     def sample_palette_color(self, T_K):
-        """温度 → RGB（physical 直查 / cinematic 可见色温重映射）。
+        """温度 → RGB（physical 直查 / cinematic 可见色温重映射 + V1 着色规格）。
 
         Args:
             T_K: 温度（单位 K）。
 
         Returns:
             形状 (3,) 的 RGB 向量，每通道 `[0, 1]`。
+
+        Notes:
+            cinematic 模式按 V1 着色规格做：
+
+            1. log-T 映射到可见色温区间 `[visual_outer, visual_inner]`
+            2. 取 Tanner Helland 黑体色（低温红、高温白）
+            3. 饱和度增强
+            4. 可选暖色偏移（默认 0）
+            5. **V1 亮度系数**：低温区压暗（×low_T），高温区提亮（×high_T）
         """
         rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
         if T_K > 0.0:
             t_source = T_K
+            t_norm_cine = 0.0  # cinematic 模式下 [0, 1] 归一化温度
             if ti.static(self._is_cinematic):
                 safe_T = ti.max(T_K, ti.exp(self._log_t_outer))
                 log_span = ti.max(self._log_t_peak - self._log_t_outer, 1e-6)
                 t_norm = (ti.log(safe_T) - self._log_t_outer) / log_span
                 t_norm = ti.min(ti.max(t_norm, 0.0), 1.0)
+                t_norm_cine = t_norm
                 t_source = self._visual_temp_outer_K + t_norm * (
                     self._visual_temp_inner_K - self._visual_temp_outer_K
                 )
@@ -838,7 +854,7 @@ class DiskV2Taichi:
                 else:
                     b_c = ti.min(ti.max(0.543207 * ti.log(t_m10) - 1.19625, 0.0), 1.0)
 
-            # cinematic 模式：饱和度增强 + 暖色偏移。
+            # cinematic 模式：饱和度增强 + 暖色偏移 + V1 亮度系数
             if ti.static(self._is_cinematic):
                 sat = self._cinematic_saturation
                 warm = self._cinematic_warm_shift
@@ -849,13 +865,20 @@ class DiskV2Taichi:
                 r_c = ti.min(ti.max(r_c * (1.0 + warm), 0.0), 1.0)
                 g_c = ti.min(ti.max(g_c * 1.0, 0.0), 1.0)
                 b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
+                # V1 着色：低温偏暗、高温偏亮
+                value = self._cinematic_value_low_T + t_norm_cine * (
+                    self._cinematic_value_high_T - self._cinematic_value_low_T
+                )
+                r_c = ti.min(ti.max(r_c * value, 0.0), 1.0)
+                g_c = ti.min(ti.max(g_c * value, 0.0), 1.0)
+                b_c = ti.min(ti.max(b_c * value, 0.0), 1.0)
 
             rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
         return rgb
 
     @ti.func
     def sample_observed_palette_color(self, T_K, g_factor):
-        """温度 + g-factor → RGB（cinematic 在可见色温链上做频移）。
+        """温度 + g-factor → RGB（cinematic 在可见色温链上做频移 + V1 着色规格）。
 
         Args:
             T_K: 发射位置物理温度（K）。
@@ -867,10 +890,14 @@ class DiskV2Taichi:
         Notes:
             cinematic 模式不把 `g*T_phys≈1e7K` 直接送入 LDR 色温公式，而是先把
             `T_phys` log 映射到可见色温，再做 `T_visible_obs = clamp(g*T_visible)`。
+            V1 亮度系数基于**最终 t_visible_obs**（含 g-factor 蓝/红移），让
+            朝向观察者侧（蓝移→更高温→更亮白）与远离侧（红移→更低温→更暗红）
+            的"温度→亮度"对比更显著。
         """
         rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
         if T_K > 0.0:
             t_source = T_K
+            t_norm_cine = 0.0
             if ti.static(self._is_cinematic):
                 safe_T = ti.max(T_K, ti.exp(self._log_t_outer))
                 log_span = ti.max(self._log_t_peak - self._log_t_outer, 1e-6)
@@ -882,6 +909,13 @@ class DiskV2Taichi:
                 t_source = ti.min(
                     ti.max(t_visible * ti.max(g_factor, 0.1), self._visual_temp_outer_K),
                     self._visual_temp_inner_K,
+                )
+                # V1 亮度系数基于最终 t_source（含 g-factor 蓝/红移）
+                vis_span = ti.max(
+                    self._visual_temp_inner_K - self._visual_temp_outer_K, 1e-6,
+                )
+                t_norm_cine = ti.min(
+                    ti.max((t_source - self._visual_temp_outer_K) / vis_span, 0.0), 1.0,
                 )
             t = t_source / 100.0
             t_safe = ti.max(t, 1e-6)
@@ -915,6 +949,13 @@ class DiskV2Taichi:
                 r_c = ti.min(ti.max(r_c * (1.0 + warm), 0.0), 1.0)
                 g_c = ti.min(ti.max(g_c * 1.0, 0.0), 1.0)
                 b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
+                # V1 着色：低温偏暗、高温偏亮（含 g-factor 频移）
+                value = self._cinematic_value_low_T + t_norm_cine * (
+                    self._cinematic_value_high_T - self._cinematic_value_low_T
+                )
+                r_c = ti.min(ti.max(r_c * value, 0.0), 1.0)
+                g_c = ti.min(ti.max(g_c * value, 0.0), 1.0)
+                b_c = ti.min(ti.max(b_c * value, 0.0), 1.0)
 
             rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
         return rgb
@@ -935,6 +976,56 @@ class DiskV2Taichi:
             ti.max(rgb_hdr[2], 0.0),
         ], dt=ti.f32)
         return safe / (1.0 + safe)
+
+    @ti.func
+    def tonemap_aces(self, rgb_hdr):
+        """ACES Filmic tonemap（Narkowicz 2015 单变量近似）。
+
+        Args:
+            rgb_hdr: HDR RGB 向量。
+
+        Returns:
+            LDR RGB 向量，每通道 `[0, 1]`（已 clip）。
+
+        Formula:
+            `x → clip(x · (a·x + b) / (x · (c·x + d) + e), 0, 1)`
+            `a=2.51, b=0.03, c=2.43, d=0.59, e=0.14`
+
+        Notes:
+            与 NumPy `tonemap_aces` 公式严格一致；parity 测试保护。
+            相对 Reinhard：x=1 → 0.77（vs 0.5），x=10 → 0.95（vs 0.91）。
+            高动态范围下保留更多中调和高光细节。
+        """
+        a = 2.51
+        b = 0.03
+        c = 2.43
+        d = 0.59
+        e = 0.14
+        result = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+        for ch in ti.static(range(3)):
+            x = ti.max(rgb_hdr[ch], 0.0)
+            num = x * (a * x + b)
+            den = ti.max(x * (c * x + d) + e, 1e-12)
+            y = num / den
+            result[ch] = ti.min(ti.max(y, 0.0), 1.0)
+        return result
+
+    @ti.func
+    def tonemap_ti(self, rgb_hdr):
+        """统一 tonemap 入口，按 `palette_params.tonemap_mode` 静态分发。
+
+        Args:
+            rgb_hdr: HDR RGB 向量。
+
+        Returns:
+            LDR RGB 向量。
+        """
+        result = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+        if ti.static(self._is_aces_tonemap):
+            result = self.tonemap_aces(rgb_hdr)
+        else:
+            result = self.tonemap_reinhard(rgb_hdr)
+        return result
 
     @ti.func
     def apply_exposure_ti(self, rgb_hdr, exposure_scale):

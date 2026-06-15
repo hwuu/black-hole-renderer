@@ -218,15 +218,29 @@ def cinematic_color(
     Formula:
         ```
         T_vis = cinematic_visual_temperature(T_K, T_peak_K, params)
+        # log-T 归一化系数（0=外缘冷低温，1=内峰高温）
+        t_norm = (T_vis - visual_temp_outer_K) / (visual_temp_inner_K - visual_temp_outer_K)
+        # V1 风格亮度系数：低温偏暗、高温偏亮
+        value = value_low_T + t_norm · (value_high_T - value_low_T)
+
         base = blackbody_color(T_vis)
         saturated = saturation_boost(base, cinematic_saturation)
         warmed = saturated · [1 + warm_shift, 1, 1 - warm_shift]
+        # V1 风格的"低温偏暗、高温偏亮"
+        out = clip(warmed · value, 0, 1)
         ```
 
     Physical Meaning:
-        在可见色温映射后的黑体色基础上增强饱和度，并对红/蓝通道做对称偏移。
+        在可见色温映射后的黑体色基础上：
+
+        1. 增强饱和度（让红色更红、蓝色更蓝）
+        2. 可选暖色偏移（默认 0；用户可显式启用）
+        3. **V1 着色规格**：温度依赖的亮度系数。低温区（红橙）整体压暗，
+           高温区（白）整体提亮，对齐 V1 直观感受"温度高 = 又白又亮"。
 
     Simplifications:
+        - value 用线性插值近似 Stefan-Boltzmann T^4 在归一化空间的相对系数；
+          1.71 倍跨度足够视觉可辨。
         - 用解析饱和度增强 + 通道增益，没有引入 LUT。
     """
     peak = float(T_peak_K if T_peak_K is not None else 1.0e7)
@@ -238,6 +252,17 @@ def cinematic_color(
         dtype=np.float64,
     )
     rgb = np.clip(rgb * warm, 0.0, 1.0)
+    # V1 风格亮度系数：t_norm 从 t_vis 归一到 [0, 1] 计算
+    visual_outer = float(params.visual_temp_outer_K)
+    visual_inner = float(params.visual_temp_inner_K)
+    visual_span = max(visual_inner - visual_outer, 1e-6)
+    t_norm = np.clip((np.asarray(t_vis) - visual_outer) / visual_span, 0.0, 1.0)
+    value = (
+        params.cinematic_value_low_T
+        + t_norm * (params.cinematic_value_high_T - params.cinematic_value_low_T)
+    )
+    # value 可以 > 1（高温偏亮），所以 clip 上界在外面控制
+    rgb = np.clip(rgb * value[..., None], 0.0, 1.0)
     return rgb
 
 
@@ -269,11 +294,74 @@ def palette_color(
         raise ValueError(f"unsupported palette_mode: {params.palette_mode!r}")
 
 
+def tonemap_reinhard(rgb_hdr: np.ndarray) -> np.ndarray:
+    """Reinhard 简化 tonemap：`x → x / (1 + x)`。
+
+    Args:
+        rgb_hdr: 非负 HDR RGB 数组。
+
+    Returns:
+        与输入同形状的数组，落在 `[0, 1)`。
+
+    Notes:
+        - x=0 → 0；x=1 → 0.5（中调）；x=∞ → 1
+        - 视觉上高光区会显著饱和（HDR p99 / white_point ≈ 1 → LDR 0.5，
+          已经偏白；高于此快速饱和到 0.97~1.0）
+    """
+    safe = np.maximum(rgb_hdr, 0.0)
+    return safe / (1.0 + safe)
+
+
+# ACES Filmic (Krzysztof Narkowicz 2015) 系数。
+# 拟合自 ACES RRT + ODT，逐分量近似。
+# 参考: https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
+_ACES_A: float = 2.51
+_ACES_B: float = 0.03
+_ACES_C: float = 2.43
+_ACES_D: float = 0.59
+_ACES_E: float = 0.14
+
+
+def tonemap_aces(rgb_hdr: np.ndarray) -> np.ndarray:
+    """ACES Filmic tonemap (Narkowicz 2015 单变量近似)。
+
+    Args:
+        rgb_hdr: 非负 HDR RGB 数组。
+
+    Returns:
+        与输入同形状的数组，落在 `[0, ~1.033]`，再 clip 到 `[0, 1]`。
+
+    Formula:
+        ```
+        x → clip(x · (a·x + b) / (x · (c·x + d) + e), 0, 1)
+        a=2.51, b=0.03, c=2.43, d=0.59, e=0.14
+        ```
+
+    Notes:
+        相对 Reinhard 的关键性质：
+
+        - x=0 → 0（一致）
+        - x=1 → 0.77（Reinhard 是 0.5）—— **中调更亮**
+        - x=10 → 0.95（Reinhard 是 0.91）—— **高光区不饱和、仍有细节**
+        - x=∞ → ~1.033（数学上限，clip 到 1）
+
+        视觉效果：HDR 跨度大时（如本项目 V2 主验收 HDR max/p99 ≈ 100）
+        ACES 让中段保留更多动态范围，而 Reinhard 会把所有中调压到 0.5 以下。
+        多普勒方向性、衰减曲线、外缘软化都需要中调动态范围才能可见。
+    """
+    safe = np.maximum(rgb_hdr, 0.0)
+    numerator = safe * (_ACES_A * safe + _ACES_B)
+    denominator = safe * (_ACES_C * safe + _ACES_D) + _ACES_E
+    out = numerator / np.maximum(denominator, 1e-12)
+    # Narkowicz 形式的渐近上限为 a/c ≈ 1.033，clip 到 [0, 1]
+    return np.clip(out, 0.0, 1.0)
+
+
 def tonemap(
     rgb_hdr: np.ndarray,
     params: DiskV2PaletteParams,
 ) -> np.ndarray:
-    """HDR → LDR 色调映射。
+    """HDR → LDR 色调映射。当前仅支持 Reinhard（X1 ACES 已撤回）。
 
     Args:
         rgb_hdr: 任意形状的非负实数数组（最后一维一般是 3，但函数对形状不挑剔）。
@@ -281,25 +369,26 @@ def tonemap(
         params: `DiskV2PaletteParams`，决定 `tonemap_mode`。
 
     Returns:
-        与输入同形状的数组，落在 `[0, 1)`。
+        与输入同形状的数组，落在 `[0, 1]`。
 
     Formula:
-        Reinhard：`rgb_ldr = rgb_hdr / (1 + rgb_hdr)`。
-        其他模式当前未实现（`params.__post_init__` 已拒绝 `aces`）。
+        Reinhard：`x / (1 + x)`，简单稳健。
 
     Physical Meaning:
-        把无界 HDR 强度压到 `[0, 1)` 区间，避免后处理时被硬截断。
+        把无界 HDR 强度压到 `[0, 1]` 区间，避免后处理时被硬截断。
 
     Notes:
-        - 对负数输入：先 clip 到 0，再做映射，避免 `1 + x` 为 0 时除零。
-        - 对超大值（如 1e10）：返回值接近但严格小于 1。
+        - 对负数输入：先 clip 到 0，再做映射，避免除零。
+        - ACES Filmic 已在 X1 (2026-06-14) 撤回：其 x→0 时斜率≈0.21 的低值
+          响应让"黑底 + 高亮"场景背景被抬亮成灰雾。函数本体 `tonemap_aces`
+          保留供未来 + black pedestal 方案启用。
     """
 
     safe_hdr = np.maximum(_to_array(rgb_hdr), 0.0)
     if params.tonemap_mode == "reinhard":
-        out = safe_hdr / (1.0 + safe_hdr)
+        out = tonemap_reinhard(safe_hdr)
     else:
-        # ACES 已经被 params.__post_init__ 拦截；这里防御性兜底。
+        # ACES 在 params.__post_init__ 已被拦截；防御性兜底。
         raise ValueError(f"unsupported tonemap_mode: {params.tonemap_mode!r}")
     return _restore_shape(out, rgb_hdr)
 
