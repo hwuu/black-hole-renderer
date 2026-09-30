@@ -3418,9 +3418,8 @@ class TaichiRenderer:
                 turb = ti.min(ti.max(
                     t_coarse + t_mid + t_fine + t_extra + t_ultra + t_pixel,
                     0.0), 1.0)
-                # 临时关闭 turbulence，便于单独观察其他结构。
-                comp[3, ri, phi_i] = 0.0
-                comp[4, ri, phi_i] = 0.0
+                comp[3, ri, phi_i] = turb
+                comp[4, ri, phi_i] = 0.05 * turb
 
                 # --- idx 11: az_hotspot ---
                 # 低频正弦方位波 * 噪声调制（使用旋转后的 phi）

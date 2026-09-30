@@ -100,6 +100,12 @@ class TestGenerateBackground(unittest.TestCase):
         self.assertTrue(np.all(turb >= -0.01), f"min={turb.min()}")
         self.assertTrue(np.all(turb <= 1.01), f"max={turb.max()}")
 
+    def test_turbulence_not_disabled(self):
+        """turbulence (idx 3) 应有非零空间结构，防止被强制置 0（b76191a 回归）。"""
+        turb = self.comp_t0[3]
+        self.assertGreater(turb.mean(), 0.05, f"mean={turb.mean()}")
+        self.assertGreater(turb.std(), 1e-3, f"std={turb.std()}")
+
     def test_turb_temp_proportional(self):
         """turb_temp (idx 4) = 0.05 * turbulence (idx 3)。"""
         turb = self.comp_t0[3]
