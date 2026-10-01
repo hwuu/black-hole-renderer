@@ -518,6 +518,7 @@ v1.0 阶段的 V2 已实施 `disk_v2/{geometry, physical_fields, structure_modul
 
 ## 变更记录
 
+- **v0.8 (2026-10-01)**：V2 后续工作转入 [`v2_volumetric_video_plan.md`](v2_volumetric_video_plan.md)（3D 程序化体积云雾、刚体环平流解决卷绕、修正 g-factor、CIE 黑体 + 白平衡、HDR 高光 bloom / 色散、V2 视频）。本文件 v0.7 中 visual atlas 方案被取代。
 - **v0.7 (2026-06-14)**：**V2 视觉恢复分支**。失败复盘：`F_clump` 主发射 → 鬣狗斑；高频 `F_shear` → 斑马纹；`save_image` uint8 误 clip → 全白。修复：新增 `disk_v2/visual_atlas.py` 预烘焙 V1 云雾 + Blender 思路（spiral warp、alpha clip）；Taichi 双线性采样；发射 `j ∝ ρ^α T^β · emission_atlas · F_mode · F_hotspot`，密度 `ρ ∝ ρ_envelope · density_atlas · F_clump_weak`；`shear_strength` 默认 0。CLI 增加 `--v2_visual_preset interstellar` 与 atlas 参数；`scripts/v2_visual_acceptance.sh` 固定验收相机 `ar1=2, ar2=15`。Filament 首版不做。详见 [`v2_visual_recovery_plan.md`](v2_visual_recovery_plan.md)。
 - **v0.6 (2026-06-14)**：Phase 1~Phase 7 实施落地。`disk_v2/` 新增 `palette.py`、`taichi_impl.py`、`taichi_render.py`、`preview.py`；现有 `params.py`、`physical_fields.py`、`structure_modulations.py` 升级到 v2.1 语义。`render.py` 加 `--disk_model {v1,v2}` + 13 个 `--v2_*` 参数；V1 路径不变。新增 85 个 V2 单测、10 个 NumPy/Taichi parity 测试、g-factor GPU smoke。AGENTS.md 增加 4 条 V2 实施踩坑记录（24-26）。README 增加 Disk V2 用法与参数表。Phase 0（基线截图）与 Phase 6/7 的视觉指标留 TODO，等用户视觉验收。Checkpoint §7.6 因连续推进被跳过。
 - **v0.5 (2026-06-13)**：吸收 gpt 5.5 修订 + 版本号同步。P2 诊断和 Phase 1 验收明确测未乘 `W_r` 的 raw temperature profile（避免完整 `T_mid(r_out)=0` 与 `T_peak/T_at_r_out ∈ [4.0, 4.6]` 字面冲突）。正文 6 处真源版本号统一引用 `design_ad_v2.md` v2.1。
