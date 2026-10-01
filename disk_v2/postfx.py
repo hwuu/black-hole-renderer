@@ -150,9 +150,9 @@ def apply_bloom(
         sc = axial_scale[c]
         ch = src[..., c : c + 1]
         bloom[..., c : c + 1] = (
-            0.35 * _box_blur(ch, max(1, int(h / 120 * sc)))
-            + 0.35 * _box_blur(ch, max(2, int(h / 25 * sc)))
-            + 0.30 * _box_blur(ch, max(4, int(h / 7 * sc)))
+            0.35 * _box_blur(ch, max(1, int(h / 250 * sc)))
+            + 0.35 * _box_blur(ch, max(2, int(h / 60 * sc)))
+            + 0.30 * _box_blur(ch, max(4, int(h / 14 * sc)))
         )
     return hdr + gain * bloom
 

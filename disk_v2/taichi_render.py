@@ -936,10 +936,11 @@ class DiskV2Renderer:
                 lum = hdr_luminance(disk_hdr).ravel()
                 lum = lum[lum > 1e-10]
                 if lum.size > 0:
-                    wp = max(float(np.percentile(lum, self.white_point_percentile)), 1e-12)
+                    # 与参考实现一致：p99.9 → 0.9（EXP_TARGET）
+                    wp = max(float(np.percentile(lum, 99.9)), 1e-12)
+                    exposure = 0.9 / wp
                 else:
-                    wp = 1.0
-                exposure = 1.0 / wp
+                    exposure = 1.0
             else:
                 exposure = 1.0
             img = postfx(hdr_total, exposure=exposure)
