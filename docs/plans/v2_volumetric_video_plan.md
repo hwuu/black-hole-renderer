@@ -1,6 +1,6 @@
 # V2 体积云雾 + 动态旋转 + 视频接入方案
 
-> **状态**：v0.3 已冻结（2026-10-01），按 §5 实施中。
+> **状态**：v0.5 已冻结（2026-10-01），按 §5 实施中。定稿为预设 M（§2，参数分三层）；L / J2 / H 保留为可退回预设（§2.4）。
 >
 > **触发原因**：
 >
@@ -8,7 +8,7 @@
 > 2. 动态模拟时开普勒差速把纹理卷成同心圈（winding problem）。
 > 3. V2 不支持视频。
 >
-> **验收基准**：参考实现 `scripts/proto_disk_reference.py` 默认输出（预设 H，用户已看图确认，见 §2）。本方案的目标是把原型**等价地**移植进 V2，而不是重新调参。
+> **验收基准**：参考实现 `scripts/proto_disk_reference.py` 默认输出（预设 M + mode 3，用户已看图确认，见 §2）。本方案的目标是把原型**等价地**移植进 V2，而不是重新调参。
 >
 > **真源关系**：盘体几何/物理场/调制的数学定义仍以 [`docs/design_ad_v2.md`](../design_ad_v2.md) 为准；本方案落地后需同步更新其对应章节（§9）。本方案替代 [`v2_visual_recovery_plan.md`](v2_visual_recovery_plan.md) 中"预烘焙 visual atlas 作为主结构"的决定。
 >
@@ -32,69 +32,104 @@
 
 ## 2. 原型定稿参数（验收基准）
 
-参考实现：`scripts/proto_disk_reference.py`（S0 已入库）。**默认命令即定稿（预设 H）**，V2 移植后需与其输出等价：
+参考实现：`scripts/proto_disk_reference.py`。**默认命令即定稿（预设 M、mode 3）**，V2 移植后需与其输出等价：
 
 ```bash
 conda run -n black-hole python scripts/proto_disk_reference.py frame --ss 2   # 1080p 单帧
 conda run -n black-hole python scripts/proto_disk_reference.py physcheck      # 物理自检
+conda run -n black-hole python scripts/proto_disk_reference.py params         # 三层参数表（当前值 + 物理值）
 ```
 
-| 类别 | 参数 | 值 | 含义 |
-|------|------|----|------|
-| 几何 | `R_IN / R_OUT` | 3 / 30 | 内缘 ISCO；外缘（用户确认） |
-| 几何 | `HR` | 0.012 | 核心层标高 H/r |
-| 相机 | `dist / fov / elev` | 60 / 38° / 7° | 相机距离、竖直视场、仰角 |
-| 核心结构 | `FR / NPHI / FZ / WARP` | 16 / 7 / 0.9 / 0.9 | 噪声频率（方位拉伸约 14 倍）与域扭曲 |
-| 核心结构 | `SIGMA_LN` | 1.3 | lognormal 密度涨落 |
-| 核心结构 | `RIDGE_POW / FIL_GAIN / FIL_MIX` | 6 / 5 / 0.6 | ridged multifractal 丝状项 |
-| 核心结构 | `COV_LO / COV_HI / COV_RIDGE` | −0.1 / 0.7 / 3 | 空洞覆盖率（丝所在处不挖空） |
-| 大尺度 | `LOWF_SIGMA / FR_L / NPHI_L` | 0.9 / 3 / 3 | 低频 lognormal 明暗调制（尺度 Δln r ≈ 0.33） |
-| 大尺度 | `DLN_L / K_RIGID_L` | ln 1.7 / 6 | 低频层宽带刚体环，避免被细带切成同心环 |
-| 烟雾 | `N_CL_HALF` | 3 | 7 层，k = −3..3 |
-| 烟雾 | `CL_SPACING / CL_WIDTH` | 0.014 / 0.011 | 层中心 z_k = k·0.014·r，层厚 σ = 0.011·r（重叠 → 近似连续烟雾冕） |
-| 烟雾 | `CL_DECAY` | 0.35 | 层振幅 ∝ exp(−0.35·|k|) |
-| 烟雾 | `CLOUD_COL` | 0.8 | 烟雾总柱密度 / 核心柱密度 |
-| 烟雾 | `CLOUD_EMIT` | 0.33 | 烟雾单位密度发射率 / 核心（偏冷、以吸收为主 → 背光暗色丝缕） |
-| 烟雾结构 | `FR_C / NPHI_C / FZ_C / SIGMA_C` | 8 / 10 / 0.9 / 1.2 | 烟雾噪声（低各向异性，蓬松） |
-| 烟雾结构 | `CLOUD_C0 / CLOUD_SOFT` | 0.4 / 0.35 | sigmoid 软覆盖率（软边缘） |
-| 温度 | `T_PEAK_VIS` | 4500 K | 可视色温峰值（Novikov-Thorne 形状） |
-| 温度 | `T_CLUMP` | 0.06 | T ← T·(1 + 0.06·tanh(n_a)) |
-| 发射 | `EMIT_POW` | 2.5 | j ∝ ρ·(T/T_peak)^2.5（非物理旋钮，4 = bolometric；控制内亮外暗的衰减速度） |
-| 光学深度 | `TAU0` | 2.0 | r = 6 处 face-on 竖直光学深度 |
-| 动态 | `DLN_R` | ln 1.22 | 刚体环带宽（ln r），带边界 1D 噪声扰动 0.35 |
-| 动态 | `K_RIGID` | 4.0 | 结构种子寿命（本地轨道周期） |
-| 相对论 | `doppler_lum` | 0.5 | 亮度频移指数（非物理旋钮，1 = 物理） |
-| 相对论 | `doppler_color` | 2.2 | 颜色频移指数（非物理旋钮，1 = 物理；用户选"稍稍夸张"） |
-| 颜色 | 黑体色度 | CIE 普朗克表 | 普朗克谱 × CIE 1931 色匹配（Wyman 2013 近似）→ 线性 sRGB |
-| 相机 | `white_balance_K` | 5000 K | 相机白平衡（von Kries） |
-| 后处理 | `bloom_src / bloom_gain` | 0.3 / 4.0 | 只散射高光 |
-| 后处理 | `CA_AXIAL` | (1.0, 1.0, 1.15) | 轴向色散：只让蓝光稍外扩（R、B 同时外扩会形成品红光晕） |
-| 后处理 | `CA_FRINGE / FRINGE_SRC / FRINGE_COLOR` | 0.4 / 0.7 / (0.3, 0.45, 1.0) | 饱和高光外缘偏蓝镶边 |
-| 后处理 | `CA_LATERAL` | 0.0025 | 横向色散 |
-| 曝光 | `auto_exposure` | p99.9 → 0.7 | 盘像素亮度分位映射值 |
-| 曝光 | `WHITE_BLEND` | 0.12 | 超色域高光向白混合斜率 |
+演进：H → J2（借鉴 NPGS / Baopinsui 最新 shader 的模型 I + H 烟雾）→ L（物理化亮度 / 温度 / 密度）→ M（全面 review 后的物理修正 + 三层参数）。原则：**所有主要物理效应必须具备，可近似**；偏离物理的取值全部放在第 3 层并标注物理值。
 
-原型实测（1080p，2×2 超采样，M5 GPU）：单帧 8.7 s，首次编译约 2–3 min；`physcheck` 全部通过（频移与严格 GR 误差 < 0.01%）。
+### 2.1 第 1 层：基本参数（场景设定）
 
-调参过程中的经验（防止 V2 移植时重犯）：
+| 参数 | CLI / 全局 | 定稿值 | 说明 |
+|------|-----------|--------|------|
+| 黑洞质量 | `--bh_mass` / `BH_MASS_MSUN` | 1e8 M☉ | 图像与尺度无关，只经 Ṁ 决定温度 |
+| 吸积率 | `--mdot_edd` / `MDOT_EDD` | 1.7e-6 Ṁ_Edd | 与 M 一起经 Page–Thorne 绝对通量推出 T_peak = 4509 K（η = 1 − sqrt(8/9)） |
+| 自旋 | — | 0 | 史瓦西黑洞 |
+| 盘内 / 外半径 | `R_IN` / `--r_out` | 3（ISCO）/ 30 r_s | |
+| 相机 | `--dist` / `--elev` / `--fov` | 40 r_s / 7° / 38° | |
+| 分辨率 / 超采样 | `--w --h` / `--ss` | 1920×1080 / 2 | |
+| 视频 | `--orbit_s` / `--fps` | 16 s / 24 | 内缘一圈对应的视频秒数 |
+
+### 2.2 第 2 层：物理模型（定稿值即物理默认值）
+
+| 模型 | CLI / 全局 | 定稿值 | 公式 / 说明 |
+|------|-----------|--------|-------------|
+| 光线 | — | 史瓦西零测地线 | `d²x/dλ² = −1.5 L² x / r⁵`，RK4 |
+| 相机标架 | `STATIC_CAM` | 1 | 静止观者本地标架：`tanψ_coord = tanψ_local / sqrt(1 − r_s/r)` |
+| 物质运动 | — | 开普勒圆轨道 | `Ω = sqrt(M/r³)`；mode 3 刚体环（带内取带中心 Ω，±15%） |
+| 频移 | — | 严格 g | 本地静止观者方向 × 引力红移（§4.3） |
+| 温度剖面 | `TEMP_PT` | 1 | Page–Thorne 相对论薄盘，峰值 4.8 r_s |
+| 峰值温度 | `--t_peak` | 0（由 M、Ṁ 推出） | 非 0 时直接覆盖 |
+| 盘结构 | `PHYS_STRUCT` | 1 | SS 外区（气压主导、Kramers）：`H/r ∝ r^{1/8} f^{3/20}`，`Σ ∝ r^{-3/4} f^{7/10}`，`f = 1 − sqrt(r_in/r)`；竖直等温高斯 |
+| 亮度 | `PHYS_LUM` | 1 | 观测谱为温度 g·T 的黑体（I_ν/ν³ 不变）→ 亮度 `Y(g·T) = ∫B_λ(gT)·ȳ dλ` |
+| 颜色 | — | CIE 黑体色度 | 普朗克谱 × CIE 1931 → 线性 sRGB(D65) |
+| 竖直温度 | `GREY_ATM` | 1 | 灰大气 `T⁴ = ¾T_eff⁴(τ_z + ⅔)`，`τ_z = κΣ/2·erfc(|z|/(√2 H_s))`；上限 `GREY_CAP` = 1.19（τ≈2，见 §2.5） |
+| 辐射转移 | — | 局部热平衡 | 发射 = 吸收 × 源函数，源函数由温度决定 |
+| 湍流密度 | `CORE_FLOOR` | 0.35 | 核心密度 = FLOOR + (1 − FLOOR)·c/⟨c⟩，无空洞 |
+| 湍流温度 | `DT_I` | 0.05 | 发热率起伏 δT/T |
+| 结构寿命 | `--k_rigid` | 4 | 本地轨道周期 |
+| 盘风团块（烟雾） | `SMOKE_I` / `SMOKE_TR` | 0.8 / 0.85 | 柱密度 = 0.8·Σ，温度 = 0.85·T(r)，7 层半透明 |
+| 内区尘埃 | `DUST_EM` / `DUST_KEPLER` | 0.02 / 1 | 稀薄尘埃，按开普勒刚体环旋转 |
+| 光行时间 | `LIGHT_DELAY` | 1 | 采样时间 = t − 光程 |
+
+### 2.3 第 3 层：视觉调节（右列为物理值）
+
+| 参数 | CLI / 全局 | 定稿值 | 物理值 / 说明 |
+|------|-----------|--------|---------------|
+| 多普勒亮度强度 | `--doppler_lum` | 0.55 | 1；亮度用 `Y(g^s·T)`。4500 K 时可见光对频移的等效指数约 hν/kT ≈ 6，物理值下左右亮度比 > 5，用户选 0.55 |
+| 多普勒颜色强度 | `--doppler_color` | 1.5 | 1；色度用 `χ(T·g^s)` |
+| 灰大气强度 | `GREY_MIX` | 0.5 | 1 |
+| 核心光学深度 | `CORE_OPAC`（τ = 1.5 × 倍率） | 2（τ≈3） | 真实薄盘 ≫ 100；τ≈3 为通透感 |
+| 盘厚 | `HR_REF`（r = 10 处 H/r） | 0.027 | SS 理论对本场景 ≪ 0.01 |
+| 大尺度明暗幅度 | `LOWF_SIGMA` | 0.9 | 约 0.3 |
+| 程序化结构 | `CON_I` 50、`KR_I` 0.2、`NPHI_I` 2、`L0_I` 3、`SURF_NOISE` 0.6、`DLN_R` ln 1.22、烟雾 `N_CL_HALF` 3 / `CL_SPACING` 0.014 / `CL_WIDTH` 0.011 / `CL_DECAY` 0.35 / `FR_C` 8 / `NPHI_C` 10 / `SIGMA_C` 1.2 / `CLOUD_C0` 0.4 / `CLOUD_SOFT` 0.35、尘埃八度 0–6 | 见左 | 噪声频率、八度、对比度、表面起伏、烟雾分层 |
+| 曝光 | `--exp` / `EXP_TARGET` | 0.9 | 盘区亮度 p99.9 映射值 |
+| 白平衡 | `--wb` | 5000 K | |
+| bloom | `--bloom_src` / `--bloom_gain` | 0.3 / 4.0 | 只散射高光 |
+| 色散 | `CA_AXIAL` / `--ca_fringe` / `--ca_lateral` | (1, 1, 1.15) / 0.4 / 0.0025 | 轴向色散、高光镶边、横向色散 |
+| 色调映射 | `WHITE_BLEND` | 0.12 | 保色度 ACES |
+
+对照预设 `Mphys`（另加 `--doppler_lum 1 --doppler_color 1`）：第 3 层中多普勒、灰大气强度、核心光学深度（τ≈100）、大尺度明暗（0.3）取物理值。
+
+原型实测（1080p，2×2 超采样，M5 GPU）：单帧约 51 s（主要为高斯竖直包络与尘埃流场，移植时优化）；`physcheck` 全部通过；慢速视频无闪烁。
+
+### 2.4 退回路径（与历史图逐像素一致，最大差 1 个灰度级为浮点舍入）
+
+```bash
+... frame --ss 2 --preset L  --doppler_lum 0.75
+... frame --ss 2 --preset J2 --dist 60 --doppler_lum 0.5 --doppler_color 2.2
+... frame --ss 2 --preset H  --dist 60 --doppler_lum 0.5 --doppler_color 2.2
+```
+
+### 2.5 调参与物理经验（防止 V2 移植时重犯）
 
 - 任何在"最亮区域"生效的后处理（轴向色散、镶边、高光向白混合）都会直接改写逼近侧颜色，必须单独验证逼近侧色相。
-- 结构只在一个频段时观感单调；需同时有低频大尺度调制。低频层必须用比细结构更宽的刚体带，否则会被切成同心环。
-- 烟雾感来自盘面上方偏冷、以吸收为主的半透明层（背光暗丝缕），而不是更多的发光层。
+- 结构只在一个频段时观感单调；需同时有低频大尺度调制，且低频层用比细结构更宽的刚体带，否则会被切成同心环。
+- 烟雾感来自盘面上方偏冷、以吸收为主的半透明层；体积感另一来源是噪声调制的表面高度（云顶轮廓）。
+- NPGS 原式"发射 ∝ ρ、吸收 ∝ ρ²"等价于 S ∝ 1/ρ（越密越暗），必须用局部热平衡；截面形状只决定几何厚度，柱密度用物理剖面。
+- 亮度必须用可见光亮度 Y(g·T)，不能用 (T/T_peak)^p：4500 K 盘在 r = 30 处物理亮度只有峰值的 1.4e-5，旧的 T^2.5 给出 6%。
+- 4500 K 与吸积率绑定：1e8 M☉ 需 Ṁ ≈ 1.7e-6 Ṁ_Edd（真实流体此时应为 ADAF，这里仍按薄盘近似，Interstellar 同样如此）。温度越高，可见光处于 Rayleigh–Jeans 段，亮度衰减越慢、外圈越不黑。
+- 灰大气用竖直 τ_z 的平行平面近似时，光线从起伏侧壁斜入会被误判为深层高温，出现少数极亮热点并拉低整体曝光；可见层温度需加上限（τ≈2）。
+- 体积积分已经计入掠射时的长光程，不能再乘掠射增亮因子。
+- 步长必须是位置的连续函数（取多个连续函数的 min），体积内配合起点抖动 + 超采样。
 
 ## 3. 总体架构
 
 ```
 +------------------+     +-------------------+     +--------------------+
 | advection.py     |---->| volume_field_ti   |---->| taichi_render.py   |
-| rigid-ring bands |     | core + 7 smoke    |     | volume ray-march   |
+| rigid-ring bands |     | lens core + smoke |     | volume ray-march   |
 | (CPU f64 phase)  |     | (Taichi noise)    |     | + g-factor (fixed) |
 +------------------+     +-------------------+     +--------------------+
          ^                        ^                          |
          |                        |                          v
 +------------------+     +-------------------+     +--------------------+
 | video driver     |     | noise_ti.py       |     | postfx.py          |
-| time t per frame |     | gnoise/fbm/ridged |     | WB + bloom + CA    |
+| time t per frame |     | cascade/vnoise/fbm|     | WB + bloom + CA    |
 | lock exposure    |     |                   |     | + chroma ACES      |
 +------------------+     +-------------------+     +--------------------+
 ```
@@ -105,14 +140,18 @@ conda run -n black-hole python scripts/proto_disk_reference.py physcheck      # 
 
 | 新概念 | 归属层 | 命名 | 返回值 |
 |--------|--------|------|--------|
-| 核心层竖直包络 `exp(−ζ²/2)` | `geometry` | 复用 `density_field` 的竖直因子 | `[0, 1]` |
+| SS 外区标高 `H(r)` | `geometry` | `disk_half_thickness`（改写） | 半厚度（r_s） |
+| 噪声调制表面高度 `H_s` | `geometry` | `perturbed_half_thickness` | 半厚度（r_s） |
+| 核心竖直剖面 `exp(−z²/2H_s²)` | `geometry` | `core_vertical_weight` | `[0, 1]` |
 | 烟雾层 k 的竖直包络 `exp(−dz_k²/2)` | `geometry` | `cloud_layer_weight(r, z, k)` | `[0, 1]` |
-| 核心/云层基础柱密度分配 | `physical_fields` | `core_density_field` / `cloud_density_field` | 物理密度 |
-| lognormal × 丝 × 覆盖率 | `structure_modulations` | `core_structure_modulation` | 围绕 1 波动，≥ 0 |
+| SS 柱密度 Σ(r)、核心 / 烟雾密度 | `physical_fields` | `surface_density_field` / `core_density_field` / `cloud_density_field` | 物理密度 |
+| Page–Thorne 温度、灰大气竖直温度 | `physical_fields` | `temperature_field` / `grey_atmosphere_temperature_factor` | K / 倍率 `[1, GREY_CAP]` |
+| 可见光亮度 Y(T) | `palette` | `blackbody_luminance` | ≥ 0 |
+| 乘性级联主云（密度 FLOOR 下限、温度起伏） | `structure_modulations` | `core_structure_modulation` / `temperature_turbulence_modulation` | 围绕 1 波动 |
 | 云层 lognormal × sigmoid 覆盖率 | `structure_modulations` | `cloud_structure_modulation` | 围绕 1 波动，≥ 0 |
-| 温度弱团块响应 | `structure_modulations` | `temperature_clump_modulation` | 围绕 1，`[0.94, 1.06]` |
+| 内区尘埃 | `structure_modulations` | `dust_modulation` | ≥ 0 |
 | 大尺度低频明暗 | `structure_modulations` | `large_scale_modulation` | 围绕 1 波动（lognormal 均值 1） |
-| 烟雾发射比例 | `physical_fields` | `cloud_emission_fraction` 参数 | 标量 `[0, 1]` |
+| 烟雾温度比 | `physical_fields` | `cloud_temperature_ratio` 参数 | 标量 `(0, 1]` |
 
 注意：覆盖率会产生接近 0 的空洞，`*_modulation` 的"围绕 1 波动"指均值约为 1（lognormal 已做 `−σ²/2` 均值校正），不是逐点。docstring 中需写明。
 
@@ -130,29 +169,29 @@ conda run -n black-hole python scripts/proto_disk_reference.py physcheck      # 
 - **float32 精度处理**：Metal 无 f64。`Ω_b·t` 在长视频中数值很大，f32 相位精度会损失。做法是每帧在 CPU 上用 float64 为每条带预计算 `(phase_b mod 2π, cycle_index_p, frac_p)`，上传为小 field（带数约 10），kernel 只查表。
 - 简化假设：带内角速度统一取带中心值，局部偏差约 ±10%（`DLN_R = ln 1.22` 时 `Ω` 在带内变化约 ±15%，经两带混合后可见偏差更小）；物理上对应"结构有有限寿命，被湍流不断重建"。
 
-### 4.2 3D 密度场
+### 4.2 3D 密度场与源函数（M）
 
 ```
-ρ(r, φ, z, t) = ρ_core + Σ_k ρ_cloud,k
+f(r)      = 1 − sqrt(r_in/r)
+H(r)      = HR_REF · r · (r/10)^{1/8} · (f/f_10)^{3/20}            # SS 外区标高
+Σ'(r)     = (r/10)^{-3/4} · (f/f_10)^{7/10} · 外缘截断 · LN_L(n_L)   # SS 柱密度 × 大尺度低频
+H_s       = H · (1 − SURF_NOISE + SURF_NOISE·softsat(tn))           # 噪声调制表面（云顶轮廓）
+ρ_core    = Σ'/(sqrt(2π)·H_s) · exp(−z²/2H_s²)                     # ∫ρ dz = Σ'
+c         = softplus(CON · Σ_l w_l ln(1 + 0.1·n(3^l p)))            # 乘性级联（value noise）
+cfac      = FLOOR + (1 − FLOOR)·c/⟨c⟩                               # 温和密度起伏，无空洞
+α_core    = κ · CORE_OPAC · cfac · ρ_core
+T_core    = T_PT(r) · [1 + GREY_MIX·(min((¾(τ_z + ⅔))^{1/4}, GREY_CAP) − 1)] · (1 + δT·(c/⟨c⟩ − 1))
+τ_z       = κ · CORE_OPAC · cfac · Σ'/2 · erfc(|z|/(√2 H_s))
+α_smoke   = κ · SMOKE_I · Σ' · Σ_k A_k exp(−dz_k²/2)/(sqrt(2π)·CL_WIDTH·r) · LN(n_c,k) · sigmoid(n_c,k),  T_smoke = SMOKE_TR·T_PT
+α_dust    = κ · DUST_EM · (1 − (z/H_d)²)⁺ · c_dust（开普勒刚体环流场），T_dust = T_PT
 
-ρ_env'(r) = ρ_env(r) · LN_L(n_L)                # 大尺度低频调制，n_L 由宽带刚体环求值
-ρ_core    = ρ_env'(r) · exp(−ζ²/2) · LN(n_a) · F(n_b) · C(n_a, n_b)
-ρ_cloud,k = CLOUD_COL · (HR/CL_WIDTH) · A_k · ρ_env'(r) · exp(−dz_k²/2) · LN(n_c,k) · S(n_c,k)
-
-发射源：S_em = (ρ_core + CLOUD_EMIT·Σρ_cloud,k)/ρ · (T/T_peak)^EMIT_POW · B_550(g_lum) · χ(T·g_col)
-吸收：  dτ = κ · ρ · ds
-
-ζ = z / (HR·r),  dz_k = (z − k·CL_SPACING·r) / (CL_WIDTH·r)
-LN(n) = exp(σ·n − σ²/2)                       # 均值为 1 的 lognormal
-F(n_b) = (1 − FIL_MIX) + FIL_MIX·FIL_GAIN·n_b  # ridged 丝状项
-C = smoothstep(COV_LO, COV_HI, n_a + COV_RIDGE·(n_b − 0.1))
-S(n) = 1 / (1 + exp(−(n − CLOUD_C0)/CLOUD_SOFT))
-A_k = exp(−CL_DECAY·|k|) / Σ_j exp(−CL_DECAY·|j|)
+dI = 透过率 · α · S(T, g) · ds，透过率 ← 透过率 · exp(−α ds)
+S(T, g)   = Y(g_lum·T)/Y(T_peak) · χ(T·g_col)，g_lum = g^{doppler_lum}，g_col = g^{doppler_color}
 ```
 
-- 噪声坐标：拉格朗日坐标 `(ln r·FR, φ0/(2π)·NPHI, ζ·FZ)`，φ 方向用整数周期格点实现无缝。
-- 烟雾 7 层在 kernel 里用**运行时循环**（非 `ti.static` 展开），只算 `|dz_k| < 3` 的层；原型实测 static 展开会让编译时间超过 20 分钟。
-- `ρ_env(r) = (r/r_in)^(−1.5)·sqrt(1 − sqrt(r_in/r))·外缘收口`，沿用现有 `physical_fields` 语义。
+- 噪声坐标：核心 `(KR_I·r, φ0/(2π)·NPHI_I, KR_I·z)`，φ0 为 mode 3 刚体环流坐标；φ 方向整数周期，无接缝。
+- 烟雾 7 层与级联噪声八度都用**运行时循环**（非 `ti.static` 展开），控制编译时间。
+- κ 由 `TAU_I` = 1.5 在 r ≈ 6 处标定（不含 CORE_OPAC）。
 
 ### 4.3 相对论修正
 
@@ -160,7 +199,7 @@ A_k = exp(−CL_DECAY·|k|) / Σ_j exp(−CL_DECAY·|j|)
 - 光子方向变换到本地静止观者：`k_loc ∝ k_rad + sqrt(1 − r_s/r)·k_tan`。
 - `g = g_grav · 1/(γ(1 − β·cosθ_loc))`，`g_grav = sqrt(1 − r_s/r_em)/sqrt(1 − r_s/r_obs)`。
 - 严格验证公式（赤道面圆轨道，`L_z/E` 取光子真实传播方向、沿盘旋转方向为正）：`g_exact = sqrt(1 − 3M/r) / (1 − Ω·L_z/E) / sqrt(1 − r_s/r_obs)`；原型逐像素误差 < 0.01%，NumPy reference 对 200 组随机方向误差 < 1e-9。
-- 亮度：观测谱为温度 `g·T` 的黑体，550 nm 处 `B_ν(g_lum·T)/B_ν(T)`；颜色：`blackbody(T·g_col)`。`g_lum = g^doppler_lum`、`g_col = g^doppler_color`，两个指数为显式非物理旋钮，默认值见 §2，CLI 帮助中注明"1 = 物理"。
+- 亮度：观测谱为温度 `g·T` 的黑体，亮度 `Y(g_lum·T)`（普朗克谱 × CIE ȳ 积分，ln Y 查找表，300–60000 K）；颜色：`χ(T·g_col)`。`g_lum = g^doppler_lum`、`g_col = g^doppler_color`，两个指数为显式非物理旋钮，默认值见 §2，CLI 帮助中注明"1 = 物理"。
 - 现有 `lum_power`（g⁴ 近似）由波段 Planck 比值替代，参数删除（§8-3）。
 
 ### 4.4 颜色与后处理
@@ -180,7 +219,9 @@ A_k = exp(−CL_DECAY·|k|) / Σ_j exp(−CL_DECAY·|j|)
 - 新增 `render_video_v2()`（`render.py`），复用 V1 `render_video` 的帧目录、`--resume`、异步 PNG 保存与编码逻辑。
 - 时间：`t = t0 + frame · dt`，`dt = P(r_in) / (orbit_s · fps)`；新增 `--v2_orbit_seconds`（内缘一圈对应视频秒数，默认 16）。
 - 曝光：首帧计算后锁定，避免逐帧自动曝光导致闪烁。
-- 相机：支持 `--orbit` / `--orbit_degrees`，与 V1 一致。
+- 光行时间：采样时间 `t_s = t − 光程`（从相机沿光线累计的路径长度），使近侧/远侧纹理相位符合物理。
+- 步长：位置的连续函数 `h = min(h_far(r), H_IN_I + 0.3·d_core, max(0.4·CL_WIDTH·R, H_IN_I) + 0.3·d_smoke)`，首步乘随机因子（每帧种子不同）。
+- 相机：支持 `--orbit` / `--orbit_degrees`，与 V1 一致；相机为静止观者本地标架（§2.2）。
 
 ---
 
@@ -193,16 +234,16 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 
 | 步骤 | 内容 | 修改/新增文件 | 测试要点 |
 |------|------|---------------|----------|
-| S0 ✅ | 原型入库作为参考实现与验收脚本 | `scripts/proto_disk_reference.py` | 默认输出与用户确认的预设 H 图逐像素一致；`physcheck` 通过 |
+| S0 ✅ | 原型入库作为参考实现与验收脚本（v0.5 更新为 M，L / J2 / H 保留为预设） | `scripts/proto_disk_reference.py` | 默认输出与用户确认的 M 图逐像素一致；L / J2 / H 复现命令与历史图一致；`physcheck` 通过 |
 | S1 ✅ | 相对论修正：β、本地方向 cosθ、Planck 波段增强、`doppler_lum/color`（helper；渲染核接线在 S6） | `disk_v2/relativity.py`、`disk_v2/taichi_impl.py`、新增 `tests/unit/test_disk_v2_relativity_s1.py` | β(ISCO)=0.5；g 与严格 GR 误差 < 0.1%；逼近侧 g>1、远离侧 g<1；Planck 比值随 g 单调；指数为 0 时 g=1 |
-| S2 | 颜色链路：CIE 黑体查找表、白平衡、删除 cinematic palette | `disk_v2/palette.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 6500K 近中性（色度偏差 < 3%）；低温偏红、高温偏蓝单调；WB=T 时该温度黑体输出中性；亮度守恒；cinematic 相关测试删除 |
-| S3 | Taichi 噪声库：周期梯度噪声、fBm、ridged、1D 噪声 | 新增 `disk_v2/noise_ti.py` | φ 周期无缝（首尾差 < 1e-5）；零均值；归一后单位方差；同种子可复现；ridged 值域 `[0, 1]` |
-| S4 | 刚体环平流 + CPU f64 相位表 | 新增 `disk_v2/advection.py` | 带权重和 = 1；种子切换时权重为 0；长时间（30 圈）倾角不衰减；纹理 Δφ 与 Ω·Δt 一致（误差 < 1°）；t = 1e6 时相位精度（与 f64 参考对比） |
-| S5 | 3D 密度场（核心 + 7 层烟雾 + 大尺度低频）替换 atlas | `disk_v2/geometry.py`、`disk_v2/physical_fields.py`、`disk_v2/structure_modulations.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 盘外 = 0；ρ ≥ 0；调制均值约 1；空洞率 15–25%；竖直剖面在核心外有烟雾包络；低频层不产生径向环（径向自相关无周期峰）；径向自相关次峰 < 0.1；各层随 Ω 同步转动 |
-| S6 | 体积光追为默认路径、步长控制、g 接入、烟雾发射比例；删除 atlas / thin-layer | `disk_v2/taichi_render.py`、删除 `disk_v2/visual_atlas.py` | 渲染可复现（同参数 hash 一致）；1080p ss=2 GPU 单帧 ≤ 10 s；与参考实现同参数时逼近/远离侧色相与盘带亮度剖面一致 |
+| S2 | 颜色与亮度链路：CIE 黑体色度表、可见光亮度 ln Y(T) 表、白平衡、删除 cinematic palette | `disk_v2/palette.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 6500K 近中性（色度偏差 < 3%）；低温偏红、高温偏蓝单调；Y(T) 单调且与数值积分误差 < 1%；WB=T 时该温度黑体中性；cinematic 相关测试删除 |
+| S3 | Taichi 噪声库：周期 value noise、乘性级联（小数八度 + softplus）、周期梯度噪声 fBm（烟雾 / 低频层）、1D 噪声 | 新增 `disk_v2/noise_ti.py` | φ 周期无缝（首尾差 < 1e-5）；同种子可复现；级联输出 ≥ 0、小数八度在整数处连续；fBm 归一后单位方差 |
+| S4 | 刚体环平流（主云、厚度扰动、烟雾、低频层共用）+ CPU f64 相位表 + 光行时间 | 新增 `disk_v2/advection.py` | 带权重和 = 1；种子切换时权重为 0；长时间（30 圈）倾角不衰减；纹理 Δφ 与 Ω·Δt 一致（误差 < 1°）；t = 1e6 时相位精度（与 f64 参考对比） |
+| S5 | 3D 场（M）：第 1 层 M、Ṁ → T_peak；Page–Thorne T(r)；SS H(r)/Σ(r) + 竖直高斯；噪声表面；灰大气 + 温度起伏；温和密度起伏；烟雾（温度比）；开普勒尘埃；大尺度低频；替换 atlas | `disk_v2/geometry.py`、`disk_v2/physical_fields.py`、`disk_v2/structure_modulations.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 盘外 = 0；ρ ≥ 0；T_peak(1e8 M☉, 1.7e-6) = 4509 K；PT 峰值 4.8 r_s；核心柱密度 = Σ'（误差 < 2%）；τ_z 与数值积分一致；灰大气倍率 ∈ [1, GREY_CAP]；各层随 Ω 同步转动；与参考实现同参数 parity |
+| S6 | 体积光追为默认路径、连续步长 + 起点抖动、静止观者相机、g 接入、Y(g·T) 源函数（核心 / 烟雾 / 尘埃分温度）；删除 atlas / thin-layer | `disk_v2/taichi_render.py`、删除 `disk_v2/visual_atlas.py` | 渲染可复现（同参数、同抖动种子 hash 一致）；1080p ss=2 GPU 单帧 ≤ 30 s；与参考实现同参数时逼近/远离侧色相与盘带亮度剖面一致 |
 | S7 | 后处理替换 | 新增 `disk_v2/postfx.py`，修改 `disk_v2/taichi_render.py` | bloom 对盘面局部对比损失 < 35%；光晕点亮暗区 5–15%；高光外缘 B/G 升高；零强度时各效果为恒等 |
 | S8 | V2 视频 | `render.py` | 相邻帧差无尖峰；亮度波动 < 1%；`--resume` 结果与连续渲染逐帧一致；V1 e2e 基线不变 |
-| S9 | CLI、README、设计文档、AGENTS 踩坑 | `render.py`、`README.md`、`docs/design_ad_v2.md`、`docs/design.md`、`AGENTS.md` | 文档与参数名一致 |
+| S9 | CLI 按三层分组（与参考实现一致）、README、设计文档、AGENTS 踩坑 | `render.py`、`README.md`、`docs/design_ad_v2.md`、`docs/design.md`、`AGENTS.md` | 文档与参数名一致；`--help` 分组与 §2 三层一致 |
 
 每步都跑：V2 单测全集 + `python tests/e2e_render.py --verify`（V1 不变）。已知与本方案无关的 6 条 `test_gpu_texture_compose` 失败不在范围内。
 
@@ -212,8 +253,8 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 
 | 项 | 原型实测 | 目标 |
 |----|----------|------|
-| 1080p 单帧（ss=1） | 约 2.3 s | ≤ 3 s |
-| 1080p 单帧（ss=2） | 8.7 s | ≤ 10 s |
+| 1080p 单帧（ss=1） | 约 13 s | ≤ 8 s |
+| 1080p 单帧（ss=2） | 51 s | ≤ 30 s（尘埃八度、高斯包络剔除、烟雾噪声优化后） |
 | 首次编译 | 约 2 min | ≤ 3 min（有离线缓存后秒级） |
 | 后处理（NumPy） | 约 0.3 s | 视频时若成为瓶颈移到 Taichi |
 
@@ -221,9 +262,10 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 
 ## 7. 风险
 
-- **编译时间**：7 层烟雾 × 两带 × 两相位的噪声内联量大。缓解：云层运行时循环；噪声函数不 static 展开八度以外的维度。
+- **编译时间与性能**：7 层烟雾 × 两带 × 两相位的噪声内联量大，且烟雾噪声占单帧耗时约 95%。缓解：运行时循环；移植时烟雾改用乘性级联 value noise（单次求值更便宜），需与参考实现做观感对比后再替换。
+- **长视频精度**：刚体环相位在 CPU 用 float64 计算（§4.1）；光行时间只做相对偏移，不引入新的大数。
 - **与原型的数值偏差**：V2 坐标系是 `disk_tilt` 绕 x 轴倾斜，原型是盘在 z=0、相机仰角。移植时在盘局部坐标内计算一切，用 `physcheck` 等价测试保证结果一致。
-- **外半径**：定稿 30；外圈亮度由 `EMIT_POW = 2.5` 控制衰减速度（用户在 1.7 / 2.0 / 2.5 中选定 2.5）。
+- **外半径与外圈亮度**：定稿 30；外圈亮度由物理 Y(T) 决定（4509 K 盘在 r ≳ 20 已接近黑），不再有 `EMIT_POW` 旋钮。
 - **现有 V2 测试大面积失效**：atlas / cinematic palette 相关测试需按新语义重写，每步明确列出被修改的测试及原因。
 
 ---
@@ -233,21 +275,25 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 1. **原型入库**：`scripts/proto_disk_reference.py`，作为参考实现与 `physcheck` 验收工具（S0 已完成）。
 2. **atlas 路径删除**：删除 `disk_v2/visual_atlas.py`、thin-layer 分支、`--v2_turbulence_strength` / `--v2_spiral_warp_strength` / `--v2_alpha_clip_threshold` / `--v2_atlas_*` / `--v2_disable_visual_atlas`，以及 `tests/unit/test_disk_v2_visual_atlas.py`（S5/S6）。
 3. **`--v2_lum_power` 删除**：由 Planck 波段增强 + `--v2_doppler_lum` 取代（helper 在 S1 提供，CLI 删除与渲染核接线在 S6）。
-4. **V2 默认外半径 30**：`ar1 = 3, ar2 = 30`；推荐相机 `dist = 60`、竖直 fov 38°、仰角 7°。观感已确认（预设 H）。
+4. **V2 默认外半径 30**：`ar1 = 3, ar2 = 30`；推荐相机 `dist = 60`、竖直 fov 38°、仰角 7°。
+6. **盘体形态定稿 J2**（v0.4，已被 7 取代）：模型 I + H 烟雾 + 大尺度明暗，对比度 50；旋转保留 mode 3（mode 4 螺线内流对比后未采用）；H 保留为可退回预设。
+7. **物理化与三层参数，定稿 M**（v0.5）：亮度 Y(g·T)、Page–Thorne、灰大气（强度 0.5）、核心 τ≈3 温和起伏、δT 5%、SS 外区结构 + 竖直高斯、开普勒尘埃、烟雾温度比、静止观者相机、T_peak 由 M、Ṁ 推出；多普勒 0.55 / 1.5、曝光 0.9、相机 dist 40；L / J2 / H 保留为退回预设。
 5. **删除 cinematic palette 与 `--v2_visual_preset interstellar`**：删除 `palette_mode = cinematic`、warm_shift / saturation / visual_temp 映射及对应测试；颜色只走"线性化黑体 + 白平衡 + 频移"（S2）。
 
 ## 9. 文档同步
 
-- `docs/design_ad_v2.md`：结构层（atlas → 3D 程序化密度 + 7 层烟雾 + 大尺度低频）、动态（刚体环）、相对论修正、颜色链路。
+- `docs/design_ad_v2.md`：参数三层；结构层（atlas → 3D 程序化密度：SS 外区 + 噪声表面 + 7 层烟雾 + 大尺度低频）；温度（Page–Thorne、灰大气）；亮度 Y(g·T)、动态（刚体环）、相对论修正、颜色链路。
 - `docs/design.md`：V2 后处理与视频管线。
 - `README.md`：新增/废弃的 `--v2_*` 参数与视频用法。
-- `AGENTS.md` 踩坑记录：Taichi kernel 内不能用 `math.exp`；`ti.static` 展开多层噪声导致编译爆炸；`from __future__ import annotations` 与 `ti.template()` 冲突；Tanner Helland 为 sRGB 编码值。
+- `AGENTS.md` 踩坑记录：亮度不能用 (T/T_peak)^p；灰大气侧壁热点；掠射增亮重复计算；NPGS 式 S ∝ 1/ρ 导致越密越暗；Taichi kernel 内不能用 `math.exp`；`ti.static` 展开多层噪声导致编译爆炸；`from __future__ import annotations` 与 `ti.template()` 冲突；Tanner Helland 为 sRGB 编码值。
 - `docs/plans/realism_uplift_plan.md` 变更记录追加本方案引用。
 
 ---
 
 ## 变更记录
 
+- **v0.5 (2026-10-01)**：全面物理 review 后定稿 M，参数分三层（基本参数 / 物理模型 / 视觉调节，§2）。新增：可见光亮度 Y(g·T)、Page–Thorne 温度（M、Ṁ 推 T_peak）、灰大气竖直温度、核心 τ≈3 温和起伏 + 温度起伏、SS 外区 H/Σ + 竖直高斯、开普勒尘埃（去重复掠射增亮）、烟雾温度比、静止观者相机；去掉 `EMIT_POW`、表面增亮、透镜状截面。S2/S5/S6/S9 与性能预算更新。
+- **v0.4 (2026-10-01)**：学习 NPGS 最新 shader 后定稿改为 J2（模型 I：绝对厚度 + 透镜状截面 + 噪声表面、乘性级联 value noise、Σ(r) 解耦的局部热平衡、表面增亮、内区尘埃、连续步长 + 抖动、光行时间；叠加 H 的 7 层烟雾与大尺度明暗；对比度 50）；mode 3 保留；H 保留为退回预设。S3/S4/S5/S6 内容与性能预算更新。
 - **v0.3 (2026-10-01)**：定稿预设 H（稀疏核心纹理 + 大尺度低频调制 + 7 层半吸收烟雾 + EMIT_POW 2.5 + CIE 黑体 + `doppler_color` 2.2 + 曝光 0.7 + 去品红色散）；S0 完成；方案冻结。
 - **v0.2 (2026-10-01)**：§8 待决事项全部定稿（原型入库、删 atlas、删 `--v2_lum_power`、`ar2 = 30`、删 cinematic palette/preset）。
 - **v0.1 (2026-10-01)**：首版。基于已确认的原型（mode 3 刚体环、核心 + 5 云层、修正 g、线性化颜色 + WB 5000K、`doppler_color = 1.6`、高光 bloom + 色散）整理移植方案。

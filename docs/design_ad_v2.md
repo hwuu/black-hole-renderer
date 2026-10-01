@@ -5,6 +5,8 @@
 > **真源关系**：本文件是吸积盘 V2 的设计真源。实施排期与跟踪由 [`docs/plans/realism_uplift_plan.md`](plans/realism_uplift_plan.md) 负责。
 >
 > **v2.3 进行中（2026-10-01）**：结构层、动态、相对论与显示链路按 [`docs/plans/v2_volumetric_video_plan.md`](plans/v2_volumetric_video_plan.md) 重做：visual atlas / thin-layer / cinematic palette 删除，改为 3D 程序化密度（薄核心 + 7 层半吸收烟雾 + 大尺度低频）、刚体环平流（解决卷绕）、修正 g-factor（β = sqrt(M/(r−2M))、本地静止观者方向）、CIE 黑体 + 白平衡、HDR 高光 bloom 与色散，并接入视频。视觉验收基准为 [`scripts/proto_disk_reference.py`](../scripts/proto_disk_reference.py) 默认输出。下文 §2.4、§3.4–§3.6、§4.3、§5 中与此冲突的内容将随各实施步骤逐节改写；冲突处以该方案为准。
+>
+> **v2.3 参数分层（方案 v0.5）**：参数分为第 1 层基本参数（M、Ṁ、半径、相机）/ 第 2 层物理模型（Page–Thorne、SS 外区结构、Y(g·T)、灰大气、湍流、盘风、尘埃、光行时间、静止观者相机）/ 第 3 层视觉调节（多普勒强度、灰大气强度、核心光学深度、盘厚、程序化结构、曝光与后期），详见方案 §2；参考实现 `params` 子命令可列出全部参数。
 
 ## 目录
 
@@ -807,6 +809,7 @@ v1.0 已实现的四个基础模块在用临时脚本预览时输出"黄乎乎�
 
 ## 变更记录
 
+- **v2.3.1 (2026-10-01)**：定稿改为预设 M（物理化亮度 / 温度 / 密度 + 三层参数），见方案 v0.5。
 - **v2.3 (2026-10-01，进行中)**：引入体积云雾 + 动态旋转 + 视频方案（见文首说明与 `docs/plans/v2_volumetric_video_plan.md`）。参考实现 `scripts/proto_disk_reference.py` 入库（S0）。各节正文随 S1–S9 逐步更新。
 - **v2.2.4 (2026-06-14)**：修 C：bloom 默认参数重校。D2+D3+路径 B 之后 HDR max ≈ 0.025，旧 `interstellar` preset 默认 `bloom_threshold=0.15` 直接过滤掉所有 bloom 信号，`v2_acceptance_bloom.png` 与 `v2_acceptance_no_bloom.png` 字节相同。修 C 把 preset 默认调到 `bloom_threshold=5e-4`（约 HDR p99.5 量级）、`bloom_intensity=1.5`、`bloom_radius=8.0`——bloom 实际起作用：mean +5%、p99 +3%、>0.7 高亮像素 +36%。同时修复 preset 偷改 bug：`v2_bloom_*` 三个 CLI 默认值改为 `None`，preset 用 `is None` 判定"用户未指定"，让用户显式 `--v2_bloom_intensity 0` 仍能覆盖 preset 默认。新增 4 个单测覆盖 bloom 配方与覆盖逻辑。已知遗留（v2.2.3）：主验收 ratio ≈ 0.02 仍在 warn 区下端；这是 reference 与"屏幕 p{n}"两种量的本质差异，下一轮可考虑 face-on smoke 校准。
 - **v2.2.3 (2026-06-14)**：D3 reference 一致性与测试漏洞修复（gpt 5.5 review 后）。**路径 B 物理修正**：Taichi `sample_emission(r, phi, z)` 之前接受 z 但完全不用，违反 thin disk emissivity 真实物理；本版改为真 z 函数，沿 z 高斯衰减 + 垂向温度衰减 + W_z 收口，与 NumPy `density_field/temperature_field` 一致。NumPy `physical_baseline_volume_flux` 之前在 vertical_density 项漏乘 W_z（少乘 1 次），同步补上。新增 `test_parity_volume_emission_integral`：在结构调制全部关闭的"纯物理基线"配置下，face-on Taichi 沿 z 数值积分与 NumPy reference 量纲一致（相对误差 < 5%）。**注意**：这条只证明"reference 与 sample_emission 的物理公式已对齐"；实际渲染叠加 g-factor、cinematic palette、transmittance 累积、构图相关 percentile 取值后，actual HDR p{n} 与 reference 之间仍会偏离一个数量级，由 `_compute_white_point` 的策略性 trusted/warn 窗口吸收。**`RenderStats` 暴露 `actual_hdr_white_point` 与 `white_point_percentile`**：之前测试只测 `used_wp == ref_wp`（fallback 后总成立、自证），现在测 `actual_hdr_wp / ref_wp` 落入 trusted/warn 窗口的真实物理 ratio。`_compute_white_point` 返回元组 `(used_wp, actual_hdr_wp)`，stats summary 显示 `actual_hdr_wp (p{n})` 让 percentile 口径明确。D3 fallback 测试改为通过 `resolve_v2_render_options(interstellar preset)` 触发主验收，不再单独构造 renderer 绕过 preset。design §2.4 说明 D3 是**策略选择**而非"actual 与 reference 已严格匹配"，相机/FOV/构图层面差异让 ratio 偏离 1 是预期的。已知遗留（不阻塞当前分支）：主验收实测 ratio ≈ 0.02 落在 warn 区下端，说明 reference 曝光基线比实际画面强一个量级；这不是"配方错误"，而是 reference 的物理量纲与"屏幕 p{n}"本质上是两个量。下一轮做 Bloom 阈值/强度重校（修 C）时一并评估是否需要 face-on smoke 校准。
