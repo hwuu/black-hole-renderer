@@ -159,7 +159,7 @@ A_k = exp(−CL_DECAY·|k|) / Σ_j exp(−CL_DECAY·|j|)
 - `β = sqrt(M/(r − 2M))`（本地静止观者测得的圆轨道速度）。
 - 光子方向变换到本地静止观者：`k_loc ∝ k_rad + sqrt(1 − r_s/r)·k_tan`。
 - `g = g_grav · 1/(γ(1 − β·cosθ_loc))`，`g_grav = sqrt(1 − r_s/r_em)/sqrt(1 − r_s/r_obs)`。
-- 严格验证公式（赤道面圆轨道）：`g_exact = sqrt(1 − 3M/r) / (1 + Ω·L_z/E) / sqrt(1 − r_s/r_obs)`，原型逐像素误差 < 0.01%。
+- 严格验证公式（赤道面圆轨道，`L_z/E` 取光子真实传播方向、沿盘旋转方向为正）：`g_exact = sqrt(1 − 3M/r) / (1 − Ω·L_z/E) / sqrt(1 − r_s/r_obs)`；原型逐像素误差 < 0.01%，NumPy reference 对 200 组随机方向误差 < 1e-9。
 - 亮度：观测谱为温度 `g·T` 的黑体，550 nm 处 `B_ν(g_lum·T)/B_ν(T)`；颜色：`blackbody(T·g_col)`。`g_lum = g^doppler_lum`、`g_col = g^doppler_color`，两个指数为显式非物理旋钮，默认值见 §2，CLI 帮助中注明"1 = 物理"。
 - 现有 `lum_power`（g⁴ 近似）由波段 Planck 比值替代，参数删除（§8-3）。
 
@@ -194,7 +194,7 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 | 步骤 | 内容 | 修改/新增文件 | 测试要点 |
 |------|------|---------------|----------|
 | S0 ✅ | 原型入库作为参考实现与验收脚本 | `scripts/proto_disk_reference.py` | 默认输出与用户确认的预设 H 图逐像素一致；`physcheck` 通过 |
-| S1 | 相对论修正：β、本地方向 cosθ、Planck 波段增强、`doppler_lum/color` | `disk_v2/relativity.py`、`disk_v2/taichi_impl.py` | 新 `test_disk_v2_relativity`：β(ISCO)=0.5；g 与严格 GR 误差 < 0.1%；逼近侧 g>1、远离侧 g<1；Planck 比值随 g 单调；指数为 0 时 g=1 |
+| S1 ✅ | 相对论修正：β、本地方向 cosθ、Planck 波段增强、`doppler_lum/color`（helper；渲染核接线在 S6） | `disk_v2/relativity.py`、`disk_v2/taichi_impl.py`、新增 `tests/unit/test_disk_v2_relativity_s1.py` | β(ISCO)=0.5；g 与严格 GR 误差 < 0.1%；逼近侧 g>1、远离侧 g<1；Planck 比值随 g 单调；指数为 0 时 g=1 |
 | S2 | 颜色链路：CIE 黑体查找表、白平衡、删除 cinematic palette | `disk_v2/palette.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 6500K 近中性（色度偏差 < 3%）；低温偏红、高温偏蓝单调；WB=T 时该温度黑体输出中性；亮度守恒；cinematic 相关测试删除 |
 | S3 | Taichi 噪声库：周期梯度噪声、fBm、ridged、1D 噪声 | 新增 `disk_v2/noise_ti.py` | φ 周期无缝（首尾差 < 1e-5）；零均值；归一后单位方差；同种子可复现；ridged 值域 `[0, 1]` |
 | S4 | 刚体环平流 + CPU f64 相位表 | 新增 `disk_v2/advection.py` | 带权重和 = 1；种子切换时权重为 0；长时间（30 圈）倾角不衰减；纹理 Δφ 与 Ω·Δt 一致（误差 < 1°）；t = 1e6 时相位精度（与 f64 参考对比） |
@@ -232,7 +232,7 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 
 1. **原型入库**：`scripts/proto_disk_reference.py`，作为参考实现与 `physcheck` 验收工具（S0 已完成）。
 2. **atlas 路径删除**：删除 `disk_v2/visual_atlas.py`、thin-layer 分支、`--v2_turbulence_strength` / `--v2_spiral_warp_strength` / `--v2_alpha_clip_threshold` / `--v2_atlas_*` / `--v2_disable_visual_atlas`，以及 `tests/unit/test_disk_v2_visual_atlas.py`（S5/S6）。
-3. **`--v2_lum_power` 删除**：由 Planck 波段增强 + `--v2_doppler_lum` 取代（S1）。
+3. **`--v2_lum_power` 删除**：由 Planck 波段增强 + `--v2_doppler_lum` 取代（helper 在 S1 提供，CLI 删除与渲染核接线在 S6）。
 4. **V2 默认外半径 30**：`ar1 = 3, ar2 = 30`；推荐相机 `dist = 60`、竖直 fov 38°、仰角 7°。观感已确认（预设 H）。
 5. **删除 cinematic palette 与 `--v2_visual_preset interstellar`**：删除 `palette_mode = cinematic`、warm_shift / saturation / visual_temp 映射及对应测试；颜色只走"线性化黑体 + 白平衡 + 频移"（S2）。
 

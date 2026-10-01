@@ -61,12 +61,82 @@ def schwarzschild_gravitational_g_ti(r_em, r_obs, rs):
 
 @ti.func
 def schwarzschild_orbital_beta_ti(r, rs, eps, beta_cap):
-    """局部静止观测者测得的 Schwarzschild 圆轨道速度近似。"""
+    """本地静止观者测得的 Schwarzschild 赤道圆轨道速度（与 `relativity.orbital_beta_local` 一致）。
+
+    Args:
+        r: 发射半径（r_s）。
+        rs: Schwarzschild 半径。
+        eps: 分母 `1 − 2M/r` 下限。
+        beta_cap: 速度上限。
+
+    Returns:
+        `β = sqrt(M/r) / sqrt(1 − 2M/r)`，范围 `[0, beta_cap]`；ISCO 处 0.5。
+    """
     safe_r = ti.max(r, rs + 1e-6)
     mass = 0.5 * rs
-    denom = ti.sqrt(ti.max(1.0 - 3.0 * mass / safe_r, eps))
+    denom = ti.sqrt(ti.max(1.0 - 2.0 * mass / safe_r, eps))
     beta = ti.sqrt(mass / safe_r) / denom
     return ti.min(ti.max(beta, 0.0), beta_cap)
+
+
+@ti.func
+def local_photon_direction_ti(pos, k_coord, rs):
+    """光子坐标方向 → 本地静止观者单位方向（与 `relativity.local_photon_direction` 一致）。
+
+    Args:
+        pos: 位置向量（r_s）。
+        k_coord: 坐标方向（不必归一）。
+        rs: Schwarzschild 半径。
+
+    Returns:
+        单位向量；`tanψ_local = sqrt(1 − r_s/r) · tanψ_coord`。
+    """
+    r = ti.max(pos.norm(), 1e-6)
+    r_hat = pos / r
+    k_rad = k_coord.dot(r_hat) * r_hat
+    k_tan = (k_coord - k_rad) * ti.sqrt(ti.max(1.0 - rs / r, 1e-12))
+    return (k_rad + k_tan).normalized()
+
+
+@ti.func
+def disk_g_factor_ti(pos, trace_dir, r_obs, rs):
+    """盘面圆轨道发射体的频移 g（与 `relativity.disk_g_factor` 一致）。
+
+    Args:
+        pos: 盘局部坐标发射点（盘面 z = 0，逆时针旋转）。
+        trace_dir: 反向追踪光线方向（光子真实方向为其反向）。
+        r_obs: 静止观察者半径。
+        rs: Schwarzschild 半径。
+
+    Returns:
+        `g = g_grav / (γ (1 − β cosθ_local))`。
+    """
+    big_r = ti.max(ti.sqrt(pos[0] * pos[0] + pos[1] * pos[1]), 1e-6)
+    r3 = ti.max(pos.norm(), rs + 1e-6)
+    beta = schwarzschild_orbital_beta_ti(ti.max(big_r, 3.0 * rs), rs, 1e-6, 0.99)
+    v_hat = ti.Vector([-pos[1], pos[0], 0.0]) / big_r
+    cos_th = v_hat.dot(local_photon_direction_ti(pos, -trace_dir, rs))
+    gamma = 1.0 / ti.sqrt(1.0 - beta * beta)
+    g_grav = ti.sqrt(ti.max(1.0 - rs / r3, 1e-12)) / ti.sqrt(ti.max(1.0 - rs / r_obs, 1e-12))
+    return g_grav / (gamma * (1.0 - beta * cos_th))
+
+
+@ti.func
+def planck_band_boost_ti(t_em, g):
+    """550 nm 波段频移亮度增强 `B_ν(gT)/B_ν(T)`（与 `relativity.planck_band_boost` 一致）。
+
+    Args:
+        t_em: 发射温度（K）。
+        g: 频移因子。
+
+    Returns:
+        `(exp(x/T) − 1) / (exp(x/(gT)) − 1)`，x = 26160 K。
+    """
+    t = ti.max(t_em, 1.0)
+    gg = ti.max(g, 1e-6)
+    x_em = ti.min(26160.0 / t, 80.0)
+    x_obs = ti.min(26160.0 / (t * gg), 80.0)
+    return (ti.exp(x_em) - 1.0) / (ti.exp(x_obs) - 1.0)
 
 
 @ti.func

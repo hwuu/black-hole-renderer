@@ -484,6 +484,25 @@ alpha_eff = alpha_k · [1 + kg · (1 - |dot(d, disk_normal)|)]
 
 ---
 
+### 4.4 相对论频移（v2.3）
+
+> 实现：`disk_v2/relativity.py`（NumPy reference）、`disk_v2/taichi_impl.py`（`*_ti`）；测试：`tests/unit/test_disk_v2_relativity_s1.py`。
+
+盘物质按圆柱半径 `R` 做赤道开普勒圆轨道，从 +z 看逆时针旋转。发射点 `pos`（盘局部坐标）、反向追踪方向 `d`（光子真实方向 `k = −d`）：
+
+```
+β = sqrt(M / (R − 2M))                              # 本地静止观者测得的轨道速度，ISCO 处 0.5
+k_loc ∝ k_rad + sqrt(1 − r_s/r) · k_tan             # 坐标方向 → 本地静止观者方向
+cosθ = v̂ · k_loc,  v̂ = (−y, x, 0) / R
+g = sqrt(1 − r_s/r) / sqrt(1 − r_s/r_obs) · 1 / (γ (1 − β cosθ))
+```
+
+- 与严格 GR `g = sqrt(1 − 3M/r) / (1 − Ω·L_z/E) / sqrt(1 − r_s/r_obs)` 对照，相对误差 < 1e-9（测试中冲击参数由光线方程守恒量 `b = |x×d̂| / sqrt(1 − |x×d̂|²/r³)` 独立求得）。
+- 修正前的两处偏差：β 误用 `1 − 3M/r`（ISCO 处 0.577）；`cosθ` 用坐标方向（近黑洞处 g 最大偏差约 5%）。
+- 亮度：观测谱为温度 `g·T` 的黑体，固定波段（550 nm）增强 `B_ν(g_lum T) / B_ν(T)`；替代 `g^lum_power`。
+- 颜色：观测色温 `T · g_color`。
+- `g_lum = g^s_lum`、`g_color = g^s_color` 为显式非物理旋钮（1 = 物理），默认值见 `docs/plans/v2_volumetric_video_plan.md` §2。
+
 ## 5. 实现方案
 
 ### 5.1 直接 Taichi 实现
