@@ -108,6 +108,7 @@ class DiskV2Renderer:
         use_postfx: bool = False,
         doppler_lum: float = 0.55,
         doppler_color: float = 1.5,
+        ss: int = 1,
     ) -> None:
         """初始化 V2 渲染器。
 
@@ -177,6 +178,7 @@ class DiskV2Renderer:
         self.use_postfx = use_postfx
         self.doppler_lum = doppler_lum
         self.doppler_color = doppler_color
+        self.ss = max(1, int(ss))
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
@@ -940,6 +942,9 @@ class DiskV2Renderer:
         self._ray_march_kernel()
 
         if self.use_postfx and self.volume_params is not None:
+            # S9: 超采样（ss>1 时内部渲染 ss 倍分辨率后平均）
+            if self.ss > 1:
+                return self._render_ss(cam_pos, fov)
             # S7: NumPy 后处理链（WB + bloom + 色散 + ACES + sRGB）
             disk_hdr = self.disk_hdr_field.to_numpy()  # (W, H, 3)
             disk_alpha = self.disk_alpha_field.to_numpy()  # (W, H)
@@ -1015,5 +1020,69 @@ class DiskV2Renderer:
 
         # 与 V1 `TaichiRenderer.render` 一致：返回 float32 LDR `[0, 1]`，由 `save_image` 量化。
         return img
+
+    def _render_ss(self, cam_pos: List[float], fov: float) -> np.ndarray:
+        """超采样渲染：内部 ss 倍分辨率 → 平均 → 后处理。"""
+        ss = self.ss
+        w, h = self.width, self.height
+        ws, hs = w * ss, h * ss
+        # 临时切换分辨率
+        orig_w, orig_h = self.width, self.height
+        self.width, self.height = ws, hs
+        # 重新创建 image field
+        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
+        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
+        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
+        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(ws, hs))
+        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
+        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(ws, hs))
+        # 重新编译 kernel（field 引用变了）
+        self._compile_kernels()
+        self._setup_camera(cam_pos, fov)
+        if self.volume_params is not None:
+            self.disk_ti.update_advection(2000.0)
+        self.volume_step_count[None] = 0
+        self.jitter_seed[None] += 1
+        self._ray_march_kernel()
+
+        # 取 HDR 并平均
+        disk_hdr = self.disk_hdr_field.to_numpy()  # (ws, hs, 3)
+        disk_alpha = self.disk_alpha_field.to_numpy()  # (ws, hs)
+        sky_hdr = self.sky_hdr_field.to_numpy()  # (ws, hs, 3)
+        # 转置到 (hs, ws, 3)
+        disk_hdr = np.transpose(disk_hdr, (1, 0, 2))
+        disk_alpha = np.transpose(disk_alpha, (1, 0))
+        sky_hdr = np.transpose(sky_hdr, (1, 0, 2))
+        # 超采样平均
+        disk_hdr = disk_hdr.reshape(h, ss, w, ss, 3).mean(axis=(1, 3))
+        disk_alpha = disk_alpha.reshape(h, ss, w, ss).mean(axis=(1, 3))
+        sky_hdr = sky_hdr.reshape(h, ss, w, ss, 3).mean(axis=(1, 3))
+
+        # 合成 + 后处理（与 use_postfx 路径相同）
+        a = disk_alpha[..., None]
+        hdr_total = disk_hdr * a + sky_hdr * (1 - a)
+        from .stats import hdr_luminance
+        lum = hdr_luminance(disk_hdr).ravel()
+        lum = lum[lum > 1e-10]
+        if lum.size > 0:
+            wp = max(float(np.percentile(lum, 99.9)), 1e-12)
+            exposure = 0.9 / wp
+        else:
+            exposure = 1.0
+        from .postfx import postfx
+        img = postfx(hdr_total, exposure=exposure)
+        self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
+
+        # 恢复原始分辨率
+        self.width, self.height = orig_w, orig_h
+        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
+        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
+        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
+        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(orig_w, orig_h))
+        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
+        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(orig_w, orig_h))
+        self._compile_kernels()
+
+        return img.astype(np.float32) / 255.0
 
     # _apply_bloom 已删除（2026-06-14）：替换为 V1 风格 LDR 域 Taichi _bloom_kernel。
