@@ -4618,6 +4618,8 @@ def parse_args() -> argparse.Namespace:
                         help="V2 模式下 g-factor 上限，避免极端蓝移侧饱和 (default: 6)")
     parser.add_argument("--v2_disable_g_factor", action="store_true",
                         help="V2 模式下关闭相对论 g-factor，仅输出无方向性发射率")
+    parser.add_argument("--v2_ss", type=int, default=1,
+                        help="V2 体积模型超采样倍率（每轴），2 = 每像素 4 条光线 (default: 1)")
     parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,
                         help="V2 视频模式：内缘开普勒轨道对应视频秒数 (default: 16.0)")
     parser.add_argument("--v2_r_max", type=float, default=None,
@@ -4821,13 +4823,13 @@ if __name__ == "__main__":
             palette_params=v2_palette, skybox=skybox,
             step_size=args.step_size, r_max=v2_r_max,
             disk_tilt_deg=args.disk_tilt,
-            volume_samples=args.v2_volume_samples if hasattr(args, 'v2_volume_samples') else 32,
-            opacity_scale=args.v2_opacity_scale if hasattr(args, 'v2_opacity_scale') else 1.0,
-            emission_scale=args.v2_emission_scale if hasattr(args, 'v2_emission_scale') else 1.0,
+            volume_samples=args.v2_volume_samples,
+            emission_scale=args.v2_emission_scale,
             auto_exposure=True,
             device=args.device,
             volume_params=v2_volume,
             use_postfx=True,
+            ss=args.v2_ss,
         )
 
         # 物理时间步：内缘轨道周期 = v2_orbit_seconds 视频秒
@@ -4853,13 +4855,15 @@ if __name__ == "__main__":
         start = _time.time()
         for f in range(args.n_frames):
             t = t0 + f * dt_per_frame
-            renderer.disk_ti.update_advection(t)
             # 相机轨道
             azim = base_azim + _math.radians(orbit_deg) * f / max(args.n_frames - 1, 1)
             cam_x = base_dist * _math.cos(base_elev) * _math.cos(azim)
             cam_y = base_dist * _math.cos(base_elev) * _math.sin(azim)
             cam_z = base_dist * _math.sin(base_elev)
-            frame = renderer.render(cam_pos=[cam_x, cam_y, cam_z], fov=fov)
+            frame = renderer.render(cam_pos=[cam_x, cam_y, cam_z], fov=fov, t=t)
+            if renderer.fixed_exposure is None:
+                # 首帧自动曝光后锁定，避免逐帧曝光闪烁（参考实现 cmd_video 同款）
+                renderer.fixed_exposure = 1.0 / renderer.last_white_point
             writer.write_frame((np.clip(frame, 0, 1) * 255).astype(np.uint8))
             if f % 24 == 0:
                 elapsed = _time.time() - start
@@ -4876,6 +4880,7 @@ if __name__ == "__main__":
             )
         if args.video:
             _render_video_v2(args, width, height, fov)
+            raise SystemExit(0)
         if args.device != "gpu":
             raise ValueError(
                 "--disk_model v2 当前仅推荐并支持 --device gpu。CPU 路径在小图下也可能耗时数分钟且无进度输出；"
@@ -4890,6 +4895,7 @@ if __name__ == "__main__":
             DiskV2PaletteParams,
             DiskV2Params,
             DiskV2StructureParams,
+            DiskV2VolumeParams,
         )
         from disk_v2.taichi_render import DiskV2Renderer
 
@@ -4945,6 +4951,11 @@ if __name__ == "__main__":
             seed=args.v2_seed,
             device=args.device,
             ignore_taichi_cache=args.ignore_taichi_cache,
+            # v2.3 体积密度场 + 参考实现后处理链（与视频路径一致；
+            # 此前单帧 CLI 未传 volume_params，实际走的是旧 atlas 薄层路径）
+            volume_params=DiskV2VolumeParams(),
+            use_postfx=True,
+            ss=args.v2_ss,
         )
         img = renderer.render(cam_pos=args.pov, fov=fov)
         save_image(img, args.output)

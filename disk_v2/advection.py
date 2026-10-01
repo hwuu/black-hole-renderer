@@ -116,16 +116,24 @@ class RigidRingBands:
     """φ_b 随机偏移的哈希流 `(b, c)`（区分使用同一带网格的不同结构层）。"""
     ph0_hash: tuple = (13, 5)
     """种子相位 ph0 的哈希流 `(b, c)`。"""
+    lnr0_bands: float = -2.0
+    """带网格原点：`lnr0 = ln r_in + lnr0_bands·dln`（核心 / 烟雾 / 尘埃 = −2；低频层 = 0）。"""
+    center_frac: float = 0.0
+    """带中心在带坐标中的偏移：`r_b = exp(lnr0 + (b + center_frac)·dln)`（低频层 = 0.5）。
+
+    与参考实现保持一致：核心层 `r_b = exp(LNR0_R + b·DLN_R)`，
+    低频层 `r_b = exp(ln R_IN + (b + 0.5)·DLN_L)`。
+    """
 
     def __post_init__(self) -> None:
-        lnr0 = math.log(self.r_in) - 2.0 * self.dln
+        lnr0 = math.log(self.r_in) + self.lnr0_bands * self.dln
         b_lo = int(math.floor((math.log(self.r_in) - lnr0) / self.dln)) - 1
         b_hi = int(math.ceil((math.log(self.r_out) + self.dln - lnr0) / self.dln)) + 1
         bs = np.arange(b_lo, b_hi + 1, dtype=np.float64)
         object.__setattr__(self, "lnr0", lnr0)
         object.__setattr__(self, "b_lo", b_lo)
         object.__setattr__(self, "b_hi", b_hi)
-        r_b = np.exp(lnr0 + bs * self.dln)
+        r_b = np.exp(lnr0 + (bs + self.center_frac) * self.dln)
         object.__setattr__(self, "r_b", r_b)
         om_b = np.sqrt(0.5 / r_b ** 3)
         object.__setattr__(self, "om_b", om_b)

@@ -182,7 +182,10 @@ python -m unittest tests/unit/test_disk_v2_array_utils tests/unit/test_disk_v2_c
   tests/unit/test_disk_v2_g_factor tests/unit/test_disk_v2_numpy_taichi_parity \
   tests/unit/test_disk_v2_palette tests/unit/test_disk_v2_physical_fields \
   tests/unit/test_disk_v2_structure_modulations tests/unit/test_disk_v2_visual_atlas \
-  tests/unit/test_disk_v2_stats
+  tests/unit/test_disk_v2_stats tests/unit/test_disk_v2_proto_parity
+
+# V2 vs Proto 同参数对比（1080p 上下拼图 + 数值指标）
+python scripts/compare_v2_proto.py
 
 # V2 视觉验收（GPU）
 bash scripts/v2_visual_acceptance.sh
@@ -215,3 +218,15 @@ bash scripts/v2_visual_acceptance.sh
     - 修复：把 `self.volume_params = volume_params` 移到
       `self._compile_kernels()` 之前
     - 文件位置：`disk_v2/taichi_render.py:__init__`
+
+31. **移植 Proto 时凭印象改写 → V2 与 Proto 长期对不上（2026-10 修复）**
+    - 现象：多轮"看图 → 猜原因 → 补一处"仍差距大：烟雾看不见、光子环下半部消失、锯齿
+    - 根因：未逐行对照移植，累积 13 处偏差（噪声未归一化、视界清零发射、合成重复乘透射率、
+      `CORE_OPAC` 漏乘发射、混入 `opacity_scale`、低频带中心约定不同、光行时间无效等）
+    - 规则：改 V2 体积路径后**必须**跑 `python scripts/compare_v2_proto.py`，看数值指标再看图；
+      详见 `docs/plans/v2_volumetric_video_plan.md` §10
+    - 保护测试：`tests/unit/test_disk_v2_proto_parity.py`
+
+32. **Taichi `@ti.func` 内不能把 dataclass 绑定到局部变量**
+    - 现象：`f = self._adv_core_f` 抛 `Invalid constant scalar data type: RigidRingFields`
+    - 修复：直接写全路径 `self._adv_core_f.rot[idx]`（与 #24 同源）

@@ -179,6 +179,14 @@ class DiskV2Renderer:
         self.doppler_lum = doppler_lum
         self.doppler_color = doppler_color
         self.ss = max(1, int(ss))
+        if self.ss > 1 and not (use_postfx and volume_params is not None):
+            raise ValueError("ss > 1 仅支持体积模型 + postfx 路径（volume_params 且 use_postfx=True）")
+        # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
+        self._iw = width * self.ss
+        self._ih = height * self.ss
+        self.last_hdr: np.ndarray | None = None
+        # 视频曝光锁定：非 None 时 render() 直接使用该曝光（参考实现视频首帧锁定）
+        self.fixed_exposure: float | None = None
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
@@ -189,28 +197,28 @@ class DiskV2Renderer:
             volume_params=volume_params,
         )
 
+        iw, ih = self._iw, self._ih
         # 输出图像 field（HDR 浮点；Bloom + tonemap 在 Python 端 / 简化 kernel 完成）。
-        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
-        self.volume_step_count = ti.field(dtype=ti.i32, shape=())
+        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
         self.jitter_seed = ti.field(dtype=ti.i32, shape=())
         self.jitter_seed[None] = 0
-        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
         # 方向 1（2026-06-14）：背景与盘分离处理
         # - disk_hdr_field: 盘的物理通量（参与曝光 + tonemap + bloom）
         # - disk_alpha_field: 盘 + 事件视界的累积不透明度（合成时分配 disk vs sky）
         # - sky_hdr_field: 背景天空原始颜色（**不**参与曝光、tonemap、bloom）
         # 解决 cinematic auto_exposure 把暗背景 (luma~0.02) ×exposure_scale(~1400)
         # 抬到 HDR~30 → Reinhard 0.97 → 全图灰白的问题。
-        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
-        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(width, height))
-        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
+        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(iw, ih))
+        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
         # V1 风格 LDR bloom 所需 fields：
         # - disk_ldr_field: 盘经 exposure+tonemap+gamma 后的 LDR，bloom 输入输出
         # - bright_field: 高亮提取缓冲
         # - blur_field: separable 高斯中间缓冲
-        self.disk_ldr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
-        self.bright_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
-        self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.disk_ldr_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
+        self.bright_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
+        self.blur_field = ti.Vector.field(3, dtype=ti.f32, shape=(iw, ih))
         # V1 bloom 参数 fields（Taichi 闭包 kernel 不接受任何参数注解，
         # 只能通过 field 传递 runtime 值）
         self.bloom_threshold_field = ti.field(dtype=ti.f32, shape=())
@@ -218,7 +226,7 @@ class DiskV2Renderer:
         self.bloom_kernel_radius_field = ti.field(dtype=ti.i32, shape=())
         self.bloom_sigma_scale_field = ti.field(dtype=ti.f32, shape=())
         # event_horizon mask：bloom 后强制黑洞内部为黑色
-        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(width, height))
+        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(iw, ih))
 
         # 上传 skybox。
         sky_h, sky_w = skybox.shape[:2]
@@ -299,8 +307,10 @@ class DiskV2Renderer:
         tan_t = ti.tan(tilt)
         use_visual_atlas = bool(disk._use_visual_atlas)
         has_volume_model = self.volume_params is not None and hasattr(disk, '_kappa_vol')
-        img_w = int(self.width)
-        img_h = int(self.height)
+        img_w = int(self._iw)
+        img_h = int(self._ih)
+        static_cam = has_volume_model and bool(disk._static_cam)
+        light_delay = has_volume_model and bool(disk._light_delay)
         min_fac = ti.cast(0.2, ti.f32)
         max_fac = ti.cast(10.0, ti.f32)
         alpha_gain = ti.cast(6.0, ti.f32)
@@ -328,6 +338,13 @@ class DiskV2Renderer:
                 py_f = ti.cast(j, ti.f32)
                 pixel_pos = tl + (px_f + 0.5) * pw * cr - (py_f + 0.5) * ph * cu
                 ray_dir = (pixel_pos - cp).normalized()
+                if ti.static(static_cam):
+                    # 静止观者本地方向 → 坐标方向：tanψ_coord = tanψ_local / sqrt(1 − r_s/r)
+                    # （ψ 为与径向夹角；径向分量不变，切向分量除以 sqrt(1 − r_s/r)）
+                    r0 = cp.norm()
+                    rh = cp / r0
+                    d_rad = ray_dir.dot(rh) * rh
+                    ray_dir = (d_rad + (ray_dir - d_rad) / ti.sqrt(1.0 - rs / r0)).normalized()
 
                 pos = cp
                 step_idx = 0
@@ -363,12 +380,24 @@ class DiskV2Renderer:
                         dt_fac = max_fac
                     h = h_base * dt_fac
                     if ti.static(has_volume_model):
-                        rc_h = ti.sqrt(pos[0] * pos[0] + pos[1] * pos[1])
-                        zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.05
-                        d_slab = ti.max(ti.abs(pos[2]) - zb, 0.0) + ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
+                        # 参考实现（模型 I）步长：位置的连续函数，避免条纹。
+                        #   远场 h = min(0.06·r, 2)；近视界 h ≤ 0.02 + 0.06·(r − 1)；
+                        #   核心盘包络 zb = 3H(r_c) + 0.02 内 h → 0.03，离开后按距离 0.3·d 放大；
+                        #   烟雾包络 CL_EXTENT·r_c + 0.02 内 h → max(0.4·CL_WIDTH·r_c, 0.03)。
+                        # 盘相关距离在盘局部坐标下计算（支持倾角）。
+                        h = ti.min(0.06 * r_cur, 2.0)
+                        h = ti.min(h, 0.02 + 0.06 * ti.max(r_cur - 1.0, 0.0))
+                        pl = _world_to_local_disk(pos)
+                        rc_h = ti.sqrt(pl[0] * pl[0] + pl[1] * pl[1])
+                        zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.02
+                        rad_out = ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
+                        d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
                         h = ti.min(h, 0.03 + 0.3 * d_slab)
+                        if ti.static(disk._smoke_on):
+                            d_smoke = ti.max(ti.abs(pl[2]) - (disk._cl_extent * rc_h + 0.02), 0.0) + rad_out
+                            h = ti.min(h, ti.max(0.4 * disk._cl_width * rc_h, 0.03) + 0.3 * d_smoke)
 
-                    # 首步抖动：打乱采样网格周期性（对齐 Proto，消除方块锯齿）
+                    # 首步抖动：起点沿光线随机偏移 [0, h)，与超采样一起构成蒙特卡洛体积积分
                     if step_idx == 0:
                         jit = _hashf(i, j, self.jitter_seed[None])
                         h = h * jit
@@ -388,41 +417,46 @@ class DiskV2Renderer:
 
                     r = new_pos.norm()
                     affine += h
+                    hit_horizon = r < r_cap
+                    hit_escape = r > r_esc or affine > max_affine
 
-                    if r < r_cap:
-                        event_horizon_hit = True
-                        break
-                    elif r > r_esc:
-                        escaped = True
-                        escape_dir = new_dir.normalized()
-                        break
-                    elif affine > max_affine:
-                        escaped = True
-                        escape_dir = new_dir.normalized()
-                        break
+                    # 旧路径（atlas / F_shear）保持原行为：先判终止再积分本段
+                    if ti.static(not has_volume_model):
+                        if hit_horizon:
+                            event_horizon_hit = True
+                            break
+                        elif hit_escape:
+                            escaped = True
+                            escape_dir = new_dir.normalized()
+                            break
 
                     if ti.static(has_volume_model):
-                        # v2.3 S6: 体积密度场（density_I）+ Y(g·T) 三温度源
-                        # 连续步长 + 段中点采样
-                        lam += (new_pos - pos).norm()
+                        # v2.3 体积密度场（density_I）+ Y(g·T) 三温度源；段中点采样。
+                        # 与参考实现一致：先积分本段，再判视界 / 逃逸（落入视界前的发射保留）。
+                        ds = (new_pos - pos).norm()
+                        lam += ds
                         pm = 0.5 * (pos + new_pos)
-                        rm = ti.sqrt(pm[0] * pm[0] + pm[1] * pm[1])
-                        if rm > disk._r_in and rm < disk._r_out:
-                            _sl = _world_to_local_disk(pm)
-                            r_local = ti.sqrt(_sl[0] ** 2 + _sl[1] ** 2)
-                            phi_local = ti.atan2(_sl[1], _sl[0])
+                        _sl = _world_to_local_disk(pm)
+                        r_local = ti.sqrt(_sl[0] ** 2 + _sl[1] ** 2)
+                        if r_local > disk._r_in and r_local < disk._r_out:
                             z_local = _sl[2]
-                            if ti.abs(z_local) < 3.0 * disk._ss_half_thickness(r_local) + 0.05:
-                                dm = 0.5 * (dir_ + new_dir)
+                            z_lim = 3.0 * disk._ss_half_thickness(r_local) + 0.01
+                            if ti.static(disk._smoke_on):
+                                z_lim = ti.max(z_lim, disk._cl_extent * r_local)
+                            if ti.abs(z_local) < z_lim:
+                                phi_local = ti.atan2(_sl[1], _sl[0])
+                                # 光线方向转到盘局部坐标（g 因子与发射点位置同一坐标系）
+                                dm = _world_to_local_disk(0.5 * (dir_ + new_dir))
+                                # 光行时间：采样时刻 = 帧时刻 − (到段中点的光程)
+                                t_delay = 0.0
+                                if ti.static(light_delay):
+                                    t_delay = lam - 0.5 * ds
                                 em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
-                                    r_local, z_local, phi_local, 2000.0 - lam, dm[2])
-                                self.volume_step_count[None] += 1
+                                    r_local, z_local, phi_local, t_delay, dm[2])
                                 if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
-                                    ds = (new_pos - pos).norm()
                                     g_phys = 1.0
                                     if ti.static(enable_g):
-                                        g_phys = disk_g_factor_ti(
-                                            ti.Vector([_sl[0], _sl[1], z_local]), dm, cp.norm(), rs)
+                                        g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs)
                                     g_lum = ti.pow(g_phys, self.doppler_lum)
                                     g_col = ti.pow(g_phys, self.doppler_color)
                                     T_K = disk._page_thorne_temperature(r_local)
@@ -436,10 +470,12 @@ class DiskV2Renderer:
                                     if disk._smoke_tr > 0:
                                         Ts = T_K * disk._smoke_tr
                                         src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Ts * g_col)
-                                    # 发射-吸收积分（与参考实现同款：T · j · ds）
-                                    j_total = em_c * src_c + em_o * src_o + em_s * src_s
+                                    # CORE_OPAC 同时乘核心发射与核心吸收：物质更多 → j、α 同比增加，
+                                    # 源函数 S = j/α 不变（与参考实现一致）。κ 已按 TAU_I 标定，
+                                    # 不再乘 V1 遗留的 opacity_scale。
+                                    j_total = disk._core_opac * em_c * src_c + em_o * src_o + em_s * src_s
                                     j_total *= emission_scale
-                                    alpha_coeff = disk._kappa_vol * opacity_scale * (ab_o + disk._core_opac * ab_c)
+                                    alpha_coeff = disk._kappa_vol * (ab_o + disk._core_opac * ab_c)
                                     alpha_seg = alpha_coeff * ds
                                     # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
                                     if alpha_coeff > 1e-30:
@@ -448,6 +484,14 @@ class DiskV2Renderer:
                                     else:
                                         hdr_accum += transmittance * j_total * ds
                                     transmittance *= ti.exp(-alpha_seg)
+                        if hit_horizon:
+                            event_horizon_hit = True
+                            transmittance = 0.0
+                            break
+                        elif hit_escape:
+                            escaped = True
+                            escape_dir = new_dir.normalized()
+                            break
                     elif ti.static(not use_visual_atlas):
                         old_local = _world_to_local_disk(old_pos)
                         new_local = _world_to_local_disk(new_pos)
@@ -622,7 +666,11 @@ class DiskV2Renderer:
                 disk_alpha_value = 0.0
                 sky_hdr_value = bg_color  # 已经处理过 event_horizon_hit（黑色）和 escape
                 if event_horizon_hit:
-                    # 黑洞剪影：alpha=1，背景完全被遮挡
+                    # 黑洞剪影：alpha=1，背景完全被遮挡。
+                    # 体积路径：光线落入视界前穿过盘的发射真实存在，必须保留
+                    #（否则阴影边缘的光子环下半部分被整圈清零）。
+                    if ti.static(has_volume_model):
+                        disk_hdr_value = hdr_accum
                     disk_alpha_value = 1.0
                     self.event_horizon_field[i, j] = 1
                 elif ti.static(use_visual_atlas):
@@ -813,7 +861,7 @@ class DiskV2Renderer:
             pixel_width,
             pixel_height,
             _top_left,
-        ) = build_camera_v1_compatible(cam_pos, fov, self.width, self.height)
+        ) = build_camera_v1_compatible(cam_pos, fov, self._iw, self._ih)
 
         self.cam_pos_field[None] = cam_pos_arr.astype(np.float32).tolist()
         self.cam_right_field[None] = right.astype(np.float32).tolist()
@@ -914,62 +962,53 @@ class DiskV2Renderer:
         )
         return hdr_wp, hdr_wp
 
-    def render(self, cam_pos: List[float], fov: float) -> np.ndarray:
-        """渲染单帧（含可选 V1 风格 LDR bloom）。
+    def render(self, cam_pos: List[float], fov: float, t: float = 2000.0) -> np.ndarray:
+        """渲染单帧。
 
         Args:
             cam_pos: 相机位置 `[x, y, z]`，单位为 r_s。
-            fov: 视野角（度）。
+            fov: 竖直视野角（度）。
+            t: 帧物理时间（r_s/c），决定刚体环平流相位；默认 2000（与参考实现单帧一致）。
+                视频逐帧递增传入。
 
         Returns:
-            `(height, width, 3)` uint8 RGB 数组。
+            `(height, width, 3)` float32 LDR `[0, 1]`。
 
         Notes:
-            管线（方向 1 + V1 bloom）：
+            体积 + postfx 路径（与参考实现 `render_hdr` + `tonemap` 一致）：
 
-            1. `_ray_march_kernel`：HDR 体积积分 → disk_hdr / disk_alpha / sky_hdr
-            2. `_compute_white_point`：disk-only HDR 统计 → wp
-            3. `_disk_tonemap_kernel`：disk_hdr → disk_ldr（exposure + tonemap + gamma）
-            4. `_bloom_kernel`（可选）：V1 风格 LDR 域 bloom，逐通道独立 sigma
-               模拟相机色散，B 通道 sigma 8× → 蓝色 halo 边缘
-            5. `_compose_kernel`：disk_ldr（含 bloom）+ sky + alpha → 最终 image_field
+            1. `_ray_march_kernel`：在 `(ss·W, ss·H)` 内部分辨率积分
+               `I = Σ T·ΔI_disk + T_end·I_sky`（写入 `hdr_field`）
+            2. `ss×ss` 盒式下采样 → `last_hdr`（`(H, W, 3)` 线性 HDR）
+            3. 曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则
+               盘区亮度（`L > 1e-4`）p99.9 → 0.9
+            4. `postfx`：WB → bloom → 镶边 → 色散 → 保色度 ACES → sRGB
+
+            旧路径（atlas / F_shear，`use_postfx=False`）：
+            disk_hdr → white point → Reinhard → 可选 LDR bloom → 与 sky 按 alpha 合成。
         """
         self._setup_camera(cam_pos, fov)
         if self.volume_params is not None:
-            self.disk_ti.update_advection(2000.0)
-        self.volume_step_count[None] = 0
+            self.disk_ti.update_advection(float(t))
         self.jitter_seed[None] += 1
         self._ray_march_kernel()
 
         if self.use_postfx and self.volume_params is not None:
-            # S9: 超采样（ss>1 时内部渲染 ss 倍分辨率后平均）
-            if self.ss > 1:
-                return self._render_ss(cam_pos, fov)
-            # S7: NumPy 后处理链（WB + bloom + 色散 + ACES + sRGB）
-            disk_hdr = self.disk_hdr_field.to_numpy()  # (W, H, 3)
-            disk_alpha = self.disk_alpha_field.to_numpy()  # (W, H)
-            sky_hdr = self.sky_hdr_field.to_numpy()  # (W, H, 3)
-            # 转置到 (H, W, 3)
-            disk_hdr = np.transpose(disk_hdr, (1, 0, 2))
-            disk_alpha = np.transpose(disk_alpha, (1, 0))
-            sky_hdr = np.transpose(sky_hdr, (1, 0, 2))
-            # 合成：disk * alpha + sky * (1 - alpha)
-            a = disk_alpha[..., None]
-            hdr_total = disk_hdr * a + sky_hdr * (1 - a)
-            # 曝光
-            if self.auto_exposure:
-                from .stats import hdr_luminance
-                lum = hdr_luminance(disk_hdr).ravel()
-                lum = lum[lum > 1e-10]
-                if lum.size > 0:
-                    # 与参考实现一致：p99.9 → 0.9（EXP_TARGET）
-                    wp = max(float(np.percentile(lum, 99.9)), 1e-12)
-                    exposure = 0.9 / wp
-                else:
-                    exposure = 1.0
+            ss = self.ss
+            hdr = np.transpose(self.hdr_field.to_numpy(), (1, 0, 2))  # (ss·H, ss·W, 3)
+            if ss > 1:
+                hdr = hdr.reshape(self.height, ss, self.width, ss, 3).mean(axis=(1, 3))
+            self.last_hdr = hdr
+            if self.fixed_exposure is not None:
+                exposure = float(self.fixed_exposure)
+            elif self.auto_exposure:
+                lum = hdr_luminance(hdr)
+                lum = lum[lum > 1e-4]
+                # 参考实现 auto_exposure：盘区亮度 p99.9 → EXP_TARGET = 0.9（预设 M）
+                exposure = 0.9 / max(float(np.percentile(lum, 99.9)), 1e-12) if lum.size else 1.0
             else:
                 exposure = 1.0
-            img = postfx(hdr_total, exposure=exposure)
+            img = postfx(hdr, exposure=exposure)
             self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
             return img.astype(np.float32) / 255.0
 
@@ -1020,69 +1059,5 @@ class DiskV2Renderer:
 
         # 与 V1 `TaichiRenderer.render` 一致：返回 float32 LDR `[0, 1]`，由 `save_image` 量化。
         return img
-
-    def _render_ss(self, cam_pos: List[float], fov: float) -> np.ndarray:
-        """超采样渲染：内部 ss 倍分辨率 → 平均 → 后处理。"""
-        ss = self.ss
-        w, h = self.width, self.height
-        ws, hs = w * ss, h * ss
-        # 临时切换分辨率
-        orig_w, orig_h = self.width, self.height
-        self.width, self.height = ws, hs
-        # 重新创建 image field
-        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
-        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
-        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
-        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(ws, hs))
-        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(ws, hs))
-        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(ws, hs))
-        # 重新编译 kernel（field 引用变了）
-        self._compile_kernels()
-        self._setup_camera(cam_pos, fov)
-        if self.volume_params is not None:
-            self.disk_ti.update_advection(2000.0)
-        self.volume_step_count[None] = 0
-        self.jitter_seed[None] += 1
-        self._ray_march_kernel()
-
-        # 取 HDR 并平均
-        disk_hdr = self.disk_hdr_field.to_numpy()  # (ws, hs, 3)
-        disk_alpha = self.disk_alpha_field.to_numpy()  # (ws, hs)
-        sky_hdr = self.sky_hdr_field.to_numpy()  # (ws, hs, 3)
-        # 转置到 (hs, ws, 3)
-        disk_hdr = np.transpose(disk_hdr, (1, 0, 2))
-        disk_alpha = np.transpose(disk_alpha, (1, 0))
-        sky_hdr = np.transpose(sky_hdr, (1, 0, 2))
-        # 超采样平均
-        disk_hdr = disk_hdr.reshape(h, ss, w, ss, 3).mean(axis=(1, 3))
-        disk_alpha = disk_alpha.reshape(h, ss, w, ss).mean(axis=(1, 3))
-        sky_hdr = sky_hdr.reshape(h, ss, w, ss, 3).mean(axis=(1, 3))
-
-        # 合成 + 后处理（与 use_postfx 路径相同）
-        a = disk_alpha[..., None]
-        hdr_total = disk_hdr * a + sky_hdr * (1 - a)
-        from .stats import hdr_luminance
-        lum = hdr_luminance(disk_hdr).ravel()
-        lum = lum[lum > 1e-10]
-        if lum.size > 0:
-            wp = max(float(np.percentile(lum, 99.9)), 1e-12)
-            exposure = 0.9 / wp
-        else:
-            exposure = 1.0
-        from .postfx import postfx
-        img = postfx(hdr_total, exposure=exposure)
-        self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
-
-        # 恢复原始分辨率
-        self.width, self.height = orig_w, orig_h
-        self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
-        self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
-        self.disk_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
-        self.disk_alpha_field = ti.field(dtype=ti.f32, shape=(orig_w, orig_h))
-        self.sky_hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(orig_w, orig_h))
-        self.event_horizon_field = ti.field(dtype=ti.i32, shape=(orig_w, orig_h))
-        self._compile_kernels()
-
-        return img.astype(np.float32) / 255.0
 
     # _apply_bloom 已删除（2026-06-14）：替换为 V1 风格 LDR 域 Taichi _bloom_kernel。

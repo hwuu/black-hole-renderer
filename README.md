@@ -103,6 +103,7 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--v2_T_peak_K` | 中面温度峰值（K），决定颜色基调 | 1e7 |
 | `--v2_clump_count` | 显式团块数量 | 400 |
 | `--v2_volume_samples` | 盘内体积积分步数 | 16 |
+| `--v2_ss` | 体积模型超采样倍率（每轴），2 = 每像素 4 条光线 | 1 |
 | `--v2_opacity_scale` | 盘体不透明度缩放 | 0.5 |
 | `--v2_lum_power` | g-factor 亮度指数（Phase 5 严格物理 = 4） | 4.0 |
 | `--v2_g_cap` | g-factor 上限 | 6.0 |

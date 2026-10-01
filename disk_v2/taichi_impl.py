@@ -166,6 +166,54 @@ def doppler_g_factor_ti(beta, cos_theta):
 
 
 @ti.func
+def _delayed_rot(rot, om_b, t_delay):
+    """刚体环带在光行时间延迟后的转角。
+
+    Args:
+        rot: 帧时刻转角 `(Ω_b·t) mod 2π`（rad）。
+        om_b: 带中心角速度 Ω_b（rad / (r_s/c)）。
+        t_delay: 延迟 `Δt ≥ 0`（r_s/c）。
+
+    Returns:
+        标量转角 `Ω_b·(t − Δt)`（rad，未取模；噪声 φ 方向周期为整数，取模无影响）。
+
+    Formula:
+        `rot_d = rot − Ω_b·Δt`
+    """
+    return rot - om_b * t_delay
+
+
+@ti.func
+def _delayed_seed(frac, cyc, t_life, t_delay):
+    """刚体环种子相位在光行时间延迟后的 (周期进度, 周期索引)。
+
+    Args:
+        frac: 帧时刻周期进度 `s − floor(s) ∈ [0, 1)`，`s = t/t_life + ph0 + p/2`。
+        cyc: 帧时刻周期索引 `floor(s) mod 4096`（i32）。
+        t_life: 种子寿命（r_s/c）。
+        t_delay: 延迟 `Δt ≥ 0`（r_s/c）。
+
+    Returns:
+        `(frac_d ∈ [0, 1), cyc_d ∈ [0, 4096))`：采样时刻 `t − Δt` 的进度与索引。
+
+    Formula:
+        ```
+        s_d    = frac − Δt / t_life
+        frac_d = s_d − floor(s_d)
+        cyc_d  = (cyc + floor(s_d)) mod 4096
+        ```
+
+    Notes:
+        只在 f32 下处理小量 `Δt/t_life`（光程 ≲ 100，远小于长视频的 t），
+        保持相位表"长视频精度"的设计。
+    """
+    s_d = frac - t_delay / t_life
+    k = ti.floor(s_d)
+    cyc_d = ((cyc + ti.cast(k, ti.i32)) % 4096 + 4096) % 4096
+    return s_d - k, cyc_d
+
+
+@ti.func
 def _ti_smoothstep(edge0, edge1, x):
     """三次平滑插值，与 NumPy `disk_v2.geometry.smoothstep` 数学等价。
 
@@ -640,6 +688,11 @@ class DiskV2Taichi:
         self._cloud_c0 = float(vp.cloud_c0)
         self._cloud_soft = float(vp.cloud_soft)
         self._smoke_on = self._smoke_i > 0.0
+        # 烟雾竖直包络 / r：CL_EXTENT = N·间距 + 3·层厚（采样剔除与步长细化用，与参考实现一致）
+        self._cl_extent = self._n_cl_half * self._cl_spacing + 3.0 * self._cl_width
+        # 噪声归一化因子（原始 fBm 的实测 std；_calibrate_volume 中标定，标定前取 1）
+        self._smoke_norm = 1.0
+        self._low_norm = 1.0
         # 低频
         self._lowf_sigma = float(vp.lowf_sigma)
         self._fr_l = float(vp.fr_l)
@@ -676,6 +729,7 @@ class DiskV2Taichi:
         self._adv_low = RigidRingBands(
             self._r_in, self._r_out, self._dln_l, self._k_rigid_l,
             phi_b_hash=(23, 1), ph0_hash=(29, 5),
+            lnr0_bands=0.0, center_frac=0.5,
         )
         self._adv_low_f = make_fields(self._adv_low)
 
@@ -707,11 +761,54 @@ class DiskV2Taichi:
         self._static_cam = bool(vp.static_cam)
 
     def _calibrate_volume(self) -> None:
-        """标定 ⟨c⟩（主云级联均值）与 κ（吸收系数，使 r ≈ 6 处 face-on τ = TAU_I）。"""
+        """标定噪声归一化因子、⟨c⟩（主云级联均值）与 κ（吸收系数）。
+
+        Formula:
+            ```
+            smoke_norm = std(_eval_cloud(ln r, φ, ζ; 0, 0, 0))     （原始烟雾 fBm）
+            low_norm   = std(fbm_3oct(i/16, j/512·NPHI_L, ((7i+13j) mod 17)/5))
+            ⟨c⟩        = mean(c(r, φ, z=0))
+            κ          = TAU_I / mean(∫(ab_c + ab_o) dz)，r ∈ [5.5, 6.5]
+            ```
+            采样网格与参考实现 `raw_stats_cloud_kernel` / `raw_stats_low_kernel`
+            完全一致（256 × 512），保证两边归一化因子相同。
+
+        Physical Meaning:
+            烟雾层与大尺度明暗的参数（`sigma_c`、`cloud_c0`、`lowf_sigma`）都是按
+            "噪声单位方差"定义的；不归一化时原始 fBm 的 std 只有约 0.2，烟雾覆盖率
+            会从约 35% 掉到约 3%，大尺度明暗只剩 1/5。
+
+        Simplifications:
+            std 在 t = 2000、无刚体环相位下标定，视作全时段常数（fBm 统计平稳）。
+        """
         import taichi as ti
 
+        # 噪声归一化：必须先于 κ 标定（κ 的吸收柱依赖归一化后的烟雾与低频调制）
+        n_r, n_phi = 256, 512
+        sbuf = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
+        lbuf = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
+        ln_r_in = math.log(self._r_in)
+        ln_r_out = math.log(self._r_out)
+
+        @ti.kernel
+        def _raw_noise(out_s: ti.template(), out_l: ti.template()):
+            for i, j in out_s:
+                lnr = ln_r_in + (ln_r_out - ln_r_in) * (ti.cast(i, ti.f32) + 0.5) / n_r
+                phi = (ti.cast(j, ti.f32) + 0.5) / n_phi * 2.0 * math.pi
+                zeta = ti.cast((i * 7 + j * 13) % 17, ti.f32) / 17.0 * 4.0 - 2.0
+                out_s[i, j] = self._eval_cloud(lnr, phi, zeta, 0.0, 0.0, 0.0)
+                out_l[i, j] = fbm_gradient(
+                    ti.cast(i, ti.f32) / 16.0,
+                    ti.cast(j, ti.f32) / n_phi * self._nphi_l,
+                    ti.cast((i * 7 + j * 13) % 17, ti.f32) / 5.0,
+                    self._nphi_l, 3, 0.5)
+
+        _raw_noise(sbuf, lbuf)
+        self._smoke_norm = max(float(sbuf.to_numpy().std()), 1e-6)
+        self._low_norm = max(float(lbuf.to_numpy().std()), 1e-6)
+
         # ⟨c⟩
-        cbuf = ti.field(dtype=ti.f32, shape=512)
+        cbuf = ti.field(dtype=ti.f32, shape=4096)  # 与参考实现 calibrate_I 同样本数
 
         @ti.kernel
         def _cmean(out: ti.template()):
@@ -720,7 +817,7 @@ class DiskV2Taichi:
                     ti.min(self._r_out, 20.0) - self._r_in - 0.5
                 )
                 phi = _hashf(i, 5, 11) * 2.0 * math.pi
-                c, tn = self._flow_I(r, phi, 0.0, 2000.0)
+                c, tn = self._flow_I(r, phi, 0.0, 0.0)
                 out[i] = c
 
         _cmean(cbuf)
@@ -739,7 +836,7 @@ class DiskV2Taichi:
                 for k in range(200):
                     z = -zmax + (ti.cast(k, ti.f32) + 0.5) / 200.0 * 2.0 * zmax
                     em_c, tf_c, ab_c, em_o, ab_o, em_s = self.density_I(
-                        r, z, phi, 2000.0, 0.0)
+                        r, z, phi, 0.0, 0.0)
                     col += (ab_c + ab_o) * 2.0 * zmax / 200.0
                 out[i] = col
 
@@ -800,8 +897,17 @@ class DiskV2Taichi:
         return c, tn
 
     @ti.func
-    def _flow_I(self, r, phi, z, t):
-        """mode 3 刚体环：两带 × 两相位混合，各带以 Ω(r_b) 刚体旋转。"""
+    def _flow_I(self, r, phi, z, t_delay):
+        """mode 3 刚体环：两带 × 两相位混合，各带以 Ω(r_b) 刚体旋转。
+
+        Args:
+            r, phi, z: 盘局部柱坐标（r_s, rad, r_s）。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（r_s/c）；采样时刻 = 帧时刻 − Δt。
+                0 表示直接使用帧时刻相位表。
+
+        Returns:
+            `(c, tn)`：主云级联值（≥ 0）与厚度扰动级联值（≥ 0）。
+        """
         r_rg = 2.0 * r
         lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
         con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
@@ -819,12 +925,9 @@ class DiskV2Taichi:
             # 用相位表查表（长视频精度）
             idx = bi - self._adv_core_f.b_lo
             if 0 <= idx < self._adv_core_f.rot.shape[0]:
-                rot = self._adv_core_f.rot[idx]
-                phi_b = self._adv_core_f.phi_b[idx]
-                phi_rigid = phi - rot - phi_b
+                phi_rigid = phi - _delayed_rot(self._adv_core_f.rot[idx], self._adv_core_f.om_b[idx], t_delay) - self._adv_core_f.phi_b[idx]
                 for p in ti.static(range(2)):
-                    fr = self._adv_core_f.frac[idx][p]
-                    cyc = self._adv_core_f.cyc[idx][p]
+                    fr, cyc = _delayed_seed(self._adv_core_f.frac[idx][p], self._adv_core_f.cyc[idx][p], self._adv_core_f.t_life[idx], t_delay)
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
@@ -836,8 +939,16 @@ class DiskV2Taichi:
     # ---- 尘埃 ----
 
     @ti.func
-    def _dust_flow(self, r, phi, z, t):
-        """尘埃噪声：与主云相同的刚体环流场，不同哈希流。"""
+    def _dust_flow(self, r, phi, z, t_delay):
+        """尘埃噪声：与主云相同的刚体环流场，不同哈希流。
+
+        Args:
+            r, phi, z: 盘局部柱坐标。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（同 `_flow_I`）。
+
+        Returns:
+            标量级联值（≥ 0），尘埃密度的结构因子。
+        """
         lnr = ti.log(r)
         fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
         b0 = ti.floor(fb)
@@ -850,12 +961,9 @@ class DiskV2Taichi:
                 wb = ti.sin(0.5 * math.pi * fbf) ** 2
             idx = bi - self._adv_dust_f.b_lo
             if 0 <= idx < self._adv_dust_f.rot.shape[0]:
-                rot = self._adv_dust_f.rot[idx]
-                phi_b = self._adv_dust_f.phi_b[idx]
-                phi_rigid = phi - rot - phi_b
+                phi_rigid = phi - _delayed_rot(self._adv_dust_f.rot[idx], self._adv_dust_f.om_b[idx], t_delay) - self._adv_dust_f.phi_b[idx]
                 for p in ti.static(range(2)):
-                    fr = self._adv_dust_f.frac[idx][p]
-                    cyc = self._adv_dust_f.cyc[idx][p]
+                    fr, cyc = _delayed_seed(self._adv_dust_f.frac[idx][p], self._adv_dust_f.cyc[idx][p], self._adv_dust_f.t_life[idx], t_delay)
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 40 + 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 41 + 2 * p) * 97.0
@@ -866,8 +974,19 @@ class DiskV2Taichi:
     # ---- 低频调制 ----
 
     @ti.func
-    def _turb_low(self, r, phi, t):
-        """大尺度低频 lognormal 调制（宽带刚体环）。"""
+    def _turb_low(self, r, phi, t_delay):
+        """大尺度低频调制场（宽带刚体环，单位方差）。
+
+        Args:
+            r, phi: 盘局部柱坐标。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（同 `_flow_I`）。
+
+        Returns:
+            标量，零均值、约单位方差；调用方以 `exp(σ_L·n − σ_L²/2)` 作 lognormal 调制。
+
+        Formula:
+            `n_L = Σ w·n / sqrt(Σ w²) / low_norm`，`low_norm` 为原始 3 八度 fBm 的实测 std。
+        """
         lnr = ti.log(r)
         fb = (lnr - ti.log(self._r_in)) / self._dln_l
         b0 = ti.floor(fb)
@@ -881,12 +1000,9 @@ class DiskV2Taichi:
                 wb = ti.sin(0.5 * math.pi * fbf) ** 2
             idx = bi - self._adv_low_f.b_lo
             if 0 <= idx < self._adv_low_f.rot.shape[0]:
-                rot = self._adv_low_f.rot[idx]
-                phi_b = self._adv_low_f.phi_b[idx]
-                phi0 = phi - rot - phi_b
+                phi0 = phi - _delayed_rot(self._adv_low_f.rot[idx], self._adv_low_f.om_b[idx], t_delay) - self._adv_low_f.phi_b[idx]
                 for p in ti.static(range(2)):
-                    fr = self._adv_low_f.frac[idx][p]
-                    cyc = self._adv_low_f.cyc[idx][p]
+                    fr, cyc = _delayed_seed(self._adv_low_f.frac[idx][p], self._adv_low_f.cyc[idx][p], self._adv_low_f.t_life[idx], t_delay)
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 7 + p) * 97.0
                     oz = _hashf(bi, cyc, 11 + p) * 97.0
@@ -896,7 +1012,7 @@ class DiskV2Taichi:
                     w = wb * wp
                     acc += w * n
                     wsq += w * w
-        return acc / ti.sqrt(ti.max(wsq, 1e-6))
+        return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._low_norm
 
     # ---- 烟雾层 ----
 
@@ -910,8 +1026,18 @@ class DiskV2Taichi:
         return fbm_gradient(x + 0.9 * wx, y, z, self._nphi_c, 5, 0.5)
 
     @ti.func
-    def _turb_pair_smoke(self, r, phi, zeta, t, loff):
-        """烟雾层刚体环（与主云共用 adv_core 表，不同噪声函数）。"""
+    def _turb_pair_smoke(self, r, phi, zeta, t_delay, loff):
+        """烟雾层刚体环噪声（与主云共用 adv_core 表，不同噪声函数，单位方差）。
+
+        Args:
+            r, phi: 盘局部柱坐标。
+            zeta: 层内竖直坐标 `(z − z_k)/σ_k`（无量纲）。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（同 `_flow_I`）。
+            loff: 层偏移（使各层噪声独立）。
+
+        Returns:
+            标量，零均值、约单位方差（除以 `smoke_norm`）。
+        """
         lnr = ti.log(r)
         fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
         b0 = ti.floor(fb)
@@ -925,12 +1051,9 @@ class DiskV2Taichi:
                 wb = ti.sin(0.5 * math.pi * fbf) ** 2
             idx = bi - self._adv_core_f.b_lo
             if 0 <= idx < self._adv_core_f.rot.shape[0]:
-                rot = self._adv_core_f.rot[idx]
-                phi_b = self._adv_core_f.phi_b[idx]
-                phi_rigid = phi - rot - phi_b
+                phi_rigid = phi - _delayed_rot(self._adv_core_f.rot[idx], self._adv_core_f.om_b[idx], t_delay) - self._adv_core_f.phi_b[idx]
                 for p in ti.static(range(2)):
-                    fr = self._adv_core_f.frac[idx][p]
-                    cyc = self._adv_core_f.cyc[idx][p]
+                    fr, cyc = _delayed_seed(self._adv_core_f.frac[idx][p], self._adv_core_f.cyc[idx][p], self._adv_core_f.t_life[idx], t_delay)
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
@@ -938,18 +1061,29 @@ class DiskV2Taichi:
                     w = wb * wp
                     acc += w * n
                     wsq += w * w
-        return acc / ti.sqrt(ti.max(wsq, 1e-6))
+        return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._smoke_norm
 
     # ---- 体积密度场 ----
 
     @ti.func
-    def density_I(self, r, z, phi, t, dir_z):
+    def density_I(self, r, z, phi, t_delay, dir_z):
         """体积密度场：返回 (核心发射, 核心温度倍率, 核心吸收, 其他发射, 其他吸收, 烟雾发射)。
 
-        核心吸收在渲染核中再乘 CORE_OPAC；"其他" = 尘埃，温度取当地 T(r)；
-        SMOKE_TR > 0 时烟雾发射单列，温度取 SMOKE_TR·T(r)。
+        核心发射与核心吸收在渲染核中**同时**再乘 CORE_OPAC（源函数不变）；
+        "其他" = 尘埃，温度取当地 T(r)；烟雾发射单列，温度取 SMOKE_TR·T(r)。
         PHYS_STRUCT = 1：SS 外区 H(r)、Σ(r) + 竖直高斯。
+
+        Args:
+            r, z, phi: 盘局部柱坐标（r_s, r_s, rad）。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（r_s/c）；采样时刻 = 帧时刻 − Δt，
+                标定与无光行时间渲染时传 0。
+            dir_z: 光线方向 z 分量（保留接口，当前 DUST_KEPLER 路径不使用）。
+
+        Returns:
+            6 元组标量：`em_c ≥ 0`、`tf_c ∈ [0.7, 1.3·GREY_CAP]`、`ab_c ≥ 0`、
+            `em_o ≥ 0`、`ab_o ≥ 0`（烟雾 + 尘埃）、`em_s ≥ 0`；盘外为 `(0, 1, 0, 0, 0, 0)`。
         """
+        t = t_delay
         em = 0.0
         ab = 0.0
         em_c = 0.0
@@ -972,7 +1106,7 @@ class DiskV2Taichi:
             az = ti.abs(z)
             # 烟雾层
             if ti.static(self._smoke_on):
-                if az < self._cl_spacing * (self._n_cl_half + 3) * r:
+                if az < self._cl_extent * r:
                     for kk in range(2 * self._n_cl_half + 1):
                         kf = ti.cast(kk - self._n_cl_half, ti.f32)
                         dz = (z - kf * self._cl_spacing * r) / (self._cl_width * r)
