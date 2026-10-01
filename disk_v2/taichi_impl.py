@@ -20,7 +20,6 @@
 - 黑体色度 / 亮度与 NumPy 实现共用同一份 CIE 查找表（palette.BB_LUT / LNY_LUT）。
 """
 
-from __future__ import annotations
 
 import math
 from dataclasses import dataclass
@@ -30,6 +29,7 @@ import numpy as np
 import taichi as ti
 
 from .palette import (
+    _blackbody_luminance_exact,
     BB_LUT,
     LNY_LUT,
     _BB_LUT_N,
@@ -39,7 +39,14 @@ from .palette import (
     _LNY_T_MIN_K,
     white_balance_gain,
 )
-from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams
+from .advection import RigidRingBands, make_fields, upload as adv_upload
+from .noise_ti import cascade, fbm_gradient, gnoise, hashf as _hashf, softplus
+from .params import (
+    DiskV2PaletteParams,
+    DiskV2Params,
+    DiskV2StructureParams,
+    DiskV2VolumeParams,
+)
 from .structure_modulations import (
     _ClumpCenters,
     _sample_clump_centers,
@@ -451,6 +458,7 @@ class DiskV2Taichi:
         emission_opacity_scale: float = 1.0,
         seed: int = 42,
         centers: Optional[_ClumpCenters] = None,
+        volume_params: Optional[DiskV2VolumeParams] = None,
     ) -> None:
         self.params = params
         self.structure_params = structure_params
@@ -562,6 +570,11 @@ class DiskV2Taichi:
             max(np.percentile(np.abs(hotspot_probe - 1.0), 99) / max(structure_params.hotspot_strength, 1e-6), 1e-3)
         )
 
+        # --- 体积密度场（v2.3 S5，对应参考实现预设 M）---
+        self.volume_params = volume_params
+        if volume_params is not None:
+            self._init_volume_params(volume_params)
+
         # --- 视觉 atlas（V1 云雾预烘焙） ---
         self._use_visual_atlas = bool(structure_params.use_visual_atlas)
         if self._use_visual_atlas:
@@ -589,6 +602,426 @@ class DiskV2Taichi:
             self._density_atlas = ti.field(dtype=ti.f32, shape=(1, 1))
             self._emission_atlas.from_numpy(np.ones((1, 1), dtype=np.float32))
             self._density_atlas.from_numpy(np.ones((1, 1), dtype=np.float32))
+
+
+
+    def _init_volume_params(self, vp: DiskV2VolumeParams) -> None:
+        """把 DiskV2VolumeParams 平铺为 self._xxx（Taichi @ti.func 限制）+ 标定。"""
+        import taichi as ti
+
+        # SS 结构
+        self._hr_ref = float(vp.hr_ref)
+        self._r_ref_vol = float(vp.r_ref)
+        self._f_ref_ss = 1.0 - math.sqrt(self._r_in / self._r_ref_vol)
+        self._surf_noise = float(vp.surf_noise)
+        # 灰大气
+        self._grey_mix = float(vp.grey_mix)
+        self._grey_cap = float(vp.grey_cap)
+        self._core_opac = float(vp.core_opac)
+        self._core_floor = float(vp.core_floor)
+        self._dt_i = float(vp.dt_i)
+        self._surf_lo = float(vp.surf_lo)
+        self._surf_k = float(vp.surf_k)
+        # 烟雾
+        self._smoke_i = float(vp.smoke_i)
+        self._smoke_tr = float(vp.smoke_tr)
+        self._smoke_s = float(vp.smoke_s)
+        self._n_cl_half = int(vp.n_cl_half)
+        self._cl_spacing = float(vp.cl_spacing)
+        self._cl_width = float(vp.cl_width)
+        self._cl_decay = float(vp.cl_decay)
+        self._cl_amp_norm = 1.0 / sum(
+            math.exp(-self._cl_decay * abs(k)) for k in range(-self._n_cl_half, self._n_cl_half + 1)
+        )
+        self._fr_c = float(vp.fr_c)
+        self._nphi_c = int(vp.nphi_c)
+        self._fz_c = float(vp.fz_c)
+        self._sigma_c = float(vp.sigma_c)
+        self._cloud_c0 = float(vp.cloud_c0)
+        self._cloud_soft = float(vp.cloud_soft)
+        self._smoke_on = self._smoke_i > 0.0
+        # 低频
+        self._lowf_sigma = float(vp.lowf_sigma)
+        self._fr_l = float(vp.fr_l)
+        self._nphi_l = int(vp.nphi_l)
+        self._dln_l = float(vp.dln_l)
+        self._k_rigid_l = float(vp.k_rigid_l)
+        # 主云
+        self._kr_i = float(vp.kr_i)
+        self._nphi_i = int(vp.nphi_i)
+        self._l0_i = float(vp.l0_i)
+        self._con_i = float(vp.con_i)
+        self._kt_i = float(vp.kt_i)
+        self._nphi_t = int(vp.nphi_t)
+        self._lt0_i = float(vp.lt0_i)
+        # 尘埃
+        self._dust_em = float(vp.dust_em)
+        self._dust_s = float(vp.dust_s)
+        self._dust_on = bool(vp.dust_on)
+        self._dust_kepler = bool(vp.dust_kepler)
+        # 刚体环
+        self._dln_r = float(vp.dln_r)
+        self._k_rigid_vol = float(vp.k_rigid)
+        self._lnr0_r = math.log(self._r_in) - 2 * self._dln_r
+
+        # 刚体环平流表（核心 / 尘埃 / 低频各一套；尘埃与低频用不同哈希流）
+        self._adv_core = RigidRingBands(self._r_in, self._r_out, self._dln_r, self._k_rigid_vol)
+        self._adv_core_f = make_fields(self._adv_core)
+        self._adv_dust = RigidRingBands(
+            self._r_in, self._r_out, self._dln_r, self._k_rigid_vol,
+            phi_b_hash=(23, 7), ph0_hash=(19, 3),
+        )
+        self._adv_dust_f = make_fields(self._adv_dust)
+        # 低频层用宽带
+        self._adv_low = RigidRingBands(
+            self._r_in, self._r_out, self._dln_l, self._k_rigid_l,
+            phi_b_hash=(23, 1), ph0_hash=(29, 5),
+        )
+        self._adv_low_f = make_fields(self._adv_low)
+
+        # Page–Thorne 温度 LUT
+        self._pt_lut = ti.field(dtype=ti.f32, shape=_BB_LUT_N)
+        from .physical_fields import build_page_thorne_lut
+        build_page_thorne_lut(self._pt_lut, self._r_in, self._r_out, _BB_LUT_N)
+
+        # T_peak（第 1 层：M、Mdot 推出）
+        if vp.t_peak_override_K > 0:
+            self._t_peak_vol = float(vp.t_peak_override_K)
+        else:
+            from .physical_fields import derive_t_peak
+            self._t_peak_vol = derive_t_peak(vp.bh_mass_msun, vp.mdot_edd)
+        # ln Y(T_peak)（Y(g·T)/Y(T_peak) 用）
+        self._ln_y_peak = math.log(
+            max(_blackbody_luminance_exact(self._t_peak_vol), 1e-300)
+        )
+
+        # κ 预设 1.0（density_I 的灰大气 tau_z 在标定期间引用 κ）
+        self._kappa_vol = 1.0
+        # 上传标定时刻的平流相位表（density_I / _flow_I 查表需要）
+        self.update_advection(2000.0)
+        # 噪声标定（⟨c⟩ 与 κ）
+        self._calibrate_volume()
+
+        # 光行时间 / 静止观者相机
+        self._light_delay = bool(vp.light_delay)
+        self._static_cam = bool(vp.static_cam)
+
+    def _calibrate_volume(self) -> None:
+        """标定 ⟨c⟩（主云级联均值）与 κ（吸收系数，使 r ≈ 6 处 face-on τ = TAU_I）。"""
+        import taichi as ti
+
+        # ⟨c⟩
+        cbuf = ti.field(dtype=ti.f32, shape=512)
+
+        @ti.kernel
+        def _cmean(out: ti.template()):
+            for i in out:
+                r = self._r_in + 0.5 + _hashf(i, 3, 7) * (
+                    ti.min(self._r_out, 20.0) - self._r_in - 0.5
+                )
+                phi = _hashf(i, 5, 11) * 2.0 * math.pi
+                c, tn = self._flow_I(r, phi, 0.0, 2000.0)
+                out[i] = c
+
+        _cmean(cbuf)
+        self._c_mean = max(float(cbuf.to_numpy().mean()), 1e-6)
+
+        # κ
+        kbuf = ti.field(dtype=ti.f32, shape=256)
+
+        @ti.kernel
+        def _column(out: ti.template()):
+            for i in out:
+                r = 5.5 + ti.cast(i % 16, ti.f32) / 16.0
+                phi = ti.cast(i, ti.f32) * 0.61803 * 2.0 * math.pi
+                zmax = 3.0 * self._ss_half_thickness(r) + 0.01
+                col = 0.0
+                for k in range(200):
+                    z = -zmax + (ti.cast(k, ti.f32) + 0.5) / 200.0 * 2.0 * zmax
+                    em_c, tf_c, ab_c, em_o, ab_o, em_s = self.density_I(
+                        r, z, phi, 2000.0, 0.0)
+                    col += (ab_c + ab_o) * 2.0 * zmax / 200.0
+                out[i] = col
+
+        _column(kbuf)
+        col_mean = max(float(kbuf.to_numpy().mean()), 1e-12)
+        self._kappa_vol = self.volume_params.tau_i / col_mean
+        print(f"[S5] ⟨c⟩ = {self._c_mean:.3g}，吸收柱均值 = {col_mean:.4g} → κ = {self._kappa_vol:.4g}")
+
+    def update_advection(self, t: float) -> None:
+        """每帧上传刚体环相位表（核心 / 尘埃 / 低频）。"""
+        adv_upload(self._adv_core_f, self._adv_core.phase_table(t))
+        adv_upload(self._adv_dust_f, self._adv_dust.phase_table(t))
+        adv_upload(self._adv_low_f, self._adv_low.phase_table(t))
+
+    # ---- SS 结构 ----
+
+    @ti.func
+    def _ss_half_thickness(self, r):
+        """SS 外区标高 H = HR_REF·r·(r/r_ref)^{1/8}·(f/f_ref)^{3/20}。"""
+        fr = ti.max(1.0 - ti.sqrt(self._r_in / ti.max(r, self._r_in)), 1e-6)
+        return self._hr_ref * r * ti.pow(r / self._r_ref_vol, 0.125) * ti.pow(fr / self._f_ref_ss, 0.15)
+
+    @ti.func
+    def _ss_surface_density(self, r):
+        """SS 外区柱密度 Σ ∝ (r/r_ref)^{-3/4}·(f/f_ref)^{7/10}·外缘截断。"""
+        fr = ti.max(1.0 - ti.sqrt(self._r_in / ti.max(r, self._r_in)), 1e-6)
+        outer = 1.0 - _ti_smoothstep(0.72 * self._r_out, self._r_out, r)
+        return ti.pow(r / self._r_ref_vol, -0.75) * ti.pow(fr / self._f_ref_ss, 0.7) * outer
+
+    @ti.func
+    def _erfc_pos(self, x):
+        """erfc(x)，x ≥ 0（A&S 7.1.26，误差 < 1.5e-7）。"""
+        t = 1.0 / (1.0 + 0.3275911 * x)
+        y = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))))
+        return y * ti.exp(-x * x)
+
+    @ti.func
+    def _page_thorne_temperature(self, r):
+        """Page–Thorne 相对论温度 T(r)（查表，log r 线性插值）。"""
+        u = (ti.log(ti.min(ti.max(r, self._r_in), self._r_out)) - ti.log(self._r_in)) / (
+            ti.log(self._r_out) - ti.log(self._r_in)
+        )
+        f = u * (_BB_LUT_N - 1)
+        i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+        w = f - ti.cast(i0, ti.f32)
+        return self._t_peak_vol * (self._pt_lut[i0] * (1.0 - w) + self._pt_lut[i0 + 1] * w)
+
+    # ---- 主云流动噪声 ----
+
+    @ti.func
+    def _flow_noise_core(self, ru, th, z, ox, oz, lev_cut, con):
+        """主云 + 厚度扰动两路级联。"""
+        c = cascade(self._kr_i * ru + ox, th / (2.0 * math.pi) * self._nphi_i,
+                    self._kr_i * z + oz, self._nphi_i,
+                    self._l0_i - lev_cut, self._l0_i + 2.0 - lev_cut, con)
+        tn = cascade(self._kt_i * ru + ox + 17.0, th / (2.0 * math.pi) * self._nphi_t,
+                     oz + 5.0, self._nphi_t, self._lt0_i, self._lt0_i + 2.0, self._con_i)
+        return c, tn
+
+    @ti.func
+    def _flow_I(self, r, phi, z, t):
+        """mode 3 刚体环：两带 × 两相位混合，各带以 Ω(r_b) 刚体旋转。"""
+        r_rg = 2.0 * r
+        lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
+        con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
+        lnr = ti.log(r)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        c = 0.0
+        tn = 0.0
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            # 用相位表查表（长视频精度）
+            idx = bi - self._adv_core_f.b_lo
+            if 0 <= idx < self._adv_core_f.rot.shape[0]:
+                rot = self._adv_core_f.rot[idx]
+                phi_b = self._adv_core_f.phi_b[idx]
+                phi_rigid = phi - rot - phi_b
+                for p in ti.static(range(2)):
+                    fr = self._adv_core_f.frac[idx][p]
+                    cyc = self._adv_core_f.cyc[idx][p]
+                    wp = ti.sin(math.pi * fr) ** 2
+                    ox = _hashf(bi, cyc, 2 * p) * 97.0
+                    oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
+                    cc, tt = self._flow_noise_core(r, phi_rigid, z, ox, oz, lev_cut, con)
+                    c += wb * wp * cc
+                    tn += wb * wp * tt
+        return c, tn
+
+    # ---- 尘埃 ----
+
+    @ti.func
+    def _dust_flow(self, r, phi, z, t):
+        """尘埃噪声：与主云相同的刚体环流场，不同哈希流。"""
+        lnr = ti.log(r)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        out = 0.0
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            idx = bi - self._adv_dust_f.b_lo
+            if 0 <= idx < self._adv_dust_f.rot.shape[0]:
+                rot = self._adv_dust_f.rot[idx]
+                phi_b = self._adv_dust_f.phi_b[idx]
+                phi_rigid = phi - rot - phi_b
+                for p in ti.static(range(2)):
+                    fr = self._adv_dust_f.frac[idx][p]
+                    cyc = self._adv_dust_f.cyc[idx][p]
+                    wp = ti.sin(math.pi * fr) ** 2
+                    ox = _hashf(bi, cyc, 40 + 2 * p) * 97.0
+                    oz = _hashf(bi, cyc, 41 + 2 * p) * 97.0
+                    out += wb * wp * cascade(
+                        2.0 * r + ox, phi_rigid / (2.0 * math.pi) * 9.0, 2.0 * z + oz, 9, 0.0, 6.0, 80.0)
+        return out
+
+    # ---- 低频调制 ----
+
+    @ti.func
+    def _turb_low(self, r, phi, t):
+        """大尺度低频 lognormal 调制（宽带刚体环）。"""
+        lnr = ti.log(r)
+        fb = (lnr - ti.log(self._r_in)) / self._dln_l
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        acc = 0.0
+        wsq = 0.0
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            idx = bi - self._adv_low_f.b_lo
+            if 0 <= idx < self._adv_low_f.rot.shape[0]:
+                rot = self._adv_low_f.rot[idx]
+                phi_b = self._adv_low_f.phi_b[idx]
+                phi0 = phi - rot - phi_b
+                for p in ti.static(range(2)):
+                    fr = self._adv_low_f.frac[idx][p]
+                    cyc = self._adv_low_f.cyc[idx][p]
+                    wp = ti.sin(math.pi * fr) ** 2
+                    ox = _hashf(bi, cyc, 7 + p) * 97.0
+                    oz = _hashf(bi, cyc, 11 + p) * 97.0
+                    n = fbm_gradient(lnr * self._fr_l + ox,
+                                     phi0 / (2.0 * math.pi) * self._nphi_l,
+                                     oz, self._nphi_l, 3, 0.5)
+                    w = wb * wp
+                    acc += w * n
+                    wsq += w * w
+        return acc / ti.sqrt(ti.max(wsq, 1e-6))
+
+    # ---- 烟雾层 ----
+
+    @ti.func
+    def _eval_cloud(self, lnr, phi0, zeta, ox, oz, layer_off):
+        """烟雾层 fBm（域扭曲），φ 周期 NPHI_C。"""
+        x = lnr * self._fr_c + ox + 57.3 + layer_off
+        y = phi0 / (2.0 * math.pi) * self._nphi_c
+        z = zeta * self._fz_c + oz + 41.9 + 0.37 * layer_off
+        wx = gnoise(x * 0.37 + 2.1, y * 0.5, z * 0.5 + 1.3, self._nphi_c // 2)
+        return fbm_gradient(x + 0.9 * wx, y, z, self._nphi_c, 5, 0.5)
+
+    @ti.func
+    def _turb_pair_smoke(self, r, phi, zeta, t, loff):
+        """烟雾层刚体环（与主云共用 adv_core 表，不同噪声函数）。"""
+        lnr = ti.log(r)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        acc = 0.0
+        wsq = 0.0
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            idx = bi - self._adv_core_f.b_lo
+            if 0 <= idx < self._adv_core_f.rot.shape[0]:
+                rot = self._adv_core_f.rot[idx]
+                phi_b = self._adv_core_f.phi_b[idx]
+                phi_rigid = phi - rot - phi_b
+                for p in ti.static(range(2)):
+                    fr = self._adv_core_f.frac[idx][p]
+                    cyc = self._adv_core_f.cyc[idx][p]
+                    wp = ti.sin(math.pi * fr) ** 2
+                    ox = _hashf(bi, cyc, 2 * p) * 97.0
+                    oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
+                    n = self._eval_cloud(lnr, phi_rigid, zeta, ox, oz, loff)
+                    w = wb * wp
+                    acc += w * n
+                    wsq += w * w
+        return acc / ti.sqrt(ti.max(wsq, 1e-6))
+
+    # ---- 体积密度场 ----
+
+    @ti.func
+    def density_I(self, r, z, phi, t, dir_z):
+        """体积密度场：返回 (核心发射, 核心温度倍率, 核心吸收, 其他发射, 其他吸收, 烟雾发射)。
+
+        核心吸收在渲染核中再乘 CORE_OPAC；"其他" = 尘埃，温度取当地 T(r)；
+        SMOKE_TR > 0 时烟雾发射单列，温度取 SMOKE_TR·T(r)。
+        PHYS_STRUCT = 1：SS 外区 H(r)、Σ(r) + 竖直高斯。
+        """
+        em = 0.0
+        ab = 0.0
+        em_c = 0.0
+        em_s = 0.0
+        ab_c_out = 0.0
+        tf_c = 1.0
+        if r > self._r_in and r < self._r_out:
+            # SS 结构
+            h_geo = self._ss_half_thickness(r)
+            h_cap = h_geo
+            sig = self._ss_surface_density(r)
+            zc = 3.0 * h_cap
+            # 大尺度低频
+            if ti.static(True):
+                nl = self._turb_low(r, phi, t)
+                sig *= ti.exp(self._lowf_sigma * nl - 0.5 * self._lowf_sigma * self._lowf_sigma)
+            # 尘埃竖直包络
+            xi = (r - self._r_in) / ti.min(self._r_out - self._r_in, 6.0)
+            dust_bound = h_geo * ti.max(0.0, 1.0 - 5.0 * xi * xi)
+            az = ti.abs(z)
+            # 烟雾层
+            if ti.static(self._smoke_on):
+                if az < self._cl_spacing * (self._n_cl_half + 3) * r:
+                    for kk in range(2 * self._n_cl_half + 1):
+                        kf = ti.cast(kk - self._n_cl_half, ti.f32)
+                        dz = (z - kf * self._cl_spacing * r) / (self._cl_width * r)
+                        if ti.abs(dz) < 3.0:
+                            amp = self._cl_amp_norm * ti.exp(-self._cl_decay * ti.abs(kf))
+                            rho_c = self._smoke_i * sig * amp * ti.exp(-0.5 * dz * dz) / (
+                                2.5066283 * self._cl_width * r)
+                            nc = self._turb_pair_smoke(r, phi, dz, t, 131.7 * ti.cast(kk + 1, ti.f32))
+                            cov = 1.0 / (1.0 + ti.exp(-(nc - self._cloud_c0) / self._cloud_soft))
+                            ab_sm = rho_c * ti.exp(
+                                self._sigma_c * nc - 0.5 * self._sigma_c * self._sigma_c) * cov
+                            ab += ab_sm
+                            if ti.static(True):
+                                em_s += ab_sm
+            # 核心
+            if az < ti.max(zc, dust_bound):
+                if az < zc:
+                    c, tn = self._flow_I(r, phi, z, t)
+                    softsat = 1.0 - 1.0 / (ti.max(tn, 0.0) + 1.0)
+                    h_s = ti.max(h_cap * (1.0 - self._surf_noise + self._surf_noise * softsat), 1e-6)
+                    zs = 3.0 * h_s
+                    if az < zs:
+                        # 等温静力平衡：ρ = Σ/(√(2π)·H_s)·exp(-z²/2H_s²)
+                        rho_s = sig * ti.exp(-0.5 * (az / h_s) ** 2) / (2.5066283 * h_s)
+                        # 温和密度起伏
+                        cfac = self._core_floor + (1.0 - self._core_floor) * c / self._c_mean
+                        ab_b = cfac * rho_s
+                        ab_c_out = ab_b
+                        em_c = ab_b * (self._surf_lo + self._surf_k * az / h_s)
+                        # 灰大气温度倍率
+                        if ti.static(True):
+                            tau_z = self._kappa_vol * self._core_opac * cfac * sig * 0.5 * self._erfc_pos(
+                                az / (1.4142136 * h_s))
+                            tf_c = 1.0 + self._grey_mix * (
+                                ti.min(ti.pow(0.75 * (tau_z + 2.0 / 3.0), 0.25), self._grey_cap) - 1.0)
+                        # 温度起伏
+                        if ti.static(True):
+                            tf_c *= ti.min(ti.max(
+                                1.0 + self._dt_i * (c / self._c_mean - 1.0), 0.7), 1.3)
+            # 尘埃
+            if ti.static(self._dust_on):
+                if az < dust_bound:
+                    di = ti.max(1.0 - (z / ti.max(dust_bound, 1e-6)) ** 2, 0.0)
+                    if ti.static(self._dust_kepler):
+                        dn = self._dust_flow(r, phi, z, t)
+                        ab_d = self._dust_em * di * dn
+                        ab += ab_d
+                        em += ab_d * self._dust_s
+        return em_c, tf_c, ab_c_out, em, ab, em_s
 
     @ti.func
     def _sample_atlas_field(self, atlas_field, r, phi):

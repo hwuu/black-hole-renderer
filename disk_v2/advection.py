@@ -112,6 +112,10 @@ class RigidRingBands:
     r_out: float
     dln: float
     k_rigid: float
+    phi_b_hash: tuple = (17, 1)
+    """φ_b 随机偏移的哈希流 `(b, c)`（区分使用同一带网格的不同结构层）。"""
+    ph0_hash: tuple = (13, 5)
+    """种子相位 ph0 的哈希流 `(b, c)`。"""
 
     def __post_init__(self) -> None:
         lnr0 = math.log(self.r_in) - 2.0 * self.dln
@@ -127,9 +131,9 @@ class RigidRingBands:
         object.__setattr__(self, "om_b", om_b)
         object.__setattr__(self, "t_life", self.k_rigid * 2.0 * math.pi / om_b)
         object.__setattr__(self, "phi_b", np.array(
-            [_hashf_py(int(b), 17, 1) * 2.0 * math.pi for b in bs]))
+            [_hashf_py(int(b), *self.phi_b_hash) * 2.0 * math.pi for b in bs]))
         object.__setattr__(self, "ph0", np.array(
-            [_hashf_py(int(b), 13, 5) for b in bs]))
+            [_hashf_py(int(b), *self.ph0_hash) for b in bs]))
 
     @property
     def n_bands(self) -> int:

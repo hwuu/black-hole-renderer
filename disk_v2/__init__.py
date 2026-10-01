@@ -31,6 +31,7 @@ from .params import (
     DiskV2PaletteParams,
     DiskV2Params,
     DiskV2StructureParams,
+    DiskV2VolumeParams,
 )
 from .palette import (
     apply_exposure,
@@ -63,6 +64,7 @@ __all__ = [
     "DiskV2PaletteParams",
     "DiskV2Params",
     "DiskV2StructureParams",
+    "DiskV2VolumeParams",
     "disk_half_thickness",
     "disk_radial_mask",
     "disk_radial_weight",
