@@ -35,6 +35,7 @@ import taichi as ti
 
 from .camera import build_camera_v1_compatible
 from .imaging import reference_exposure
+from .postfx import postfx
 from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams, DiskV2VolumeParams
 from .stats import RenderStats, compute_render_stats, hdr_luminance
 from .structure_modulations import _ClumpCenters
@@ -103,6 +104,7 @@ class DiskV2Renderer:
         device: str = "cpu",
         ignore_taichi_cache: bool = False,
         volume_params: Optional[DiskV2VolumeParams] = None,
+        use_postfx: bool = False,
     ) -> None:
         """初始化 V2 渲染器。
 
@@ -169,6 +171,7 @@ class DiskV2Renderer:
 
         # 把基础场和 palette 包装为 Taichi 句柄。
         self.volume_params = volume_params
+        self.use_postfx = use_postfx
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
@@ -909,6 +912,34 @@ class DiskV2Renderer:
         if self.volume_params is not None:
             self.disk_ti.update_advection(2000.0)
         self._ray_march_kernel()
+
+        if self.use_postfx and self.volume_params is not None:
+            # S7: NumPy 后处理链（WB + bloom + 色散 + ACES + sRGB）
+            disk_hdr = self.disk_hdr_field.to_numpy()  # (W, H, 3)
+            disk_alpha = self.disk_alpha_field.to_numpy()  # (W, H)
+            sky_hdr = self.sky_hdr_field.to_numpy()  # (W, H, 3)
+            # 转置到 (H, W, 3)
+            disk_hdr = np.transpose(disk_hdr, (1, 0, 2))
+            disk_alpha = np.transpose(disk_alpha, (1, 0))
+            sky_hdr = np.transpose(sky_hdr, (1, 0, 2))
+            # 合成：disk * alpha + sky * (1 - alpha)
+            a = disk_alpha[..., None]
+            hdr_total = disk_hdr * a + sky_hdr * (1 - a)
+            # 曝光
+            if self.auto_exposure:
+                from .stats import hdr_luminance
+                lum = hdr_luminance(disk_hdr).ravel()
+                lum = lum[lum > 1e-10]
+                if lum.size > 0:
+                    wp = max(float(np.percentile(lum, self.white_point_percentile)), 1e-12)
+                else:
+                    wp = 1.0
+                exposure = 1.0 / wp
+            else:
+                exposure = 1.0
+            img = postfx(hdr_total, exposure=exposure)
+            self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
+            return img.astype(np.float32) / 255.0
 
         # stats / white_point 只看 disk_hdr_field（不含 sky）
         disk_hdr_for_stats = self.disk_hdr_field.to_numpy()
