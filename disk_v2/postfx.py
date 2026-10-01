@@ -71,6 +71,55 @@ def apply_white_balance(
     return hdr * white_balance_gain(white_balance_K)[None, None, :]
 
 
+def compute_auto_wb_gain(
+    hdr: np.ndarray,
+    alpha: np.ndarray | None = None,
+    percentile: float = 99.0,
+    warm_bias: float = 0.0,
+) -> np.ndarray:
+    """从 HDR 自动估计 von Kries 白平衡增益。
+
+    取盘区（或全图）亮度前 `percentile`% 的像素，计算平均色度，
+    返回使该色度呈精确中性的增益（BT.709 亮度不变）。
+
+    Args:
+        hdr: `(H, W, 3)` 线性 HDR RGB。
+        alpha: 可选 `(H, W)` 盘区不透明度 mask（> 0.1 视为盘区）。
+        percentile: 亮度分位数（只取最亮的前 x% 像素做色度参考）。
+        warm_bias: 暖色偏移 `[0, 1]`。0 = 完全中性；> 0 让白点偏暖
+            （R 增益 × (1+bias)、B 增益 × (1−bias)，模拟"Interstellar 金色"）。
+
+    Returns:
+        `(3,)` von Kries 增益（BT.709 亮度不变）。
+    """
+    w = np.array([0.2126, 0.7152, 0.0722])
+    lum = hdr @ w
+    mask = lum > 1e-10
+    if alpha is not None:
+        mask &= alpha > 0.1
+    if not mask.any():
+        return np.ones(3)
+    v = lum[mask]
+    if v.size < 10:
+        return np.ones(3)
+    bright = lum >= np.percentile(v, percentile)
+    m = mask & bright
+    if not m.any():
+        m = mask
+    mean_rgb = hdr[m].mean(0)
+    lum_mean = float(mean_rgb @ w)
+    if lum_mean < 1e-10:
+        return np.ones(3)
+    # 归一化到亮度=1（与 blackbody_color 同约定）
+    c = mean_rgb / lum_mean
+    gain = 1.0 / np.maximum(c, 1e-3)
+    # 暖色偏移：R 增益提高、B 增益降低（保持亮度不变的重归一）
+    if warm_bias > 0:
+        gain = gain * np.array([1.0 + warm_bias, 1.0, 1.0 - warm_bias])
+    # BT.709 亮度不变归一
+    return gain * lum_mean / float(gain @ mean_rgb)
+
+
 # ---------------------------------------------------------------------------
 # 2. 高光 bloom（轴向色散）
 # ---------------------------------------------------------------------------
@@ -214,6 +263,25 @@ def tonemap_chroma_aces(
 
 
 # ---------------------------------------------------------------------------
+# 5.5 饱和度调整（ACES 后、sRGB 前）
+# ---------------------------------------------------------------------------
+def adjust_saturation(rgb: np.ndarray, saturation: float = 1.0) -> np.ndarray:
+    """调整色彩饱和度（围绕 BT.709 亮度）。
+
+    Args:
+        rgb: `(H, W, 3)` RGB，`[0, 1]` 线性。
+        saturation: 1.0 = 不变；< 1 降饱和（→金色/中性）；> 1 增饱和。
+
+    Returns:
+        调整后的 RGB，`[0, 1]`。
+    """
+    if saturation == 1.0:
+        return rgb
+    lum = rgb @ np.array([0.2126, 0.7152, 0.0722])
+    return np.clip(lum[..., None] + saturation * (rgb - lum[..., None]), 0.0, 1.0)
+
+
+# ---------------------------------------------------------------------------
 # 6. sRGB 编码
 # ---------------------------------------------------------------------------
 def srgb_encode(x: np.ndarray) -> np.ndarray:
@@ -247,12 +315,15 @@ def postfx_params_defaults() -> dict:
         "fringe_color": (0.3, 0.45, 1.0),
         "lateral_ca": 0.0025,
         "white_blend": 0.12,
+    "saturation": 1.0,
     }
 
 
 def postfx(
     hdr: np.ndarray,
     exposure: float = 1.0,
+    auto_wb: bool = False,
+    auto_wb_warm_bias: float = 0.0,
     **params,
 ) -> np.ndarray:
     """完整后处理链：曝光 → WB → bloom → 镶边 → 色散 → ACES → sRGB。
@@ -260,6 +331,8 @@ def postfx(
     Args:
         hdr: `(H, W, 3)` 线性 HDR RGB。
         exposure: 曝光缩放。
+        auto_wb: True 时从 HDR 自动估计白平衡（忽略 `white_balance_K`）。
+        auto_wb_warm_bias: 自动 WB 的暖色偏移 `[0, 1]`（0 = 中性；0.1 ≈ Interstellar 金）。
         **params: 覆盖 `postfx_params_defaults` 中的参数。
 
     Returns:
@@ -267,10 +340,15 @@ def postfx(
     """
     p = {**postfx_params_defaults(), **params}
     x = hdr * exposure
-    x = apply_white_balance(x, p["white_balance_K"])
+    if auto_wb:
+        gain = compute_auto_wb_gain(x, percentile=99.0, warm_bias=auto_wb_warm_bias)
+        x = x * gain[None, None, :]
+    else:
+        x = apply_white_balance(x, p["white_balance_K"])
     x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"])
     x = apply_fringe(x, p["fringe_strength"], p["fringe_threshold"], p["fringe_color"])
     x = apply_lateral_ca(x, p["lateral_ca"])
     x = tonemap_chroma_aces(x, p["white_blend"])
+    x = adjust_saturation(x, p["saturation"])
     x = srgb_encode(x)
     return (np.clip(x, 0, 1) * 255 + 0.5).astype(np.uint8)

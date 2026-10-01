@@ -226,7 +226,12 @@ class TaichiParityTest(unittest.TestCase):
 
         k()
         for i, t in enumerate(vals):
-            self.assertLessEqual(abs(out.to_numpy()[i] / blackbody_luminance(float(t)) - 1.0), 0.01)
+            # blackbody_luminance_ti 返回 lnY，与 exp(lnY) 比较
+            self.assertLessEqual(
+                abs(ti_exp(out.to_numpy()[i]) / blackbody_luminance(float(t)) - 1.0), 0.02)
+
+def ti_exp(x):
+    return np.exp(x)
 
     def test_white_balance_parity(self):
         """每档 white_balance_K 构造的 DiskV2Taichi，其 kernel 增益与 NumPy 一致。

@@ -105,6 +105,8 @@ class DiskV2Renderer:
         ignore_taichi_cache: bool = False,
         volume_params: Optional[DiskV2VolumeParams] = None,
         use_postfx: bool = False,
+        doppler_lum: float = 0.55,
+        doppler_color: float = 1.5,
     ) -> None:
         """初始化 V2 渲染器。
 
@@ -172,6 +174,8 @@ class DiskV2Renderer:
         # 把基础场和 palette 包装为 Taichi 句柄。
         self.volume_params = volume_params
         self.use_postfx = use_postfx
+        self.doppler_lum = doppler_lum
+        self.doppler_color = doppler_color
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
@@ -398,22 +402,23 @@ class DiskV2Renderer:
                                     if ti.static(enable_g):
                                         g_phys = disk_g_factor_ti(
                                             ti.Vector([_sl[0], _sl[1], z_local]), dm, cp.norm(), rs)
-                                    g_lum = ti.pow(ti.max(g_phys, 0.1), lum_power * 0.25)
+                                    g_lum = ti.pow(ti.max(g_phys, 0.1), self.doppler_lum)
+                                    g_col = ti.pow(ti.max(g_phys, 0.1), self.doppler_color)
                                     T_K = disk._page_thorne_temperature(r_local)
                                     # 核心：Y(g·T·tf_c)·χ(g·T·tf_c)
                                     Tc = T_K * tf_c
-                                    src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Tc * g_phys)
+                                    src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Tc * g_col)
                                     # 其他（尘埃）：Y(g·T)·χ(g·T)
-                                    src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(T_K * g_phys)
+                                    src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(T_K * g_col)
                                     # 烟雾：T_smoke = SMOKE_TR·T
                                     src_s = src_o
                                     if disk._smoke_tr > 0:
                                         Ts = T_K * disk._smoke_tr
-                                        src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Ts * g_phys)
+                                        src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Ts * g_col)
                                     # 发射-吸收积分（与参考实现同款：T · j · ds）
                                     j_total = em_c * src_c + em_o * src_o + em_s * src_s
                                     j_total *= emission_scale
-                                    alpha_coeff = opacity_scale * (ab_o + disk._core_opac * ab_c)
+                                    alpha_coeff = disk._kappa_vol * opacity_scale * (ab_o + disk._core_opac * ab_c)
                                     alpha_seg = alpha_coeff * ds
                                     # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
                                     if alpha_coeff > 1e-30:

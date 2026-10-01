@@ -1323,13 +1323,19 @@ class DiskV2Taichi:
 
     @ti.func
     def blackbody_luminance_ti(self, T_K):
-        """温度 → 黑体可见光亮度 `Y(T)`（查 `palette.LNY_LUT`，与 NumPy parity）。
+        """温度 → 黑体可见光亮度的对数 `ln Y(T)`（查 `palette.LNY_LUT`）。
 
         Args:
             T_K: 温度（K）。
 
         Returns:
-            `Y(T)` ≥ 0；`T_K ≤ 0` 返回 0。频移后的观测亮度即 `Y(g·T)`。
+            `ln Y(T)`；`T_K ≤ 0` 返回 0（调用方以 `exp(lnY − lnY_peak)` 计算比值）。
+            频移后的观测亮度比值为 `exp(lnY(g·T) − lnY(T_peak)) = Y(g·T)/Y(T_peak)`。
+
+        Notes:
+            返回 `ln Y` 而非 `Y`（与参考实现 `ln_luminance` 一致）——
+            kernel 用 `exp(lnY(T) − lnY(T_peak))` 得到无量纲比值。
+            若直接返回 `Y`，`exp(Y − lnY_peak)` 会产生 ~exp(32) ≈ 1e14 的错误量级。
         """
         out = 0.0
         if T_K > 0.0:
@@ -1339,7 +1345,7 @@ class DiskV2Taichi:
             f = u * (_BB_LUT_N - 1)
             i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
             w = f - ti.cast(i0, ti.f32)
-            out = ti.exp(self._lny_lut[i0] * (1.0 - w) + self._lny_lut[i0 + 1] * w)
+            out = self._lny_lut[i0] * (1.0 - w) + self._lny_lut[i0 + 1] * w
         return out
 
     @ti.func
