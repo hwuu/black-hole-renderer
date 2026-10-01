@@ -331,6 +331,7 @@ class DiskV2Renderer:
                 L2_val = L_vec.dot(L_vec)
 
                 escaped = False
+                lam = 0.0
                 escape_dir = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
                 event_horizon_hit = False
                 hdr_accum = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
@@ -354,6 +355,11 @@ class DiskV2Renderer:
                     if dt_fac > max_fac:
                         dt_fac = max_fac
                     h = h_base * dt_fac
+                    if ti.static(has_volume_model):
+                        rc_h = ti.sqrt(pos[0] * pos[0] + pos[1] * pos[1])
+                        zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.05
+                        d_slab = ti.max(ti.abs(pos[2]) - zb, 0.0) + ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
+                        h = ti.min(h, 0.03 + 0.3 * d_slab)
 
                     # RK4 主光线。
                     k1p = h * dir_
@@ -385,6 +391,7 @@ class DiskV2Renderer:
                     if ti.static(has_volume_model):
                         # v2.3 S6: 体积密度场（density_I）+ Y(g·T) 三温度源
                         # 连续步长 + 段中点采样
+                        lam += (new_pos - pos).norm()
                         pm = 0.5 * (pos + new_pos)
                         rm = ti.sqrt(pm[0] * pm[0] + pm[1] * pm[1])
                         if rm > disk._r_in and rm < disk._r_out:
@@ -395,15 +402,15 @@ class DiskV2Renderer:
                             if ti.abs(z_local) < 3.0 * disk._ss_half_thickness(r_local) + 0.05:
                                 dm = 0.5 * (dir_ + new_dir)
                                 em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
-                                    r_local, z_local, phi_local, 2000.0, dm[2])
+                                    r_local, z_local, phi_local, 2000.0 - lam, dm[2])
                                 if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
                                     ds = (new_pos - pos).norm()
                                     g_phys = 1.0
                                     if ti.static(enable_g):
                                         g_phys = disk_g_factor_ti(
                                             ti.Vector([_sl[0], _sl[1], z_local]), dm, cp.norm(), rs)
-                                    g_lum = ti.pow(ti.max(g_phys, 0.1), self.doppler_lum)
-                                    g_col = ti.pow(ti.max(g_phys, 0.1), self.doppler_color)
+                                    g_lum = ti.pow(g_phys, self.doppler_lum)
+                                    g_col = ti.pow(g_phys, self.doppler_color)
                                     T_K = disk._page_thorne_temperature(r_local)
                                     # 核心：Y(g·T·tf_c)·χ(g·T·tf_c)
                                     Tc = T_K * tf_c
