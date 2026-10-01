@@ -35,11 +35,12 @@ import taichi as ti
 
 from .camera import build_camera_v1_compatible
 from .imaging import reference_exposure
-from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams
+from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams, DiskV2VolumeParams
 from .stats import RenderStats, compute_render_stats, hdr_luminance
 from .structure_modulations import _ClumpCenters
 from .taichi_impl import (
     DiskV2Taichi,
+    disk_g_factor_ti,
     doppler_g_factor_ti,
     disk_half_thickness_ti,
     disk_volume_mask_ti,
@@ -101,6 +102,7 @@ class DiskV2Renderer:
         centers: Optional[_ClumpCenters] = None,
         device: str = "cpu",
         ignore_taichi_cache: bool = False,
+        volume_params: Optional[DiskV2VolumeParams] = None,
     ) -> None:
         """初始化 V2 渲染器。
 
@@ -166,6 +168,7 @@ class DiskV2Renderer:
         self.reference_white_point: float = 1.0 / max(float(exposure_ref), 1e-12)
 
         # 把基础场和 palette 包装为 Taichi 句柄。
+        self.volume_params = volume_params
         self.disk_ti = DiskV2Taichi(
             params=params,
             structure_params=structure_params,
@@ -173,6 +176,7 @@ class DiskV2Renderer:
             emission_opacity_scale=opacity_scale,
             seed=seed,
             centers=centers,
+            volume_params=volume_params,
         )
 
         # 输出图像 field（HDR 浮点；Bloom + tonemap 在 Python 端 / 简化 kernel 完成）。
@@ -281,6 +285,7 @@ class DiskV2Renderer:
 
         tan_t = ti.tan(tilt)
         use_visual_atlas = bool(disk._use_visual_atlas)
+        has_volume_model = self.volume_params is not None and hasattr(disk, '_kappa_vol')
         img_w = int(self.width)
         img_h = int(self.height)
         min_fac = ti.cast(0.2, ti.f32)
@@ -370,7 +375,51 @@ class DiskV2Renderer:
                         escape_dir = new_dir.normalized()
                         break
 
-                    if ti.static(not use_visual_atlas):
+                    if ti.static(has_volume_model):
+                        # v2.3 S6: 体积密度场（density_I）+ Y(g·T) 三温度源
+                        # 连续步长 + 段中点采样
+                        pm = 0.5 * (pos + new_pos)
+                        rm = ti.sqrt(pm[0] * pm[0] + pm[1] * pm[1])
+                        if rm > disk._r_in and rm < disk._r_out:
+                            _sl = _world_to_local_disk(pm)
+                            r_local = ti.sqrt(_sl[0] ** 2 + _sl[1] ** 2)
+                            phi_local = ti.atan2(_sl[1], _sl[0])
+                            z_local = _sl[2]
+                            if ti.abs(z_local) < 3.0 * disk._ss_half_thickness(r_local) + 0.05:
+                                dm = 0.5 * (dir_ + new_dir)
+                                em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
+                                    r_local, z_local, phi_local, 2000.0, dm[2])
+                                if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
+                                    ds = (new_pos - pos).norm()
+                                    g_phys = 1.0
+                                    if ti.static(enable_g):
+                                        g_phys = disk_g_factor_ti(
+                                            ti.Vector([_sl[0], _sl[1], z_local]), dm, cp.norm(), rs)
+                                    g_lum = ti.pow(ti.max(g_phys, 0.1), lum_power * 0.25)
+                                    T_K = disk._page_thorne_temperature(r_local)
+                                    # 核心：Y(g·T·tf_c)·χ(g·T·tf_c)
+                                    Tc = T_K * tf_c
+                                    src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Tc * g_phys)
+                                    # 其他（尘埃）：Y(g·T)·χ(g·T)
+                                    src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(T_K * g_phys)
+                                    # 烟雾：T_smoke = SMOKE_TR·T
+                                    src_s = src_o
+                                    if disk._smoke_tr > 0:
+                                        Ts = T_K * disk._smoke_tr
+                                        src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Ts * g_phys)
+                                    # 发射-吸收积分（与参考实现同款：T · j · ds）
+                                    j_total = em_c * src_c + em_o * src_o + em_s * src_s
+                                    j_total *= emission_scale
+                                    alpha_coeff = opacity_scale * (ab_o + disk._core_opac * ab_c)
+                                    alpha_seg = alpha_coeff * ds
+                                    # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
+                                    if alpha_coeff > 1e-30:
+                                        hdr_accum += transmittance * j_total / alpha_coeff * (
+                                            1.0 - ti.exp(-alpha_seg))
+                                    else:
+                                        hdr_accum += transmittance * j_total * ds
+                                    transmittance *= ti.exp(-alpha_seg)
+                    elif ti.static(not use_visual_atlas):
                         old_local = _world_to_local_disk(old_pos)
                         new_local = _world_to_local_disk(new_pos)
                         old_r = ti.sqrt(old_local[0] ** 2 + old_local[1] ** 2)
@@ -857,6 +906,8 @@ class DiskV2Renderer:
             5. `_compose_kernel`：disk_ldr（含 bloom）+ sky + alpha → 最终 image_field
         """
         self._setup_camera(cam_pos, fov)
+        if self.volume_params is not None:
+            self.disk_ti.update_advection(2000.0)
         self._ray_march_kernel()
 
         # stats / white_point 只看 disk_hdr_field（不含 sky）
