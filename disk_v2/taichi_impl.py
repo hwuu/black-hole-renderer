@@ -4,7 +4,7 @@
 
 - `@ti.func` 形式的基础物理场（密度、温度、几何掩码）。
 - `@ti.func` 形式的 F_clump 团块场采样。
-- `@ti.func` 形式的 palette（黑体色 + cinematic）和 tonemap（Reinhard）。
+- `@ti.func` 形式的 palette（CIE 黑体色度 / 亮度查找表）和 tonemap（Reinhard）。
 - 顶层辅助类 `DiskV2Taichi`，负责把 Python 端的 `DiskV2Params/StructureParams/PaletteParams`
   + clump centers 推送到 Taichi field，并提供供 `@ti.kernel` 调用的工具。
 
@@ -17,7 +17,7 @@
   实现严格 parity（见 `tests/unit/test_disk_v2_numpy_taichi_parity.py`）。
 - Taichi 端只放数值核函数，不放 Python 控制流；clump centers 等"集合"
   在外部一次性构造，传入 field。
-- 黑体色查表与 NumPy 实现共用同一个 Tanner Helland 分段公式。
+- 黑体色度 / 亮度与 NumPy 实现共用同一份 CIE 查找表（palette.BB_LUT / LNY_LUT）。
 """
 
 from __future__ import annotations
@@ -29,6 +29,16 @@ from typing import Optional
 import numpy as np
 import taichi as ti
 
+from .palette import (
+    BB_LUT,
+    LNY_LUT,
+    _BB_LUT_N,
+    _BB_T_MAX_K,
+    _BB_T_MIN_K,
+    _LNY_T_MAX_K,
+    _LNY_T_MIN_K,
+    white_balance_gain,
+)
 from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams
 from .structure_modulations import (
     _ClumpCenters,
@@ -468,31 +478,18 @@ class DiskV2Taichi:
         self._hotspot_phi_sigma = float(structure_params.hotspot_phi_sigma)
         self._hotspot_logr_sigma = float(structure_params.hotspot_logr_sigma)
         self._gamma = float(palette_params.gamma)
-        self._cinematic_saturation = float(palette_params.cinematic_saturation)
-        self._cinematic_warm_shift = float(palette_params.cinematic_warm_shift)
-        self._visual_temp_outer_K = float(palette_params.visual_temp_outer_K)
-        self._visual_temp_inner_K = float(palette_params.visual_temp_inner_K)
-        # V1 风格 cinematic 亮度系数
-        self._cinematic_value_low_T = float(palette_params.cinematic_value_low_T)
-        self._cinematic_value_high_T = float(palette_params.cinematic_value_high_T)
-        outer_ratio = max(self._r_out / max(self._r_in, 1e-6), 1.0 + 1e-6)
-        outer_inner_term = max(1.0 - math.sqrt(1.0 / outer_ratio), 1e-6)
-        outer_raw = (
-            (outer_ratio ** -0.75)
-            * (outer_inner_term ** 0.25)
-            * _THIN_DISK_NORM_FACTOR
-        )
-        t_outer_phys = max(self._T_peak_K * outer_raw, 1.0)
-        self._log_t_peak = float(math.log(max(self._T_peak_K, t_outer_phys + 1.0)))
-        self._log_t_outer = float(math.log(max(t_outer_phys, 1.0)))
-        self._visual_log_span = float(
-            math.log(max(palette_params.visual_temp_inner_K, 1.0))
-            - math.log(max(palette_params.visual_temp_outer_K, 1.0))
-        )
         # 字符串模式不能进 @ti.func，必须在 Python 端做模式分发。
-        self._is_cinematic = (palette_params.palette_mode == "cinematic")
-        # X1: tonemap_mode 平铺为 Python bool 供 @ti.func 静态分支
+        # v2.3：cinematic 已删除，颜色只走 CIE 黑体查找表。
         self._is_aces_tonemap = (palette_params.tonemap_mode == "aces")
+        # CIE 黑体查找表（与 palette.py 共用同一份数据 → parity 恒成立）。
+        self._bb_lut = ti.Vector.field(3, dtype=ti.f32, shape=_BB_LUT_N)
+        self._lny_lut = ti.field(dtype=ti.f32, shape=_BB_LUT_N)
+        self._bb_lut.from_numpy(BB_LUT.astype(np.float32))
+        self._lny_lut.from_numpy(LNY_LUT.astype(np.float32))
+        self._wb_gain = ti.Vector.field(3, dtype=ti.f32, shape=())
+        self._wb_gain[None] = np.asarray(
+            white_balance_gain(float(palette_params.white_balance_K)), dtype=np.float32
+        ).tolist()
 
         if centers is None:
             centers = _sample_clump_centers(params, structure_params, seed)
@@ -871,164 +868,90 @@ class DiskV2Taichi:
         return j_base * f_struct
 
     @ti.func
+    def blackbody_color_ti(self, T_K):
+        """温度 → 黑体色度（线性 sRGB D65，查 `palette.BB_LUT`，与 NumPy parity）。
+
+        Args:
+            T_K: 温度（K）。
+
+        Returns:
+            `(3,)` RGB 向量，每通道 ≥ 0、BT.709 亮度 = 1；`T_K ≤ 0` 返回 0。
+        """
+        rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
+        if T_K > 0.0:
+            u = (ti.log(ti.min(ti.max(T_K, _BB_T_MIN_K), _BB_T_MAX_K)) - ti.log(_BB_T_MIN_K)) / (
+                ti.log(_BB_T_MAX_K) - ti.log(_BB_T_MIN_K)
+            )
+            f = u * (_BB_LUT_N - 1)
+            i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+            w = f - ti.cast(i0, ti.f32)
+            rgb = self._bb_lut[i0] * (1.0 - w) + self._bb_lut[i0 + 1] * w
+        return rgb
+
+    @ti.func
+    def blackbody_luminance_ti(self, T_K):
+        """温度 → 黑体可见光亮度 `Y(T)`（查 `palette.LNY_LUT`，与 NumPy parity）。
+
+        Args:
+            T_K: 温度（K）。
+
+        Returns:
+            `Y(T)` ≥ 0；`T_K ≤ 0` 返回 0。频移后的观测亮度即 `Y(g·T)`。
+        """
+        out = 0.0
+        if T_K > 0.0:
+            u = (ti.log(ti.min(ti.max(T_K, _LNY_T_MIN_K), _LNY_T_MAX_K)) - ti.log(_LNY_T_MIN_K)) / (
+                ti.log(_LNY_T_MAX_K) - ti.log(_LNY_T_MIN_K)
+            )
+            f = u * (_BB_LUT_N - 1)
+            i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+            w = f - ti.cast(i0, ti.f32)
+            out = ti.exp(self._lny_lut[i0] * (1.0 - w) + self._lny_lut[i0 + 1] * w)
+        return out
+
+    @ti.func
+    def white_balance_gain_ti(self, T_wb):
+        """von Kries 白平衡增益（Python 端按 `white_balance_K` 预计算，kernel 只查表）。
+
+        Args:
+            T_wb: 白平衡色温（K）。仅作文档语义：Taichi kernel 闭包不接受
+                运行时向量参数，增益取自构造 `DiskV2PaletteParams.white_balance_K`
+                时上传的 field。
+
+        Returns:
+            `(3,)` RGB 增益，全为正；使该色温的黑体呈精确中性 (1,1,1)。
+        """
+        return self._wb_gain[None]
+
+    @ti.func
     def sample_palette_color(self, T_K):
-        """温度 → RGB（physical 直查 / cinematic 可见色温重映射 + V1 着色规格）。
+        """温度 → 黑体色度（v2.3：无二级映射，cinematic 已删除）。
 
         Args:
             T_K: 温度（单位 K）。
 
         Returns:
-            形状 (3,) 的 RGB 向量，每通道 `[0, 1]`。
-
-        Notes:
-            cinematic 模式按 V1 着色规格做：
-
-            1. log-T 映射到可见色温区间 `[visual_outer, visual_inner]`
-            2. 取 Tanner Helland 黑体色（低温红、高温白）
-            3. 饱和度增强
-            4. 可选暖色偏移（默认 0）
-            5. **V1 亮度系数**：低温区压暗（×low_T），高温区提亮（×high_T）
+            形状 (3,) 的 RGB 向量，每通道 ≥ 0、亮度 = 1；`T_K ≤ 0` 返回 0。
         """
-        rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
-        if T_K > 0.0:
-            t_source = T_K
-            t_norm_cine = 0.0  # cinematic 模式下 [0, 1] 归一化温度
-            if ti.static(self._is_cinematic):
-                safe_T = ti.max(T_K, ti.exp(self._log_t_outer))
-                log_span = ti.max(self._log_t_peak - self._log_t_outer, 1e-6)
-                t_norm = (ti.log(safe_T) - self._log_t_outer) / log_span
-                t_norm = ti.min(ti.max(t_norm, 0.0), 1.0)
-                t_norm_cine = t_norm
-                t_source = self._visual_temp_outer_K + t_norm * (
-                    self._visual_temp_inner_K - self._visual_temp_outer_K
-                )
-            t = t_source / 100.0
-            t_safe = ti.max(t, 1e-6)
-            t_m60 = ti.max(t - 60.0, 1e-6)
-            t_m10 = ti.max(t - 10.0, 1e-6)
-
-            r_c = 1.0
-            if t > 66.0:
-                r_c = ti.min(ti.max(1.292936 * ti.pow(t_m60, -0.1332047592), 0.0), 1.0)
-
-            g_c = 0.0
-            if t <= 66.0:
-                g_c = ti.min(ti.max(0.390082 * ti.log(t_safe) - 0.631841, 0.0), 1.0)
-            else:
-                g_c = ti.min(ti.max(1.129891 * ti.pow(t_m60, -0.0755148492), 0.0), 1.0)
-
-            b_c = 1.0
-            if t < 66.0:
-                if t <= 19.0:
-                    b_c = 0.0
-                else:
-                    b_c = ti.min(ti.max(0.543207 * ti.log(t_m10) - 1.19625, 0.0), 1.0)
-
-            # cinematic 模式：饱和度增强 + 暖色偏移 + V1 亮度系数
-            if ti.static(self._is_cinematic):
-                sat = self._cinematic_saturation
-                warm = self._cinematic_warm_shift
-                luma = 0.2126 * r_c + 0.7152 * g_c + 0.0722 * b_c
-                r_c = ti.min(ti.max(luma + sat * (r_c - luma), 0.0), 1.0)
-                g_c = ti.min(ti.max(luma + sat * (g_c - luma), 0.0), 1.0)
-                b_c = ti.min(ti.max(luma + sat * (b_c - luma), 0.0), 1.0)
-                r_c = ti.min(ti.max(r_c * (1.0 + warm), 0.0), 1.0)
-                g_c = ti.min(ti.max(g_c * 1.0, 0.0), 1.0)
-                b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
-                # V1 着色：低温偏暗、高温偏亮
-                value = self._cinematic_value_low_T + t_norm_cine * (
-                    self._cinematic_value_high_T - self._cinematic_value_low_T
-                )
-                r_c = ti.min(ti.max(r_c * value, 0.0), 1.0)
-                g_c = ti.min(ti.max(g_c * value, 0.0), 1.0)
-                b_c = ti.min(ti.max(b_c * value, 0.0), 1.0)
-
-            rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
-        return rgb
+        return self.blackbody_color_ti(T_K)
 
     @ti.func
     def sample_observed_palette_color(self, T_K, g_factor):
-        """温度 + g-factor → RGB（cinematic 在可见色温链上做频移 + V1 着色规格）。
+        """观测色度：温度 `T·g_factor` 的黑体（I_ν/ν³ 洛伦兹不变）。
 
         Args:
             T_K: 发射位置物理温度（K）。
-            g_factor: `nu_obs / nu_em`。
+            g_factor: `nu_obs / nu_em`（应为 `g^doppler_color`，强度旋钮由调用方施加）。
 
         Returns:
-            RGB 向量，每通道 `[0, 1]`。
+            `(3,)` RGB 向量；`T_K ≤ 0` 返回 0。
 
         Notes:
-            cinematic 模式不把 `g*T_phys≈1e7K` 直接送入 LDR 色温公式，而是先把
-            `T_phys` log 映射到可见色温，再做 `T_visible_obs = clamp(g*T_visible)`。
-            V1 亮度系数基于**最终 t_visible_obs**（含 g-factor 蓝/红移），让
-            朝向观察者侧（蓝移→更高温→更亮白）与远离侧（红移→更低温→更暗红）
-            的"温度→亮度"对比更显著。
+            v2.3 之前 cinematic 模式把 `g·T_visible` 送入 Helland 公式并叠加
+            饱和度 / 暖色 / 低温压暗；这些非物理调整已删除，频移后的色度就是
+            温度 `g·T` 的黑体色度。
         """
-        rgb = ti.Vector([0.0, 0.0, 0.0], dt=ti.f32)
-        if T_K > 0.0:
-            t_source = T_K
-            t_norm_cine = 0.0
-            if ti.static(self._is_cinematic):
-                safe_T = ti.max(T_K, ti.exp(self._log_t_outer))
-                log_span = ti.max(self._log_t_peak - self._log_t_outer, 1e-6)
-                t_norm = (ti.log(safe_T) - self._log_t_outer) / log_span
-                t_norm = ti.min(ti.max(t_norm, 0.0), 1.0)
-                t_visible = self._visual_temp_outer_K + t_norm * (
-                    self._visual_temp_inner_K - self._visual_temp_outer_K
-                )
-                t_source = ti.min(
-                    ti.max(t_visible * ti.max(g_factor, 0.1), self._visual_temp_outer_K),
-                    self._visual_temp_inner_K,
-                )
-                # V1 亮度系数基于最终 t_source（含 g-factor 蓝/红移）
-                vis_span = ti.max(
-                    self._visual_temp_inner_K - self._visual_temp_outer_K, 1e-6,
-                )
-                t_norm_cine = ti.min(
-                    ti.max((t_source - self._visual_temp_outer_K) / vis_span, 0.0), 1.0,
-                )
-            t = t_source / 100.0
-            t_safe = ti.max(t, 1e-6)
-            t_m60 = ti.max(t - 60.0, 1e-6)
-            t_m10 = ti.max(t - 10.0, 1e-6)
-
-            r_c = 1.0
-            if t > 66.0:
-                r_c = ti.min(ti.max(1.292936 * ti.pow(t_m60, -0.1332047592), 0.0), 1.0)
-
-            g_c = 0.0
-            if t <= 66.0:
-                g_c = ti.min(ti.max(0.390082 * ti.log(t_safe) - 0.631841, 0.0), 1.0)
-            else:
-                g_c = ti.min(ti.max(1.129891 * ti.pow(t_m60, -0.0755148492), 0.0), 1.0)
-
-            b_c = 1.0
-            if t < 66.0:
-                if t <= 19.0:
-                    b_c = 0.0
-                else:
-                    b_c = ti.min(ti.max(0.543207 * ti.log(t_m10) - 1.19625, 0.0), 1.0)
-
-            if ti.static(self._is_cinematic):
-                sat = self._cinematic_saturation
-                warm = self._cinematic_warm_shift
-                luma = 0.2126 * r_c + 0.7152 * g_c + 0.0722 * b_c
-                r_c = ti.min(ti.max(luma + sat * (r_c - luma), 0.0), 1.0)
-                g_c = ti.min(ti.max(luma + sat * (g_c - luma), 0.0), 1.0)
-                b_c = ti.min(ti.max(luma + sat * (b_c - luma), 0.0), 1.0)
-                r_c = ti.min(ti.max(r_c * (1.0 + warm), 0.0), 1.0)
-                g_c = ti.min(ti.max(g_c * 1.0, 0.0), 1.0)
-                b_c = ti.min(ti.max(b_c * (1.0 - warm), 0.0), 1.0)
-                # V1 着色：低温偏暗、高温偏亮（含 g-factor 频移）
-                value = self._cinematic_value_low_T + t_norm_cine * (
-                    self._cinematic_value_high_T - self._cinematic_value_low_T
-                )
-                r_c = ti.min(ti.max(r_c * value, 0.0), 1.0)
-                g_c = ti.min(ti.max(g_c * value, 0.0), 1.0)
-                b_c = ti.min(ti.max(b_c * value, 0.0), 1.0)
-
-            rgb = ti.Vector([r_c, g_c, b_c], dt=ti.f32)
-        return rgb
+        return self.blackbody_color_ti(T_K * g_factor)
 
     @ti.func
     def tonemap_reinhard(self, rgb_hdr):

@@ -41,7 +41,6 @@ class DiskV2GFactorTest(unittest.TestCase):
     def _make_renderer(
         self,
         enable_g: bool,
-        palette_mode: str = "cinematic",
         *,
         auto_exposure: bool = False,
     ):
@@ -50,7 +49,7 @@ class DiskV2GFactorTest(unittest.TestCase):
 
         p = DiskV2Params()
         sp = DiskV2StructureParams(clump_count=20)
-        pp = DiskV2PaletteParams(palette_mode=palette_mode)
+        pp = DiskV2PaletteParams()
         return DiskV2Renderer(
             width=64,
             height=64,

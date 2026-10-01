@@ -7,7 +7,6 @@ import unittest
 import numpy as np
 
 from disk_v2.imaging import (
-    observed_visible_temperature,
     physical_baseline_flux,
     physical_baseline_volume_flux,
     reference_exposure,
@@ -83,22 +82,6 @@ class DiskV2ImagingTest(unittest.TestCase):
         self.assertTrue(np.all(volume_flux >= 0.0))
         self.assertGreater(float(np.max(volume_flux)), 0.0)
         self.assertLess(abs(float(radii[np.argmax(surface_flux)] - radii[np.argmax(volume_flux)])), 2.0)
-
-    def test_observed_visible_temperature_uses_visible_band_and_clamps(self):
-        palette = DiskV2PaletteParams(
-            palette_mode="cinematic",
-            visual_temp_outer_K=2800.0,
-            visual_temp_inner_K=11500.0,
-        )
-        t_visible = np.array([2800.0, 5000.0, 9000.0, 0.0])
-        g = np.array([0.5, 1.2, 2.0, 2.0])
-
-        out = observed_visible_temperature(t_visible, g, palette)
-
-        self.assertAlmostEqual(float(out[0]), palette.visual_temp_outer_K)
-        self.assertAlmostEqual(float(out[1]), 6000.0)
-        self.assertAlmostEqual(float(out[2]), palette.visual_temp_inner_K)
-        self.assertEqual(float(out[3]), 0.0)
 
 
 if __name__ == "__main__":

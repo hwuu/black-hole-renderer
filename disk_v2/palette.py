@@ -1,299 +1,287 @@
-"""Disk V2 调色与色调映射层（v2.1 新增）。
+"""Disk V2 颜色与亮度链路（v2.3 S2 重写）。
 
-本模块只处理"物理量 → 像素颜色"的映射，不涉及物理场定义本身：
+本模块只处理"物理量 → 像素颜色 / 亮度"的映射，不涉及物理场定义本身：
 
-- `blackbody_color(T_K)`：温度 → RGB（基于 Tanner Helland 近似）。
-- `cinematic_color(T_K, params)`：在 `blackbody_color` 基础上做饱和度增强 + 暖色偏移。
-- `tonemap(rgb_hdr, params)`：HDR → LDR 色调映射。
-- `gamma_correct(rgb_linear, params)`：sRGB 伽马校正。
-- `apply_palette(rgb_hdr, T_K, params)`：把基础 HDR 强度乘上 palette 颜色后输出 HDR 颜色。
+- `blackbody_color(T_K)`：温度 → 线性 sRGB(D65) 黑体色度（普朗克谱 × CIE 1931
+  色匹配函数 → XYZ → sRGB，负值裁 0、BT.709 亮度归一为 1）。预计算 log T 等
+  间距查找表（v2.3 之前用 Tanner Helland 分段拟合——其输出是 sRGB 编码值，
+  被当线性光使用会叠加两次伽马、白平衡下易偏青/品红）。
+- `blackbody_luminance(T_K)`：温度 → 可见光亮度 `Y(T) = ∫ B_λ(T)·ȳ(λ) dλ`，
+  log T 间距查找表。观测谱为温度 g·T 的黑体（I_ν/ν³ 洛伦兹不变），因此频移
+  后的观测亮度就是 `Y(g·T)`，替代旧的 `(T/T_peak)^p` 与 550 nm 单色近似。
+- `white_balance_gain(T_wb)`：von Kries 白平衡增益，使色温 T_wb 的黑体呈精确
+  中性 (1,1,1)；不保证其他温度黑体的 BT.709 亮度（von Kries 固有属性）。
+- `tonemap` / `gamma_correct` / `apply_exposure`：显示链（Reinhard + sRGB）。
+- `palette_color(T_K, params)`：温度 → 黑体色度（无二级映射）。
 
 Notes:
-    所有函数都是纯 NumPy 实现，作为参考实现。Phase 4 的 Taichi 实现
-    会以这些函数的逐元素行为为基准做 parity 测试。
+    所有函数都是纯 NumPy 实现，作为参考实现。Taichi 端
+    （`taichi_impl.blackbody_color_ti` 等）以同一张查找表做 parity。
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 
 from ._array_utils import _restore_shape, _to_array
 from .params import DiskV2PaletteParams
 
+# ---------------------------------------------------------------------------
+# CIE 黑体查找表（模块级常量，NumPy 与 Taichi 共用）
+# ---------------------------------------------------------------------------
+_BB_LUT_N: int = 512
+"""黑体查找表项数（log T 等间距）。"""
 
-def _blackbody_rgb_array(t_over_100: np.ndarray) -> np.ndarray:
-    """Tanner Helland 黑体色温查表（向量化版本，单位 = T / 100）。
+_BB_T_MIN_K: float = 1000.0
+_BB_T_MAX_K: float = 40000.0
+"""色度表温度范围（K）。盘内有效色温（T_peak ≈ 4500 K × g_cap）都在范围内。"""
+
+_LNY_T_MIN_K: float = 300.0
+_LNY_T_MAX_K: float = 60000.0
+"""亮度表温度范围（K）。需要覆盖红移后的低温（g < 1）。"""
+
+_LAM_NM = np.linspace(380.0, 780.0, 801)
+"""CIE 积分波长网格（nm）。"""
+
+
+def _cie_cmf(lam: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """CIE 1931 2° 色匹配函数（Wyman, Sloan & Shirley 2013 多瓣高斯解析近似）。
 
     Args:
-        t_over_100: 温度除以 100 后的标量或数组。
+        lam: 波长（nm）。
 
     Returns:
-        形状为 `(..., 3)` 的数组，最后一维是 `(R, G, B)`，每个通道在 `[0, 1]`。
+        `(x̄, ȳ, z̄)`，与 `lam` 同形状，均 ≥ 0。
 
-    Notes:
-        与 `render.py:136` 的 `_blackbody_rgb` 数学等价；这里用稳定的逐通道
-        分段表达，便于 Phase 4 Taichi parity 对照。
+    Formula:
+        每个通道是若干 `exp(−0.5((λ−μ)/σ)²)` 的加权和，σ 在 μ 两侧取不同值。
     """
+    def g(x, mu, s1, s2):
+        sig = np.where(x < mu, s1, s2)
+        return np.exp(-0.5 * ((x - mu) / sig) ** 2)
 
-    t = t_over_100
-    t_safe = np.maximum(t, 1e-6)
-    t_minus_60 = np.maximum(t - 60.0, 1e-6)
-    t_minus_10 = np.maximum(t - 10.0, 1e-6)
+    xb = (1.056 * g(lam, 599.8, 37.9, 31.0) + 0.362 * g(lam, 442.0, 16.0, 26.7)
+          - 0.065 * g(lam, 501.1, 20.4, 26.2))
+    yb = 0.821 * g(lam, 568.8, 46.9, 40.5) + 0.286 * g(lam, 530.9, 16.3, 31.1)
+    zb = 1.217 * g(lam, 437.0, 11.8, 36.0) + 0.681 * g(lam, 459.0, 26.0, 13.8)
+    return xb, yb, zb
 
-    r = np.where(
-        t <= 66.0,
-        1.0,
-        np.clip(1.292936 * np.power(t_minus_60, -0.1332047592), 0.0, 1.0),
+
+_XYZ_TO_SRGB_D65 = np.array([
+    [3.2406, -1.5372, -0.4986],
+    [-0.9689, 1.8758, 0.0415],
+    [0.0557, -0.2040, 1.0570],
+])
+"""XYZ → 线性 sRGB(D65) 矩阵。"""
+
+_BT709 = np.array([0.2126, 0.7152, 0.0722])
+"""BT.709 亮度权重。"""
+
+
+def _planck(lam: np.ndarray, t_k: float) -> np.ndarray:
+    """普朗克谱 `B_λ ∝ λ⁻⁵ / (exp(hc/(λkT)) − 1)`（任意单位）。
+
+    Args:
+        lam: 波长（nm）。
+        t_k: 温度（K），> 0。
+
+    Returns:
+        与 `lam` 同形状的谱强度。`hc/(λk)` 用 nm-K 标度 `1.4388e7`。
+    """
+    x = np.minimum(1.4388e7 / (lam * t_k), 700.0)
+    return lam ** -5 / np.expm1(x)
+
+
+def _blackbody_rgb_exact(t_k: float) -> np.ndarray:
+    """单温度黑体的线性 sRGB(D65) 色度（直接数值积分，用于构建查找表）。
+
+    Args:
+        t_k: 温度（K）。
+
+    Returns:
+        形状 `(3,)` 的 RGB，每通道 ≥ 0、BT.709 亮度 = 1。黑体轨迹极低温端
+        小段在 sRGB 色域外（G 为负），裁 0。
+
+    Formula:
+        ```
+        XYZ = ∫ B_λ(T)·(x̄, ȳ, z̄) dλ；RGB = M_sRGB · XYZ；
+        RGB ← RGB / (w·RGB)，负通道裁 0 后重归一。
+        ```
+    """
+    xb, yb, zb = _cie_cmf(_LAM_NM)
+    spec = _planck(_LAM_NM, t_k)
+    xyz = np.array([(spec * xb).sum(), (spec * yb).sum(), (spec * zb).sum()])
+    rgb = _XYZ_TO_SRGB_D65 @ xyz
+    rgb = np.maximum(rgb, 0.0)
+    return rgb / max(float(rgb @ _BT709), 1e-30)
+
+
+def _blackbody_luminance_exact(t_k: float) -> float:
+    """单温度黑体的可见光亮度 `Y(T) = ∫ B_λ(T)·ȳ dλ`（任意单位，> 0）。
+
+    Args:
+        t_k: 温度（K），> 0。
+
+    Returns:
+        标量亮度。与色度无关的独立量，决定"多亮"；观测时被频移缩放。
+    """
+    _, yb, _ = _cie_cmf(_LAM_NM)
+    return float((_planck(_LAM_NM, t_k) * yb).sum())
+
+
+def _build_bb_lut() -> tuple[np.ndarray, np.ndarray]:
+    """构建黑体查找表（模块导入时执行一次）。
+
+    Returns:
+        `(bb_lut, lny_lut)`：
+        - `bb_lut`：`(_BB_LUT_N, 3)` 色度表，log T ∈ [log 1000, log 40000] 等间距；
+        - `lny_lut`：`(_BB_LUT_N,)` 的 `ln Y(T)` 表，log T ∈ [log 300, log 60000] 等间距。
+    """
+    ts_color = np.exp(np.linspace(math.log(_BB_T_MIN_K), math.log(_BB_T_MAX_K), _BB_LUT_N))
+    bb_lut = np.stack([_blackbody_rgb_exact(t) for t in ts_color]).astype(np.float64)
+    ts_lum = np.exp(np.linspace(math.log(_LNY_T_MIN_K), math.log(_LNY_T_MAX_K), _BB_LUT_N))
+    lny_lut = np.array(
+        [math.log(max(_blackbody_luminance_exact(t), 1e-300)) for t in ts_lum]
     )
-    g = np.where(
-        t <= 66.0,
-        np.clip(0.390082 * np.log(t_safe) - 0.631841, 0.0, 1.0),
-        np.clip(1.129891 * np.power(t_minus_60, -0.0755148492), 0.0, 1.0),
-    )
-    b = np.where(
-        t >= 66.0,
-        1.0,
-        np.where(
-            t <= 19.0,
-            0.0,
-            np.clip(0.543207 * np.log(t_minus_10) - 1.19625, 0.0, 1.0),
-        ),
-    )
-    return np.stack([r, g, b], axis=-1)
+    return bb_lut, lny_lut
+
+
+BB_LUT, LNY_LUT = _build_bb_lut()
+"""模块级查找表；`taichi_impl.DiskV2Taichi.__init__` 把它们上传为 Taichi field。"""
+
+
+def _lut_lookup(lut: np.ndarray, t_k: np.ndarray, t_min: float, t_max: float) -> np.ndarray:
+    """log T 等间距查找表的线性插值。
+
+    Args:
+        lut: `(N,)` 或 `(N, 3)` 查找表。
+        t_k: 温度（K），标量或数组；越界按端点裁剪。
+        t_min, t_max: 表的温度范围（K）。
+
+    Returns:
+        与 `t_k` 广播后的插值结果；`lut` 为 `(N, 3)` 时形状为 `(..., 3)`。
+    """
+    t_arr = _to_array(t_k)
+    u = (np.log(np.clip(t_arr, t_min, t_max)) - math.log(t_min)) / (math.log(t_max) - math.log(t_min))
+    f = u * (_BB_LUT_N - 1)
+    i0 = np.clip(np.floor(f).astype(np.int64), 0, _BB_LUT_N - 2)
+    w = (f - i0)[..., None] if lut.ndim == 2 else (f - i0)
+    if lut.ndim == 2:
+        return lut[i0] * (1.0 - w) + lut[i0 + 1] * w
+    return lut[i0] * (1.0 - w) + lut[i0 + 1] * w
 
 
 def blackbody_color(
     T_K: float | np.ndarray,
 ) -> np.ndarray:
-    """温度 → 黑体色 RGB（physical 模式）。
+    """温度 → 黑体色度（线性 sRGB D65，BT.709 亮度归一为 1）。
 
     Args:
         T_K: 温度，单位开氏度 K。可以是标量或任意形状数组。
 
     Returns:
-        最后一维大小为 3 的 RGB 数组，每个通道在 `[0, 1]`。
-        当输入为标量时返回形状 `(3,)` 的数组。
-
-    Formula:
-        基于 Tanner Helland 近似：
-        ```
-        t = T / 100
-        R(t), G(t), B(t) 由分段解析公式给出
-        ```
+        最后一维大小为 3 的 RGB 数组，每通道 ≥ 0、亮度 = 1。
+        `T ≤ 0`（盘外 / 边界）返回全 0 RGB，不抛错。标量输入返回 `(3,)`。
 
     Physical Meaning:
-        把绝对温度映射为可视化的 RGB。高温（≥ 6600 K）偏蓝白，
-        低温（< 4000 K）偏红橙。`1e7 K` 输入会落在公式表达上限，
-        所有通道趋近 1（紫白）；`3000 K` 输入则强偏红。
+        把黑体谱经人眼（CIE 1931 色匹配）映射到显示器色度空间；
+        只描述"什么颜色"，不描述"多亮"（亮度见 `blackbody_luminance`）。
 
     Simplifications:
-        - 这是经验拟合，不是严格普朗克黑体辐射积分。
-        - 温度为 0 或负时返回全 0 RGB（不抛错，便于在盘外/边界处使用）。
-    """
-
-    T_arr = _to_array(T_K)
-    safe_T = np.maximum(T_arr, 1.0)  # 避免 log/pow 在 0/负温度发散
-    t = safe_T / 100.0
-    rgb = _blackbody_rgb_array(t)
-    # 温度 ≤ 0 时整体置 0。
-    mask_pos = (T_arr > 0.0)
-    rgb = rgb * mask_pos[..., None]
-    return rgb.astype(np.float64)
-
-
-def _rgb_saturation_boost(rgb: np.ndarray, saturation: float) -> np.ndarray:
-    """对 RGB 做饱和度增强，围绕亮度 luma 保持平均亮度不变。
-
-    Args:
-        rgb: 形状 `(..., 3)` 的数组，每个通道 `[0, 1]`。
-        saturation: 饱和度倍率。`1.0` 等同原图；`>1` 增强；`<1` 降饱和。
-
-    Returns:
-        与输入同形状的数组，仍在 `[0, 1]`（超出部分会被 clip）。
-
-    Formula:
-        ```
-        luma = 0.2126 R + 0.7152 G + 0.0722 B    # BT.709
-        out = luma + saturation · (rgb - luma)
-        ```
-
-    Notes:
-        在 cinematic palette 中用于让"亮蓝"和"暗红"区域颜色更显眼。
-    """
-
-    luma = (
-        0.2126 * rgb[..., 0]
-        + 0.7152 * rgb[..., 1]
-        + 0.0722 * rgb[..., 2]
-    )
-    luma = luma[..., None]
-    out = luma + saturation * (rgb - luma)
-    return np.clip(out, 0.0, 1.0)
-
-
-def physical_temperature_outer_K(T_peak_K: float, T_outer_over_peak: float = 1.0 / 4.32) -> float:
-    """估算盘外缘 raw 物理温度，用于 cinematic 可见色温归一化。
-
-    Args:
-        T_peak_K: 中面温度峰值（K）。
-        T_outer_over_peak: 外缘 raw 温度与峰值之比。默认 `1/4.32` 对应
-            `r_in=3, r_out=50` 的标准薄盘剖面。
-
-    Returns:
-        外缘参考温度（K），恒为正。
-    """
-    return max(float(T_peak_K) * float(T_outer_over_peak), 1.0)
-
-
-def cinematic_visual_temperature(
-    T_K: float | np.ndarray,
-    T_peak_K: float,
-    params: DiskV2PaletteParams,
-    *,
-    T_outer_K: float | None = None,
-) -> np.ndarray:
-    """把物理 Kelvin 重映射到 cinematic 可见色温区间。
-
-    Args:
-        T_K: 物理温度（K），标量或数组。
-        T_peak_K: 盘内 raw 温度峰值（K）。
-        params: `DiskV2PaletteParams`，提供 `visual_temp_outer_K` / `visual_temp_inner_K`。
-        T_outer_K: 可选外缘物理温度；默认由 `physical_temperature_outer_K` 估算。
-
-    Returns:
-        与输入广播后同形状的可见色温（K）。
-
-    Formula:
-        ```
-        t_norm = clamp((log T - log T_outer) / (log T_peak - log T_outer), 0, 1)
-        T_vis = T_outer_vis + t_norm · (T_inner_vis - T_outer_vis)
-        ```
-
-    Physical Meaning:
-        物理温度 `1e7 K` 远超 Helland 公式有效可见范围；cinematic 模式先把
-        盘内相对温度映射到可见区间再查黑体色，保证内外圈连续渐变。
-
-    Simplifications:
-        - 使用 log 温度归一化，而非径向坐标百分位。
-        - 外缘物理温度默认按 `T_peak/4.32` 估算，可由调用方覆盖。
+        - CIE 匹配函数用 Wyman 2013 解析近似，非查表精确值。
+        - XYZ → sRGB 后负通道裁 0（黑体轨迹极低温端略超 sRGB 色域）。
+        - 512 项 log T 查找表线性插值（相对直接积分误差 < 3%）。
     """
     T_arr = _to_array(T_K)
-    t_outer_phys = float(
-        T_outer_K if T_outer_K is not None else physical_temperature_outer_K(T_peak_K)
-    )
-    t_peak = max(float(T_peak_K), t_outer_phys + 1.0)
-    mask_pos = T_arr > 0.0
-    safe_T = np.maximum(T_arr, t_outer_phys)
-    log_span = np.log(t_peak) - np.log(t_outer_phys)
-    t_norm = np.clip(
-        (np.log(safe_T) - np.log(t_outer_phys)) / max(log_span, 1e-12),
-        0.0,
-        1.0,
-    )
-    t_vis = params.visual_temp_outer_K + t_norm * (
-        params.visual_temp_inner_K - params.visual_temp_outer_K
-    )
-    t_vis = np.where(mask_pos, t_vis, 0.0)
-    return _restore_shape(t_vis.astype(np.float64), T_K)
-
-
-def cinematic_color(
-    T_K: float | np.ndarray,
-    params: DiskV2PaletteParams,
-    *,
-    T_peak_K: float | None = None,
-    T_outer_K: float | None = None,
-) -> np.ndarray:
-    """温度 → 颜色（cinematic 模式）。
-
-    Args:
-        T_K: 温度，单位 K。
-        params: `DiskV2PaletteParams`，提供 cinematic 调色与可见色温映射参数。
-        T_peak_K: 物理温度峰值；cinematic 重映射需要。未传时默认 `1e7`。
-        T_outer_K: 可选外缘物理温度，用于 log 归一化。
-
-    Returns:
-        最后一维大小为 3 的 RGB 数组，每个通道在 `[0, 1]`。
-
-    Formula:
-        ```
-        T_vis = cinematic_visual_temperature(T_K, T_peak_K, params)
-        # log-T 归一化系数（0=外缘冷低温，1=内峰高温）
-        t_norm = (T_vis - visual_temp_outer_K) / (visual_temp_inner_K - visual_temp_outer_K)
-        # V1 风格亮度系数：低温偏暗、高温偏亮
-        value = value_low_T + t_norm · (value_high_T - value_low_T)
-
-        base = blackbody_color(T_vis)
-        saturated = saturation_boost(base, cinematic_saturation)
-        warmed = saturated · [1 + warm_shift, 1, 1 - warm_shift]
-        # V1 风格的"低温偏暗、高温偏亮"
-        out = clip(warmed · value, 0, 1)
-        ```
-
-    Physical Meaning:
-        在可见色温映射后的黑体色基础上：
-
-        1. 增强饱和度（让红色更红、蓝色更蓝）
-        2. 可选暖色偏移（默认 0；用户可显式启用）
-        3. **V1 着色规格**：温度依赖的亮度系数。低温区（红橙）整体压暗，
-           高温区（白）整体提亮，对齐 V1 直观感受"温度高 = 又白又亮"。
-
-    Simplifications:
-        - value 用线性插值近似 Stefan-Boltzmann T^4 在归一化空间的相对系数；
-          1.71 倍跨度足够视觉可辨。
-        - 用解析饱和度增强 + 通道增益，没有引入 LUT。
-    """
-    peak = float(T_peak_K if T_peak_K is not None else 1.0e7)
-    t_vis = cinematic_visual_temperature(T_K, peak, params, T_outer_K=T_outer_K)
-    rgb = blackbody_color(t_vis)
-    rgb = _rgb_saturation_boost(rgb, params.cinematic_saturation)
-    warm = np.array(
-        [1.0 + params.cinematic_warm_shift, 1.0, 1.0 - params.cinematic_warm_shift],
-        dtype=np.float64,
-    )
-    rgb = np.clip(rgb * warm, 0.0, 1.0)
-    # V1 风格亮度系数：t_norm 从 t_vis 归一到 [0, 1] 计算
-    visual_outer = float(params.visual_temp_outer_K)
-    visual_inner = float(params.visual_temp_inner_K)
-    visual_span = max(visual_inner - visual_outer, 1e-6)
-    t_norm = np.clip((np.asarray(t_vis) - visual_outer) / visual_span, 0.0, 1.0)
-    value = (
-        params.cinematic_value_low_T
-        + t_norm * (params.cinematic_value_high_T - params.cinematic_value_low_T)
-    )
-    # value 可以 > 1（高温偏亮），所以 clip 上界在外面控制
-    rgb = np.clip(rgb * value[..., None], 0.0, 1.0)
+    scalar = np.ndim(T_K) == 0
+    rgb = np.zeros(T_arr.shape + (3,), dtype=np.float64)
+    mask = T_arr > 0.0
+    if np.any(mask):
+        rgb[mask] = _lut_lookup(BB_LUT, T_arr[mask], _BB_T_MIN_K, _BB_T_MAX_K)
+    if scalar:
+        return rgb.reshape(3)
     return rgb
+
+
+def blackbody_luminance(
+    T_K: float | np.ndarray,
+) -> float | np.ndarray:
+    """温度 → 黑体可见光亮度 `Y(T) = ∫ B_λ(T)·ȳ(λ) dλ`（任意单位）。
+
+    Args:
+        T_K: 温度（K），标量或数组。
+
+    Returns:
+        `Y(T)`，≥ 0；`T ≤ 0` 返回 0。标量输入返回 float。
+        频移后的观测亮度即 `Y(g·T)`（观测谱仍是黑体，温度 g·T）。
+
+    Physical Meaning:
+        "多亮"的物理量。替代旧 `(T/T_peak)^p` 旋钮（4500 K 盘在可见光处于
+        Wien 指数段，Y 随温度的等效指数 ≈ hν̄/kT ≈ 6，不是固定 p）。
+
+    Simplifications:
+        - 512 项 ln Y 查找表线性插值（相对直接积分误差 < 1%）。
+        - 单一 ȳ 积分代替全光谱 RGB 加权（亮度与色度分离）。
+    """
+    T_arr = _to_array(T_K)
+    out = np.zeros(T_arr.shape, dtype=np.float64)
+    mask = T_arr > 0.0
+    if np.any(mask):
+        ln_y = _lut_lookup(LNY_LUT, T_arr[mask], _LNY_T_MIN_K, _LNY_T_MAX_K)
+        out[mask] = np.exp(ln_y)
+    if np.ndim(T_K) == 0:
+        return float(out)
+    return out
+
+
+def white_balance_gain(
+    T_wb: float,
+) -> np.ndarray:
+    """von Kries 白平衡增益：让色温 `T_wb` 的黑体呈中性，BT.709 亮度不变。
+
+    Args:
+        T_wb: 相机白平衡色温（K）。6600 K ≈ 表的中性白点，增益接近 1。
+
+    Returns:
+        形状 `(3,)` 的 RGB 增益，全为正。渲染时对 HDR 线性 RGB 逐通道相乘。
+
+    Formula:
+        ```
+        gain_c = 1 / rgb_c(T_wb)
+        ```
+
+    Physical Meaning:
+        相机按场景色温设定白点：色温 T_wb 的黑体经增益后成为精确中性 (1,1,1)，
+        低于该色温的暖色被中和、相对冷暖差更易辨认。这是标准 von Kries 对角
+        变换；它保持锥响应，**不**逐谱保持 BT.709 亮度（其他温度的黑体平衡后
+        luma 有百分之几的物理性漂移），曝光由 `apply_exposure` 单独控制。
+    """
+    c = np.asarray(blackbody_color(float(T_wb)))
+    return 1.0 / np.maximum(c, 1e-3)
 
 
 def palette_color(
     T_K: float | np.ndarray,
     params: DiskV2PaletteParams,
-    *,
-    T_peak_K: float | None = None,
-    T_outer_K: float | None = None,
 ) -> np.ndarray:
-    """温度 → 颜色 RGB，按 `params.palette_mode` 选 `physical` 或 `cinematic`。
+    """温度 → 黑体色度（v2.3：无二级映射，cinematic 已删除）。
 
     Args:
-        T_K: 温度，单位 K。
-        params: `DiskV2PaletteParams`。
-        T_peak_K: cinematic 模式需要的物理峰值温度（K）。
-        T_outer_K: cinematic 模式可选外缘物理温度（K）。
+        T_K: 温度（K），标量或数组。
+        params: `DiskV2PaletteParams`（保留参数以兼容现有调用方签名）。
 
     Returns:
-        最后一维大小为 3 的 RGB 数组，每个通道在 `[0, 1]`。
+        最后一维大小为 3 的 RGB 色度数组，每通道 ≥ 0、亮度 = 1。
     """
-
-    if params.palette_mode == "physical":
-        return blackbody_color(T_K)
-    elif params.palette_mode == "cinematic":
-        return cinematic_color(T_K, params, T_peak_K=T_peak_K, T_outer_K=T_outer_K)
-    else:
-        # 应该已经被 __post_init__ 拦截，这里再做一次防御性检查。
-        raise ValueError(f"unsupported palette_mode: {params.palette_mode!r}")
+    del params
+    return blackbody_color(T_K)
 
 
+# ---------------------------------------------------------------------------
+# 显示链（不变）
+# ---------------------------------------------------------------------------
 def tonemap_reinhard(rgb_hdr: np.ndarray) -> np.ndarray:
     """Reinhard 简化 tonemap：`x → x / (1 + x)`。
 
@@ -468,32 +456,30 @@ def apply_palette(
     intensity_hdr: float | np.ndarray,
     T_K: float | np.ndarray,
     params: DiskV2PaletteParams,
-    *,
-    T_peak_K: float | None = None,
-    T_outer_K: float | None = None,
 ) -> np.ndarray:
-    """把 HDR 强度乘上由温度决定的 palette 颜色，得到 HDR RGB。
+    """把 HDR 强度乘上由温度决定的黑体色度，得到 HDR RGB。
 
     Args:
         intensity_hdr: 非负 HDR 强度，形状任意。语义上是 V2 体积积分对单
             一光线累积出的标量强度（或每通道强度的预先平均）。
         T_K: 与 `intensity_hdr` 广播兼容的温度数组，单位 K。
-        params: `DiskV2PaletteParams`。
+        params: `DiskV2PaletteParams`（保留以兼容现有调用方）。
 
     Returns:
         形状为 `(..., 3)` 的 HDR RGB 数组。
 
     Formula:
         ```
-        rgb_hdr = palette_color(T_K, params) · intensity_hdr
+        rgb_hdr = blackbody_color(T_K) · intensity_hdr
         ```
 
     Notes:
-        - `palette_color` 返回值落在 `[0, 1]`；强度本身决定 HDR 量级。
+        - `blackbody_color` 返回值亮度 = 1；强度本身决定 HDR 量级
+          （强度应来自 `blackbody_luminance` / 体积积分）。
         - 调用 `tonemap` / `render_hdr_to_ldr` 才会把结果压到 `[0, 1]`。
     """
 
-    color = palette_color(T_K, params, T_peak_K=T_peak_K, T_outer_K=T_outer_K)
+    color = blackbody_color(T_K)
     intensity_arr = _to_array(intensity_hdr)
     # color 形状 (..., 3)；intensity 形状 (...)；广播相乘。
     return color * intensity_arr[..., None]

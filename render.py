@@ -4599,9 +4599,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2_clump_emission_weight", type=float, default=0.0,
                         help="V2 团块在独立发射调制中的权重 [0,1]；主光追发射已改用 F_shear，"
                              "默认 0 避免出现大块亮斑 (default: 0.0)")
-    parser.add_argument("--v2_palette_mode", type=str, default="cinematic",
-                        choices=["physical", "cinematic"],
-                        help="V2 模式下显示链: physical=诊断剖面，cinematic=log-T 可见色温 + 曝光/Bloom (default: cinematic)")
     parser.add_argument("--v2_tonemap_mode", type=str, default=None,
                         choices=["reinhard", "aces"],
                         help="V2 模式下 tonemap 算法: reinhard (default)。"
@@ -4626,13 +4623,13 @@ def parse_args() -> argparse.Namespace:
                              "建议在 r_out=50 默认下传 20，让大盘和远端光线有充分的绕回空间。")
     parser.add_argument("--v2_bloom_threshold", type=float, default=None,
                         help="V2 模式下 Bloom 亮度阈值（HDR 域）。仅当 --v2_bloom_intensity > 0 时生效。"
-                             "默认 None：无 preset 时取 1.0，interstellar preset 取 5e-4。")
+                             "默认 None：取 1.0。")
     parser.add_argument("--v2_bloom_intensity", type=float, default=None,
                         help="V2 模式下 Bloom 强度。0 关闭；推荐弱 Bloom 0.3 ~ 0.6，电影感 1.0 ~ 2.0。"
-                             "默认 None：无 preset 时取 0.0（关闭），interstellar preset 取 1.5。")
+                             "默认 None：取 0.0（关闭）。")
     parser.add_argument("--v2_bloom_radius", type=float, default=None,
                         help="V2 模式下 Bloom 高斯模糊半径（像素）。推荐 4 ~ 12。"
-                             "默认 None：无 preset 时取 4.0，interstellar preset 取 8.0。")
+                             "默认 None：取 4.0。")
     parser.add_argument("--v2_auto_exposure", action="store_true",
                         help="V2 模式下根据 HDR p99 自动设置 white point，避免手动猜 emission_scale")
     parser.add_argument("--v2_white_point_percentile", type=float, default=99.0,
@@ -4653,9 +4650,6 @@ def parse_args() -> argparse.Namespace:
                         help="V2 傅里叶剪切强度，默认 0（关闭）")
     parser.add_argument("--v2_disable_visual_atlas", action="store_true",
                         help="V2 关闭视觉 atlas，回退 F_shear 路径")
-    parser.add_argument("--v2_visual_preset", type=str, default=None,
-                        choices=["interstellar"],
-                        help="V2 视觉预设：interstellar = 统一 V2 物理路径上的 cinematic 曝光 + 弱 bloom")
     return parser.parse_args()
 
 
@@ -4724,21 +4718,13 @@ def build_v2_structure_params(args) -> "DiskV2StructureParams":
         replacements["shear_strength"] = args.v2_shear_strength
     if args.v2_disable_visual_atlas:
         replacements["use_visual_atlas"] = False
-    if args.v2_visual_preset == "interstellar":
-        if args.v2_turbulence_strength is None:
-            replacements["turbulence_strength"] = 0.82
-        if args.v2_alpha_clip_threshold is None:
-            replacements["alpha_clip_threshold"] = 0.006
     if replacements:
         sp = replace(sp, **replacements)
     return sp
 
 
 def resolve_v2_render_options(args) -> dict:
-    """解析 V2 渲染选项，应用 `--v2_visual_preset` 推荐参数。
-
-    preset 只覆盖未显式指定的 bloom / exposure / palette / 体积积分推荐值；
-    显式 CLI 参数始终优先。
+    """解析 V2 渲染选项（v2.3 S2：`--v2_visual_preset` 与 palette_mode 已删除）。
 
     Args:
         args: `parse_args()` 返回的命名空间。
@@ -4746,30 +4732,29 @@ def resolve_v2_render_options(args) -> dict:
     Returns:
         传给 `DiskV2Renderer` 的 kwargs 覆盖片段。
     """
-    # bloom 三个参数 CLI 默认 None（无 preset 时 fallback 到下面的"无 preset 默认"）。
-    # 这样 preset 才能区分"用户未指定"（None）与"用户显式传 0"（0.0）。
-    no_preset_bloom_threshold = 1.0
-    no_preset_bloom_intensity = 0.0
-    no_preset_bloom_radius = 4.0
+    # bloom 三个参数 CLI 默认 None：区分"用户未指定"（None → 取下述默认）与
+    # "用户显式传 0"（0.0，表示关闭）。
+    default_bloom_threshold = 1.0
+    default_bloom_intensity = 0.0
+    default_bloom_radius = 4.0
 
     opts = {
         "auto_exposure": args.v2_auto_exposure,
         "bloom_threshold": (
             args.v2_bloom_threshold
             if args.v2_bloom_threshold is not None
-            else no_preset_bloom_threshold
+            else default_bloom_threshold
         ),
         "bloom_intensity": (
             args.v2_bloom_intensity
             if args.v2_bloom_intensity is not None
-            else no_preset_bloom_intensity
+            else default_bloom_intensity
         ),
         "bloom_radius": (
             args.v2_bloom_radius
             if args.v2_bloom_radius is not None
-            else no_preset_bloom_radius
+            else default_bloom_radius
         ),
-        "palette_mode": args.v2_palette_mode,
         "tonemap_mode": (
             args.v2_tonemap_mode if args.v2_tonemap_mode is not None else "reinhard"
         ),
@@ -4780,46 +4765,6 @@ def resolve_v2_render_options(args) -> dict:
         "r_max": args.v2_r_max if args.v2_r_max is not None else args.r_max,
         "white_point_percentile": args.v2_white_point_percentile,
     }
-    if args.v2_visual_preset == "interstellar":
-        opts["auto_exposure"] = True
-        opts["palette_mode"] = "cinematic"
-        # X1 已撤回 (2026-06-14)：ACES 让"99% 黑底 + 1% 高亮"场景背景灰雾。
-        # tonemap_mode 保持 'reinhard'（用户仍可通过 --v2_tonemap_mode 切换，
-        # 但 params.py 会拦截 'aces' 抛 NotImplementedError）。
-        # bloom：用 None 判定，让用户的 `--v2_bloom_intensity 0` 显式关闭仍然有效
-        # bloom：用 None 判定，让用户的 `--v2_bloom_intensity 0` 显式关闭仍然有效
-        if args.v2_bloom_intensity is None:
-            # V1 风格 LDR bloom：intensity=0.4 与 V1 一致。
-            # V1 bloom 在 LDR 域做，不再用 HDR 域的 threshold/radius。
-            # kernel_radius 和 sigma_scale 由 V2 内部按 V1 公式自动算。
-            opts["bloom_intensity"] = 0.4
-        if args.v2_bloom_threshold is None:
-            # V1 bloom threshold=0（所有非零亮度像素参与）
-            opts["bloom_threshold"] = 0.0
-        if args.v2_bloom_radius is None:
-            # V1 风格不用这个参数（kernel_radius 内部算），留兼容
-            opts["bloom_radius"] = 8.0
-        if args.v2_opacity_scale == 0.55:
-            # 方向 1（2026-06-14）：sky/disk 分离后，盘 alpha 直接控制盘 LDR
-            # 强度（盘内 LDR = tonemap(...) × disk_alpha）。
-            # opacity=20 让盘面 alpha p50≈0.83、p90≈1.0——盘面大部分不透明，
-            # wrap 回来的光子环被前面的实体盘遮挡，符合物理预期。
-            opts["opacity_scale"] = 20.0
-        if args.v2_emission_scale == 1.0:
-            # 方向 1 收尾 (2026-06-14)：sky/disk 分离 + opacity=5 + 暖色调后，
-            # emission=5.0 让盘体亮度跟 V1 对照（橙色盘）接近。
-            # 之前 1.85 是为 ACES 链路（X1 已撤回）调的。
-            opts["emission_scale"] = 5.0
-        # 注意：不再覆盖 lum_power。D2+D3 之前曾把 lum_power 从 4 降到 2.5 以避免
-        # HDR 饱和，但这等于把 plan Step 4 严格 g^4 物理变成 g^2.5，吃掉了多普勒
-        # 视觉显著性。D3 后曝光 reference 物理可控，HDR 由 Reinhard 自然压缩，
-        # 不再需要这个 hack。
-        if args.v2_volume_samples == 16:
-            opts["volume_samples"] = 32
-        if args.v2_r_max is None:
-            opts["r_max"] = 25.0
-        if args.v2_white_point_percentile == 99.0:
-            opts["white_point_percentile"] = 96.0
     return opts
 
 
@@ -4895,26 +4840,9 @@ if __name__ == "__main__":
         )
         v2_structure = build_v2_structure_params(args)
         v2_render_opts = resolve_v2_render_options(args)
-        if args.v2_visual_preset == "interstellar":
-            # X1+V1 着色：cinematic palette interstellar 预设
-            # - 方向 1 收尾 (2026-06-14)：色调向 V1 橙黄靠拢
-            # - warm_shift=0.25: R ×1.25, B ×0.75，强暖色基调
-            # - visual_temp_inner_K=6500: 内峰中性白(6500K) 而不是紫白/黄白
-            # - visual_temp_outer_K=2800: 外缘维持深红
-            # - X1 已撤回，tonemap_mode 走 Reinhard
-            v2_palette = DiskV2PaletteParams(
-                palette_mode="cinematic",
-                tonemap_mode=v2_render_opts["tonemap_mode"],
-                cinematic_saturation=1.58,
-                cinematic_warm_shift=0.4,
-                visual_temp_outer_K=2800.0,
-                visual_temp_inner_K=6500.0,
-            )
-        else:
-            v2_palette = DiskV2PaletteParams(
-                palette_mode=v2_render_opts["palette_mode"],
-                tonemap_mode=v2_render_opts["tonemap_mode"],
-            )
+        v2_palette = DiskV2PaletteParams(
+            tonemap_mode=v2_render_opts["tonemap_mode"],
+        )
 
         v2_r_max = v2_render_opts["r_max"]
 

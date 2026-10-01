@@ -4,8 +4,9 @@
 
 - `tau_effective_midplane()`：把密度包络转换为有效光学厚度标度。
 - `physical_baseline_flux()`：默认 thin-disk effective radiative transfer 的相对通量。
-- `reference_exposure()`：cinematic 曝光的相机无关参考值。
-- `observed_visible_temperature()`：g-factor 在可见色温显示链上的近似作用。
+- `reference_exposure()`：曝光参考值（相机无关）。v2.3 起 g-factor 的颜色/亮度
+  作用由 `relativity.py` 的频移因子直接完成（观测谱 = 温度 g·T 的黑体），
+  不再有"可见色温"二级链。
 
 这些函数用于单元测试、文档和后续 Taichi 移植的 reference。
 """
@@ -220,38 +221,4 @@ def reference_exposure(
     return target_hdr / f_ref
 
 
-def observed_visible_temperature(
-    T_visible_K: float | np.ndarray,
-    g_factor: float | np.ndarray,
-    params: DiskV2PaletteParams,
-) -> float | np.ndarray:
-    """把 g-factor 作用到 cinematic 可见色温显示链上。
 
-    Args:
-        T_visible_K: 已经由物理温度 log 映射得到的可见色温（K）。
-        g_factor: 相对论频移因子 `nu_obs / nu_em`，可为标量或数组。
-        params: 调色参数，提供可见色温上下界。
-
-    Returns:
-        与输入广播后同形状的可见观测色温，范围被限制在
-        `[visual_temp_outer_K, visual_temp_inner_K]`；输入非正温度返回 0。
-
-    Formula:
-        ```
-        T_visible_obs = clamp(g · T_visible_em, Tvis_min, Tvis_max)
-        ```
-
-    Physical Meaning:
-        这是 band-limited cinematic 显示近似。真实 `T_phys≈1e7K` 不直接进入
-        Tanner Helland/LDR 显示链；g-factor 只移动已经映射到可见区间的色温。
-
-    Simplifications:
-        不使用指数 Wien 通道缩放。若未来恢复 Wien 近似，也必须作用在
-        `T_visible` 上，并用测试锁定蓝移/红移方向。
-    """
-    t_arr = _to_array(T_visible_K)
-    g_arr = _to_array(g_factor)
-    obs = t_arr * g_arr
-    obs = np.clip(obs, params.visual_temp_outer_K, params.visual_temp_inner_K)
-    obs = np.where(t_arr > 0.0, obs, 0.0)
-    return _restore_shape(obs.astype(np.float64), T_visible_K if np.ndim(T_visible_K) >= np.ndim(g_arr) else g_factor)

@@ -7,7 +7,7 @@
 - 几何函数：disk_half_thickness、disk_radial_weight、disk_vertical_weight、disk_volume_mask。
 - 物理场：midplane_density_field、midplane_temperature_field、density_field、temperature_field。
 - 团块场：clump_modulation。
-- 调色：blackbody_color / cinematic palette / tonemap_reinhard。
+- 调色：blackbody_color（CIE 表）/ 观测色度（T·g） / tonemap_reinhard。
 
 容差：相对误差 `< 1e-4`（fp32 Taichi 路径下；fp64 NumPy 参考实现）。
 """
@@ -27,13 +27,10 @@ from disk_v2.params import DiskV2PaletteParams, DiskV2Params, DiskV2StructurePar
 from disk_v2.palette import (
     apply_exposure,
     blackbody_color,
-    cinematic_color,
-    cinematic_visual_temperature,
     tonemap,
     tonemap_aces,
     tonemap_reinhard,
 )
-from disk_v2.imaging import observed_visible_temperature
 from disk_v2.physical_fields import (
     density_field,
     midplane_density_field,
@@ -60,16 +57,11 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
         _ensure_taichi()
         cls.params = DiskV2Params(r_in=3.0, r_out=50.0, T_peak_K=1.0e7, edge_softness=0.02)
         cls.structure_params = DiskV2StructureParams(clump_count=80, clump_strength=0.6)
-        cls.palette_params_phys = DiskV2PaletteParams(palette_mode="physical")
-        cls.palette_params_cine = DiskV2PaletteParams(palette_mode="cinematic")
+        cls.palette_params_phys = DiskV2PaletteParams()
 
-        # Taichi 句柄分别用 physical 和 cinematic 构造两个，便于测试不同模式。
+        # Taichi 句柄（v2.3 只有一条颜色链）。
         cls.ti_phys = DiskV2Taichi(
             cls.params, cls.structure_params, cls.palette_params_phys, seed=7
-        )
-        cls.ti_cine = DiskV2Taichi(
-            cls.params, cls.structure_params, cls.palette_params_cine, seed=7,
-            centers=cls.ti_phys.centers,
         )
 
         # 固定测试网格：32 个 (r, phi, z) 采样点。
@@ -324,105 +316,7 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
         np_rgb = np.asarray(blackbody_color(self.T_samples), dtype=np.float64)
         np.testing.assert_allclose(ti_rgb, np_rgb, rtol=1e-3, atol=1e-3)
 
-    def test_parity_blackbody_color_cinematic(self):
-        ti_obj = self.ti_cine
-
-        @ti.kernel
-        def compute(out_r: ti.template(), out_g: ti.template(), out_b: ti.template(),
-                    T_f: ti.template(), obj: ti.template()):
-            for i in range(out_r.shape[0]):
-                rgb = obj.sample_palette_color(T_f[i])
-                out_r[i] = rgb[0]
-                out_g[i] = rgb[1]
-                out_b[i] = rgb[2]
-
-        T_f = ti.field(dtype=ti.f32, shape=self.n)
-        T_f.from_numpy(self.T_samples.astype(np.float32))
-        out_r = ti.field(dtype=ti.f32, shape=self.n)
-        out_g = ti.field(dtype=ti.f32, shape=self.n)
-        out_b = ti.field(dtype=ti.f32, shape=self.n)
-        compute(out_r, out_g, out_b, T_f, ti_obj)
-        ti_rgb = np.stack([
-            out_r.to_numpy(), out_g.to_numpy(), out_b.to_numpy()
-        ], axis=-1).astype(np.float64)
-
-        np_rgb = np.asarray(
-            cinematic_color(
-                self.T_samples,
-                self.palette_params_cine,
-                T_peak_K=self.params.T_peak_K,
-            ),
-            dtype=np.float64,
-        )
-        np.testing.assert_allclose(ti_rgb, np_rgb, rtol=2e-3, atol=2e-3)
-
-    def test_parity_observed_palette_color_cinematic(self):
-        ti_obj = self.ti_cine
-        g_samples = np.linspace(0.5, 1.8, self.n).astype(np.float64)
-
-        @ti.kernel
-        def compute(out_r: ti.template(), out_g: ti.template(), out_b: ti.template(),
-                    T_f: ti.template(), g_f: ti.template(), obj: ti.template()):
-            for i in range(out_r.shape[0]):
-                rgb = obj.sample_observed_palette_color(T_f[i], g_f[i])
-                out_r[i] = rgb[0]
-                out_g[i] = rgb[1]
-                out_b[i] = rgb[2]
-
-        T_f = ti.field(dtype=ti.f32, shape=self.n)
-        g_f = ti.field(dtype=ti.f32, shape=self.n)
-        T_f.from_numpy(self.T_samples.astype(np.float32))
-        g_f.from_numpy(g_samples.astype(np.float32))
-        out_r = ti.field(dtype=ti.f32, shape=self.n)
-        out_g = ti.field(dtype=ti.f32, shape=self.n)
-        out_b = ti.field(dtype=ti.f32, shape=self.n)
-        compute(out_r, out_g, out_b, T_f, g_f, ti_obj)
-        ti_rgb = np.stack([
-            out_r.to_numpy(), out_g.to_numpy(), out_b.to_numpy()
-        ], axis=-1).astype(np.float64)
-
-        t_visible = observed_visible_temperature(
-            # 先用 public 函数得到发射可见色温，再手工应用 g-factor 与
-            # cinematic saturation/warm。
-            cinematic_visual_temperature(
-                self.T_samples,
-                self.params.T_peak_K,
-                self.palette_params_cine,
-            ),
-            g_samples,
-            self.palette_params_cine,
-        )
-        np_rgb = blackbody_color(t_visible)
-        luma = (
-            0.2126 * np_rgb[..., 0]
-            + 0.7152 * np_rgb[..., 1]
-            + 0.0722 * np_rgb[..., 2]
-        )[..., None]
-        np_rgb = luma + self.palette_params_cine.cinematic_saturation * (np_rgb - luma)
-        np_rgb = np.clip(np_rgb, 0.0, 1.0)
-        warm = np.array([
-            1.0 + self.palette_params_cine.cinematic_warm_shift,
-            1.0,
-            1.0 - self.palette_params_cine.cinematic_warm_shift,
-        ])
-        np_rgb = np.clip(np_rgb * warm, 0.0, 1.0)
-        # V1 着色系数：t_norm = (t_visible - outer) / (inner - outer)，value 线性插值
-        visual_outer = float(self.palette_params_cine.visual_temp_outer_K)
-        visual_inner = float(self.palette_params_cine.visual_temp_inner_K)
-        visual_span = max(visual_inner - visual_outer, 1e-6)
-        t_norm = np.clip((np.asarray(t_visible) - visual_outer) / visual_span, 0.0, 1.0)
-        value = (
-            self.palette_params_cine.cinematic_value_low_T
-            + t_norm * (
-                self.palette_params_cine.cinematic_value_high_T
-                - self.palette_params_cine.cinematic_value_low_T
-            )
-        )
-        np_rgb = np.clip(np_rgb * value[..., None], 0.0, 1.0)
-
-        np.testing.assert_allclose(ti_rgb, np_rgb, rtol=2e-3, atol=2e-3)
-
-    def test_parity_observed_palette_color_physical_does_not_double_count_g(self):
+    def test_parity_observed_palette_color_applies_g_to_temperature(self):
         ti_obj = self.ti_phys
 
         @ti.kernel
@@ -448,9 +342,11 @@ class DiskV2NumpyTaichiParityTest(unittest.TestCase):
             out_r.to_numpy(), out_g.to_numpy(), out_b.to_numpy()
         ], axis=-1).astype(np.float64)
 
-        expected = blackbody_color(T_const)
-        np.testing.assert_allclose(ti_rgb, expected, rtol=1e-3, atol=1e-3)
-        np.testing.assert_allclose(ti_rgb[0], ti_rgb[-1], rtol=1e-6, atol=1e-6)
+        # v2.3：观测色度 = blackbody(T·g)（I_ν/ν³ 不变 → 观测谱仍是黑体）
+        expected = np.asarray(blackbody_color(T_const * g_samples))
+        np.testing.assert_allclose(ti_rgb, expected, rtol=2e-3, atol=2e-3)
+        # g > 1（蓝移）应提高 B/R 比值：首尾两样本方向相反
+        self.assertLess(ti_rgb[0, 2] / ti_rgb[0, 0], ti_rgb[-1, 2] / ti_rgb[-1, 0])
 
     def test_parity_tonemap_reinhard(self):
         ti_obj = self.ti_phys

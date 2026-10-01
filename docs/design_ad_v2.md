@@ -7,6 +7,12 @@
 > **v2.3 进行中（2026-10-01）**：结构层、动态、相对论与显示链路按 [`docs/plans/v2_volumetric_video_plan.md`](plans/v2_volumetric_video_plan.md) 重做：visual atlas / thin-layer / cinematic palette 删除，改为 3D 程序化密度（薄核心 + 7 层半吸收烟雾 + 大尺度低频）、刚体环平流（解决卷绕）、修正 g-factor（β = sqrt(M/(r−2M))、本地静止观者方向）、CIE 黑体 + 白平衡、HDR 高光 bloom 与色散，并接入视频。视觉验收基准为 [`scripts/proto_disk_reference.py`](../scripts/proto_disk_reference.py) 默认输出。下文 §2.4、§3.4–§3.6、§4.3、§5 中与此冲突的内容将随各实施步骤逐节改写；冲突处以该方案为准。
 >
 > **v2.3 参数分层（方案 v0.5）**：参数分为第 1 层基本参数（M、Ṁ、半径、相机）/ 第 2 层物理模型（Page–Thorne、SS 外区结构、Y(g·T)、灰大气、湍流、盘风、尘埃、光行时间、静止观者相机）/ 第 3 层视觉调节（多普勒强度、灰大气强度、核心光学深度、盘厚、程序化结构、曝光与后期），详见方案 §2；参考实现 `params` 子命令可列出全部参数。
+>
+> **已废止章节（S2 起，2026-10-01）**：本文件下述内容与 v2.3 冲突，**以 [`docs/plans/v2_volumetric_video_plan.md`](plans/v2_volumetric_video_plan.md) 为准**，随 S3–S9 逐节改写——
+> §2.4 v2.2 成像契约（cinematic palette / visual_temp / 曝光 reference）；§3.6 调色与色调映射（Tanner Helland、palette_mode）；
+> §4.3 有限厚度积分中的颜色路径（`sample_observed_palette_color` 的可见色温链）；
+> §5.1–§5.3 中涉及 atlas / cinematic / lum_power 的实现与参数草案。
+> S2 已落地的新链路：CIE 黑体色度 + 可见光亮度 Y(g·T) + von Kries 白平衡（`disk_v2/palette.py`）。
 
 ## 目录
 

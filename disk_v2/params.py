@@ -253,65 +253,46 @@ class DiskV2StructureParams:
 
 @dataclass(frozen=True)
 class DiskV2PaletteParams:
-    """Disk V2 调色与色调映射参数（v2.1 新增）。
+    """Disk V2 颜色与显示链参数（v2.3 S2 精简）。
 
     Args:
-        palette_mode: 颜色映射模式。`"physical"` 用于诊断物理剖面；`"cinematic"`
-            使用 log-T 可见色温映射 + 饱和度/暖色调整，用于最终视觉验收。
-        tonemap_mode: 色调映射算法。当前实现仅支持 `"reinhard"`，预留 `"aces"`
-            作为后续切换选项。
+        tonemap_mode: 色调映射算法。当前实现仅支持 `"reinhard"`；`"aces"` 预留
+            （见 `__post_init__` 说明）。
         gamma: sRGB 伽马校正指数。色调映射后输出 LDR 用 `x^(1/gamma)`。
+        white_balance_K: 相机白平衡色温（K）。von Kries 增益使该温度黑体呈精确
+            中性 (1,1,1)；不保证其他温度黑体的 BT.709 亮度（von Kries 固有属性）。
+            6600 K ≈ 中性白点（增益 ≈ 1）。
         opacity_scale: 有效 opacity 缩放。v2.2 reference 中用于
             `tau_effective(r) = opacity_scale · rho_mid(r) · H(r)`；当该值全盘
             显著小于 1 时，应解释为 optically-thin effective opacity，而不是真实
             photosphere。
-        cinematic_saturation: cinematic 模式下的饱和度增强系数。`1.0` 等价于
-            physical 模式；典型取值 `1.2 ~ 1.6`。
-        cinematic_warm_shift: cinematic 模式下的暖色偏移，对 R 通道做 `* (1 + warm_shift)`、
-            对 B 通道做 `* (1 - warm_shift)` 的乘性调整。典型取值 `0.0 ~ 0.15`。
-        visual_temp_outer_K: cinematic 模式下，物理温度 log 映射到的可见色温下限（K）。
-        visual_temp_inner_K: cinematic 模式下，物理温度 log 映射到的可见色温上限（K）。
 
     Physical Meaning:
-        这一层不改变基础物理场，只定义显示链。cinematic 模式先把物理 Kelvin
-        重映射到可见色温区间，再查 Helland 黑体色，避免 `T_peak_K ~ 1e7`
-        直接白化。g-factor 的颜色偏移也应作用在该可见色温链上，而不是把
-        `g · T_phys` 直接送入 LDR 色温公式。
+        这一层不改变基础物理场，只定义显示链。v2.3 起颜色只有一条链：
+        CIE 黑体色度 + 可见光亮度 Y(g·T) + 白平衡 + tonemap（见方案
+        `docs/plans/v2_volumetric_video_plan.md` §2）。旧的 cinematic
+        （log-T 可见色温映射、饱和度 / 暖色 / 低温压暗）已删除：其饱和度增强
+        与 `visual_temp` 重映射属于非物理人工调整，且与 g-factor 频移链耦合
+        后难以解释。
 
     Simplifications:
-        - tonemap 第一版只实现 Reinhard，结构上预留可扩展 ACES Filmic。
-        - cinematic 模式用 log 温度归一化 + 可见色温 lerp，不引入 LUT。
+        - tonemap 只支持 Reinhard，结构上预留可扩展 ACES Filmic。
+        - 白平衡只作用于最终 HDR RGB（S6 接线）。
     """
 
-    palette_mode: str = "physical"
     tonemap_mode: str = "reinhard"
     gamma: float = 2.2
+    white_balance_K: float = 6600.0
     opacity_scale: float = 0.5
-    cinematic_saturation: float = 1.3
-    # X1 + V1 着色：default 0 让"高温偏白"成立；之前 0.08 让所有颜色偏暖，
-    # 与"高温偏白"矛盾。用户仍可通过 CLI 显式启用 warm shift。
-    cinematic_warm_shift: float = 0.0
-    visual_temp_outer_K: float = 2500.0
-    visual_temp_inner_K: float = 12000.0
-    # V1 着色：温度依赖的亮度系数（"低温偏暗、高温偏亮"）。
-    # 在 cinematic palette 里按 t_norm ∈ [0, 1] 线性插值：
-    #   value = value_low_T + t_norm · (value_high_T - value_low_T)
-    # 取 0.7 / 1.2 是 V1 行为的轻量近似（Stefan-Boltzmann 等价 T^4 在
-    # 归一化空间下太陡，1.2/0.7 ≈ 1.71 倍跨度足够视觉可辨）。
-    cinematic_value_low_T: float = 0.7
-    cinematic_value_high_T: float = 1.2
 
     def __post_init__(self) -> None:
-        """校验调色参数的合法范围。
+        """校验显示链参数的合法范围。
 
         Raises:
-            ValueError: 当模式名未支持、伽马或不透明度非正、cinematic 系数越界时抛出。
+            ValueError: 当模式名未支持（含已删除的 cinematic）、伽马 / 不透明度 /
+                白平衡温度非正时抛出。
         """
 
-        if self.palette_mode not in ("physical", "cinematic"):
-            raise ValueError(
-                f"palette_mode must be 'physical' or 'cinematic', got {self.palette_mode!r}"
-            )
         if self.tonemap_mode not in ("reinhard", "aces"):
             raise ValueError(
                 f"tonemap_mode must be 'reinhard' or 'aces', got {self.tonemap_mode!r}"
@@ -329,16 +310,5 @@ class DiskV2PaletteParams:
             raise ValueError("gamma must be positive")
         if self.opacity_scale <= 0.0:
             raise ValueError("opacity_scale must be positive")
-        if self.cinematic_saturation <= 0.0:
-            raise ValueError("cinematic_saturation must be positive")
-        if not -1.0 < self.cinematic_warm_shift < 1.0:
-            raise ValueError("cinematic_warm_shift must be in (-1, 1)")
-        if self.visual_temp_outer_K <= 0.0:
-            raise ValueError("visual_temp_outer_K must be positive")
-        if self.visual_temp_inner_K <= self.visual_temp_outer_K:
-            raise ValueError("visual_temp_inner_K must be greater than visual_temp_outer_K")
-        # V1 着色：温度依赖亮度系数
-        if self.cinematic_value_low_T <= 0.0:
-            raise ValueError("cinematic_value_low_T must be positive")
-        if self.cinematic_value_high_T <= 0.0:
-            raise ValueError("cinematic_value_high_T must be positive")
+        if self.white_balance_K <= 0.0:
+            raise ValueError("white_balance_K must be positive")

@@ -48,6 +48,10 @@ ACCEPT_AR2=50
 ACCEPT_TILT=20
 SKY="output/black_sky.png"
 
+# 主验收渲染配方（v2.3 S2）：原 interstellar preset 删除后改为显式参数，
+# 与 tests/unit/test_disk_v2_exposure_fallback._acceptance_args() 保持一致：
+# 自动曝光（reference white point）+ 不透明盘（opacity 20）+ emission 5 +
+# r_max 25（大盘绕回空间）+ 白点分位 96。
 ACCEPT_COMMON=(
   --texture "$SKY"
   --pov $ACCEPT_POV
@@ -57,6 +61,11 @@ ACCEPT_COMMON=(
   --disk_tilt "$ACCEPT_TILT"
   -r hd
   --device gpu
+  --v2_auto_exposure
+  --v2_opacity_scale 20
+  --v2_emission_scale 5
+  --v2_r_max 25
+  --v2_white_point_percentile 96
 )
 
 # --- 小盘对照参数（v1 默认行为 + V1 兼容范围，用于横向比较） ---
@@ -86,7 +95,6 @@ echo "[acceptance] V2 Step 0 基线（volume 主路径，无 bloom，主验收�
 $PYTHON render.py \
   --disk_model v2 \
   "${ACCEPT_COMMON[@]}" \
-  --v2_visual_preset interstellar \
   --v2_disable_visual_atlas \
   --v2_bloom_intensity 0 \
   --v2_print_stats \
@@ -96,7 +104,6 @@ echo "[acceptance] V2 acceptance — no bloom（volume 主路径，主验收参�
 $PYTHON render.py \
   --disk_model v2 \
   "${ACCEPT_COMMON[@]}" \
-  --v2_visual_preset interstellar \
   --v2_disable_visual_atlas \
   --v2_bloom_intensity 0 \
   --v2_print_stats \
@@ -106,8 +113,8 @@ echo "[acceptance] V2 acceptance — bloom（volume 主路径，主验收参数�
 $PYTHON render.py \
   --disk_model v2 \
   "${ACCEPT_COMMON[@]}" \
-  --v2_visual_preset interstellar \
   --v2_disable_visual_atlas \
+  --v2_bloom_intensity 0.4 \
   --v2_print_stats \
   -o output/v2_acceptance_bloom.png
 
@@ -115,7 +122,6 @@ echo "[acceptance] V2 atlas thin-layer 对照（主验收参数，非主验收�
 $PYTHON render.py \
   --disk_model v2 \
   "${ACCEPT_COMMON[@]}" \
-  --v2_visual_preset interstellar \
   --v2_print_stats \
   -o output/v2_acceptance_atlas.png
 
@@ -123,7 +129,9 @@ echo "[acceptance] V2 小盘对照（v1 兼容范围 ar1=2 ar2=15，volume 主�
 $PYTHON render.py \
   --disk_model v2 \
   "${COMPAT_COMMON[@]}" \
-  --v2_visual_preset interstellar \
+  --v2_auto_exposure \
+  --v2_opacity_scale 20 \
+  --v2_emission_scale 5 \
   --v2_disable_visual_atlas \
   --v2_bloom_intensity 0 \
   --v2_print_stats \

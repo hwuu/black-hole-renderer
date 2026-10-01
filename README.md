@@ -45,56 +45,7 @@ python render.py --device gpu -o output/gpu.png
 V2 用有限厚度发射-吸收积分代替 V1 的零厚度倾斜平面；主视觉结构来自预烘焙 visual atlas（V1 云雾 + spiral warp）。
 当前仅支持单帧渲染（视频和交互模式将在后续 Phase 接入）。
 
-```bash
-# 固定验收（Interstellar 风格参考图；ar1=2, ar2=15，远景相机以保留盘缘）
-bash scripts/v2_visual_acceptance.sh
-
-# 或手动渲染 acceptance
-python render.py --disk_model v2 --texture output/black_sky.png \
-  --pov 24 0 8 --fov 90 --ar1 2 --ar2 15 --disk_tilt 20 \
-  -r hd --device gpu --v2_visual_preset interstellar \
-  -o output/v2_acceptance_bloom.png
-
-# V2 大半径 demo（推荐 GPU + r_out 50 + auto exposure）
-python render.py --disk_model v2 --pov 30 0 10 --fov 90 \
-                 --ar1 3 --ar2 50 --disk_tilt 20 \
-                 -r hd --device gpu --v2_auto_exposure \
-                 -o output/v2_demo.png
-
-# 打印 HDR/LDR 诊断统计（不改变图像）
-python render.py --disk_model v2 --ar1 3 --ar2 50 --device gpu \
-                 --v2_print_stats -o output/v2_stats.png
-
-# 关闭相对论 g-factor 看纯发射率
-python render.py --disk_model v2 --v2_disable_g_factor \
-                 --ar1 3 --ar2 50 --device gpu \
-                 -o output/v2_no_g.png
-
-# 启用 HDR 域 Bloom（实验性，参数留待视觉验收阶段重校）
-python render.py --disk_model v2 \
-                 --ar1 3 --ar2 50 --device gpu \
-                 --v2_bloom_intensity 0.5 \
-                 --v2_bloom_threshold 0.3 \
-                 --v2_bloom_radius 4 \
-                 -o output/v2_bloom.png
-
-# 手动降低 HDR 发射（高级参数；常规优先用 --v2_auto_exposure）
-python render.py --disk_model v2 \
-                 --ar1 3 --ar2 50 --device gpu \
-                 --v2_emission_scale 0.05 \
-                 -o output/v2_exposure_check.png
-
-# physical palette + 关闭 cinematic 增强
-python render.py --disk_model v2 --v2_palette_mode physical \
-                 --ar1 3 --ar2 50 --device gpu \
-                 -o output/v2_physical.png
-```
-
-V2 参数说明见下方 "Disk V2 参数" 小节。
-
-### 视频生成
-
-```bash
+bash
 # 环绕视频（默认 3600 帧，36 fps）
 python render.py --video --orbit -o output/demo.mp4
 
@@ -148,7 +99,6 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--disk_model` | 吸积盘模型: `v1` / `v2` | v1 |
 | `--v2_T_peak_K` | 中面温度峰值（K），决定颜色基调 | 1e7 |
 | `--v2_clump_count` | 显式团块数量 | 400 |
-| `--v2_palette_mode` | 调色模式: `physical` / `cinematic` | cinematic |
 | `--v2_volume_samples` | 盘内体积积分步数 | 16 |
 | `--v2_opacity_scale` | 盘体不透明度缩放 | 0.5 |
 | `--v2_lum_power` | g-factor 亮度指数（Phase 5 严格物理 = 4） | 4.0 |
@@ -163,7 +113,6 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--v2_white_point_percentile` | auto exposure 使用的 HDR 亮度分位数 | 99.0 |
 | `--v2_print_stats` | 渲染后打印 HDR/LDR 诊断统计 | 关闭 |
 | `--v2_seed` | 团块/atlas 随机种子 | 42 |
-| `--v2_visual_preset` | 视觉预设：`interstellar`（auto exposure + cinematic + 弱 bloom） | 无 |
 | `--v2_turbulence_strength` | visual atlas 云雾强度 | 0.35 |
 | `--v2_spiral_warp_strength` | 径向 spiral warp 强度 | 1.8 |
 | `--v2_alpha_clip_threshold` | atlas Alpha Clip 阈值 | 0.01 |

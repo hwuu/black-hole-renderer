@@ -37,30 +37,26 @@ def _gpu_available() -> bool:
 def _acceptance_args() -> argparse.Namespace:
     """构造与 `scripts/v2_visual_acceptance.sh` 主验收命令等价的 args。
 
-    对应：
+    对应（v2.3 S2：`--v2_visual_preset` 已删除）：
         --disk_model v2 --ar1 3 --ar2 50 --pov "95 0 32" --fov 90
         --disk_tilt 20 -r hd --device gpu
-        --v2_visual_preset interstellar --v2_disable_visual_atlas
-        --v2_print_stats
+        --v2_auto_exposure --v2_disable_visual_atlas --v2_print_stats
 
-    注意：bloom 三个 CLI 参数默认 None（修 C），让 preset 能识别"用户未指定"。
+    bloom 三参数默认 None（区分"用户未指定"与"显式传 0"）。
     """
     return argparse.Namespace(
-        # V2 CLI 默认值
-        v2_visual_preset="interstellar",
-        v2_auto_exposure=False,
+        v2_auto_exposure=True,
         v2_bloom_threshold=None,
         v2_bloom_intensity=None,
         v2_bloom_radius=None,
-        v2_palette_mode="cinematic",
         v2_tonemap_mode=None,
-        v2_opacity_scale=0.55,
-        v2_emission_scale=1.0,
+        v2_opacity_scale=20.0,
+        v2_emission_scale=5.0,
         v2_lum_power=4.0,
-        v2_volume_samples=16,
-        v2_r_max=None,
+        v2_volume_samples=32,
+        v2_r_max=25.0,
         r_max=10.0,
-        v2_white_point_percentile=99.0,
+        v2_white_point_percentile=96.0,
         v2_disable_visual_atlas=True,
     )
 
@@ -79,8 +75,7 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
     def _make_acceptance_renderer(self, *, width: int = 256, height: int = 256, args=None):
         """构造与 acceptance 脚本主验收一致的 renderer，但用小尺寸跑 CI。
 
-        关键：走 `render.resolve_v2_render_options` 让 `interstellar` preset
-        生效——这才是真正的"主验收路径"。
+        走 `render.resolve_v2_render_options`，保持与主验收一致的选项解析路径。
 
         Args:
             width, height: 测试尺寸（默认 256×256 让 CI 快）。
@@ -99,7 +94,7 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         p = DiskV2Params(r_in=3.0, r_out=50.0)
         # use_visual_atlas=False 对应 --v2_disable_visual_atlas
         sp = DiskV2StructureParams(use_visual_atlas=False)
-        pp = DiskV2PaletteParams(palette_mode=opts["palette_mode"])
+        pp = DiskV2PaletteParams()
 
         return DiskV2Renderer(
             width=width, height=height, params=p, structure_params=sp, palette_params=pp,
@@ -180,9 +175,9 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             img_off = r_off.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
 
-        # Bloom on（preset 默认 i=0.4）
+        # Bloom on（默认配置给 i=0.0 → 关闭；显式打开）
         args_on = _acceptance_args()
-        # args_on.v2_bloom_intensity = None → preset 给 0.4
+        args_on.v2_bloom_intensity = 0.4
         r_on = self._make_acceptance_renderer(args=args_on)
         with redirect_stdout(io.StringIO()):
             img_on = r_on.render(cam_pos=[95.0, 0.0, 32.0], fov=90.0)
@@ -203,7 +198,7 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         s = r.last_stats
         self.assertIsNotNone(s.actual_hdr_white_point)
         self.assertIsNotNone(s.white_point_percentile)
-        # interstellar preset 应当把 white_point_percentile 改为 96
+        # 验收配置使用 white_point_percentile=96
         self.assertEqual(s.white_point_percentile, 96.0)
 
     # --- 单元逻辑：手工构造 HDR 验证三档分支 ---
@@ -214,7 +209,7 @@ class DiskV2ExposureFallbackTest(unittest.TestCase):
         ref_wp = r.reference_white_point
 
         # 让 HDR 99 分位 ≈ 3.0 · ref_wp（trusted 内）
-        # 注意 preset 已经把 white_point_percentile 设为 96，调用 _compute_white_point 时
+        # 验收配置 white_point_percentile=96，调用 _compute_white_point 时
         # 用的是 self.white_point_percentile，所以构造 HDR p96 即可。
         target = 3.0 * ref_wp
         hdr = np.zeros((64, 64, 3), dtype=np.float32)
