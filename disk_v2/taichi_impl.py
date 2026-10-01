@@ -778,9 +778,9 @@ class DiskV2Taichi:
 
     @ti.func
     def _page_thorne_temperature(self, r):
-        """Page–Thorne 相对论温度 T(r)（查表，log r 线性插值）。"""
-        u = (ti.log(ti.min(ti.max(r, self._r_in), self._r_out)) - ti.log(self._r_in)) / (
-            ti.log(self._r_out) - ti.log(self._r_in)
+        """Page–Thorne 相对论温度 T(r)（查表，线性 r 插值——与 LUT 构建一致）。"""
+        u = (ti.min(ti.max(r, self._r_in), self._r_out) - self._r_in) / (
+            self._r_out - self._r_in
         )
         f = u * (_BB_LUT_N - 1)
         i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)

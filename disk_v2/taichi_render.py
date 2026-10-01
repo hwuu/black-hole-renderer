@@ -188,6 +188,7 @@ class DiskV2Renderer:
 
         # 输出图像 field（HDR 浮点；Bloom + tonemap 在 Python 端 / 简化 kernel 完成）。
         self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
+        self.volume_step_count = ti.field(dtype=ti.i32, shape=())
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         # 方向 1（2026-06-14）：背景与盘分离处理
         # - disk_hdr_field: 盘的物理通量（参与曝光 + tonemap + bloom）
@@ -403,6 +404,7 @@ class DiskV2Renderer:
                                 dm = 0.5 * (dir_ + new_dir)
                                 em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
                                     r_local, z_local, phi_local, 2000.0 - lam, dm[2])
+                                self.volume_step_count[None] += 1
                                 if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
                                     ds = (new_pos - pos).norm()
                                     g_phys = 1.0
@@ -923,6 +925,7 @@ class DiskV2Renderer:
         self._setup_camera(cam_pos, fov)
         if self.volume_params is not None:
             self.disk_ti.update_advection(2000.0)
+        self.volume_step_count[None] = 0
         self._ray_march_kernel()
 
         if self.use_postfx and self.volume_params is not None:
