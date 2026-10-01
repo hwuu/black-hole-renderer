@@ -4618,6 +4618,8 @@ def parse_args() -> argparse.Namespace:
                         help="V2 模式下 g-factor 上限，避免极端蓝移侧饱和 (default: 6)")
     parser.add_argument("--v2_disable_g_factor", action="store_true",
                         help="V2 模式下关闭相对论 g-factor，仅输出无方向性发射率")
+    parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,
+                        help="V2 视频模式：内缘开普勒轨道对应视频秒数 (default: 16.0)")
     parser.add_argument("--v2_r_max", type=float, default=None,
                         help="V2 模式下逃逸半径下限。默认 None 表示使用 --r_max（10）；"
                              "建议在 r_out=50 默认下传 20，让大盘和远端光线有充分的绕回空间。")
@@ -4795,13 +4797,85 @@ if __name__ == "__main__":
             ignore_taichi_cache=args.ignore_taichi_cache
         )
 
+    def _render_video_v2(args, width, height, fov):
+        """V2 视频渲染（S8）：体积密度场 + postfx，曝光首帧锁定。"""
+        import math as _math
+        from disk_v2.params import (
+            DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams, DiskV2VolumeParams,
+        )
+        from disk_v2.taichi_render import DiskV2Renderer
+
+        arch = ti.gpu if args.device == "gpu" else ti.cpu
+        ti.init(arch=arch, default_fp=ti.f32)
+        skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
+        v2_params = DiskV2Params(r_in=args.disk_inner_radius, r_out=args.disk_outer_radius,
+                                 T_peak_K=args.v2_T_peak_K)
+        v2_structure = build_v2_structure_params(args)
+        v2_palette = DiskV2PaletteParams(tonemap_mode="reinhard")
+        v2_volume = DiskV2VolumeParams()
+        v2_r_max = args.v2_r_max if args.v2_r_max is not None else max(args.r_max, 50.0)
+
+        renderer = DiskV2Renderer(
+            width=width, height=height,
+            params=v2_params, structure_params=v2_structure,
+            palette_params=v2_palette, skybox=skybox,
+            step_size=args.step_size, r_max=v2_r_max,
+            disk_tilt_deg=args.disk_tilt,
+            volume_samples=args.v2_volume_samples if hasattr(args, 'v2_volume_samples') else 32,
+            opacity_scale=args.v2_opacity_scale if hasattr(args, 'v2_opacity_scale') else 1.0,
+            emission_scale=args.v2_emission_scale if hasattr(args, 'v2_emission_scale') else 1.0,
+            auto_exposure=True,
+            device=args.device,
+            volume_params=v2_volume,
+            use_postfx=True,
+        )
+
+        # 物理时间步：内缘轨道周期 = v2_orbit_seconds 视频秒
+        r_in_m = args.disk_inner_radius
+        omega_in = _math.sqrt(0.5 / r_in_m ** 3)
+        period_in = 2 * _math.pi / omega_in
+        dt_per_frame = period_in / (args.v2_orbit_seconds * args.fps)
+
+        # 相机轨道
+        orbit_deg = args.orbit_degrees if args.orbit else 0.0
+        base_azim = _math.atan2(args.pov[1], args.pov[0])
+        base_dist = _math.sqrt(args.pov[0]**2 + args.pov[1]**2 + args.pov[2]**2)
+        base_elev = _math.asin(args.pov[2] / max(base_dist, 1e-9))
+
+        print(f"[V2 video] {args.n_frames} 帧 @ {args.fps} fps，"
+              f"内缘周期 {args.v2_orbit_seconds}s，dt={dt_per_frame:.4f}")
+
+        t0 = 2000.0  # 物理起始时间（参考实现同款）
+        exposure = None
+        writer = iio.imopen(args.output, "w", plugin="pyav")
+        writer.init_video_stream("libx264", fps=args.fps)
+        import time as _time
+        start = _time.time()
+        for f in range(args.n_frames):
+            t = t0 + f * dt_per_frame
+            renderer.disk_ti.update_advection(t)
+            # 相机轨道
+            azim = base_azim + _math.radians(orbit_deg) * f / max(args.n_frames - 1, 1)
+            cam_x = base_dist * _math.cos(base_elev) * _math.cos(azim)
+            cam_y = base_dist * _math.cos(base_elev) * _math.sin(azim)
+            cam_z = base_dist * _math.sin(base_elev)
+            frame = renderer.render(cam_pos=[cam_x, cam_y, cam_z], fov=fov)
+            writer.write_frame((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+            if f % 24 == 0:
+                elapsed = _time.time() - start
+                print(f"  frame {f}/{args.n_frames}  {elapsed:.1f}s")
+        writer.close()
+        print(f"[V2 video] 完成: {args.output} ({_time.time() - start:.1f}s)")
+
     if args.disk_model == "v2":
         # V2 路径：独立 DiskV2Renderer，不复用 V1 的 TaichiRenderer。
         # 当前仅支持单帧渲染（无 Bloom / 视频 / 交互；Phase 7 再扩展）。
-        if args.video or args.interactive:
+        if args.interactive:
             raise NotImplementedError(
-                "--disk_model v2 当前仅支持单帧渲染；视频和交互模式将在后续 Phase 接入。"
+                "--disk_model v2 交互模式尚未接入。"
             )
+        if args.video:
+            _render_video_v2(args, width, height, fov)
         if args.device != "gpu":
             raise ValueError(
                 "--disk_model v2 当前仅推荐并支持 --device gpu。CPU 路径在小图下也可能耗时数分钟且无进度输出；"
