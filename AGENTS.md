@@ -187,3 +187,31 @@ python -m unittest tests/unit/test_disk_v2_array_utils tests/unit/test_disk_v2_c
 # V2 视觉验收（GPU）
 bash scripts/v2_visual_acceptance.sh
 ```
+
+
+### 踩坑记录（v2.3 S0-S9 实施期间）
+
+28. **`blackbody_luminance_ti` 多包一层 `exp()` → 亮度比值全错（S6 修复）**
+    - 现象：V2 渲染全红，HDR 值 ~1e13（应为 ~1）
+    - 根因：`blackbody_luminance_ti` 返回 `exp(lnY) = Y`，而 kernel 用
+      `exp(Y - lnY_peak)` 计算 `Y/Y_peak` 比值——多了一层 exp 使所有温度的比值
+      都变成 ~exp(32) ≈ 1e14，冷区红光不被压制
+    - 修复：返回 `lnY`（与参考实现 `ln_luminance` 一致），kernel 用
+      `exp(lnY(T) - lnY(T_peak))` 得到正确比值
+    - 文件位置：`disk_v2/taichi_impl.py:blackbody_luminance_ti`
+
+29. **`from __future__ import annotations` 使 `ti.template()` 失效（S5 踩到）**
+    - 现象：标定 kernel 编译报 `TaichiSyntaxError: Invalid type annotation`
+    - 根因：Python 3.12 中 `from __future__ import annotations` 把所有注解变成
+      字符串，Taichi 无法把字符串 `'ti.template()'` 解析回类型
+    - 修复：`taichi_impl.py` 移除该 import（其余模块可用，但含 `@ti.kernel`
+      定义的文件不可用）
+    - 文件位置：`disk_v2/taichi_impl.py`
+
+30. **渲染核内 `self.xxx` 属性必须在 `_compile_kernels()` 之前赋值（S6 踩到）**
+    - 现象：`AttributeError: 'DiskV2Renderer' object has no attribute 'volume_params'`
+    - 根因：`_compile_kernels()` 在 `__init__` 中被调用时通过闭包读取
+      `self.volume_params`，但该属性在 `_compile_kernels()` 之后才赋值
+    - 修复：把 `self.volume_params = volume_params` 移到
+      `self._compile_kernels()` 之前
+    - 文件位置：`disk_v2/taichi_render.py:__init__`

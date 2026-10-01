@@ -40,10 +40,13 @@ python render.py -r 4k -o output/4k.png
 python render.py --device gpu -o output/gpu.png
 ```
 
-### Disk V2 模式（v2.1，视觉恢复 experimental）
+### Disk V2 模式（v2.3，体积密度场 + 物理后处理）
 
-V2 用有限厚度发射-吸收积分代替 V1 的零厚度倾斜平面；主视觉结构来自预烘焙 visual atlas（V1 云雾 + spiral warp）。
-当前仅支持单帧渲染（视频和交互模式将在后续 Phase 接入）。
+V2 用 3D 体积密度场（SS 外区结构 + Page–Thorne 温度 + 灰大气 + 刚体环平流 +
+乘性级联噪声 + 烟雾 + 尘埃）+ 体积发射-吸收积分 + 物理后处理链
+（CIE 黑体 + Y(g·T) 亮度 + von Kries 白平衡 + 高光 bloom + 双色散 + 保色度 ACES）。
+参数分三层（基本参数 / 物理模型 / 视觉调节），详见
+[`docs/plans/v2_volumetric_video_plan.md`](docs/plans/v2_volumetric_video_plan.md) §2。
 
 bash
 # 环绕视频（默认 3600 帧，36 fps）

@@ -8,6 +8,12 @@
 >
 > **v2.3 参数分层（方案 v0.5）**：参数分为第 1 层基本参数（M、Ṁ、半径、相机）/ 第 2 层物理模型（Page–Thorne、SS 外区结构、Y(g·T)、灰大气、湍流、盘风、尘埃、光行时间、静止观者相机）/ 第 3 层视觉调节（多普勒强度、灰大气强度、核心光学深度、盘厚、程序化结构、曝光与后期），详见方案 §2；参考实现 `params` 子命令可列出全部参数。
 >
+> **v2.3 实施完成（2026-10-01）**：S0（参考实现）→ S1（相对论修正）→ S2（CIE 颜色链路，删除 cinematic）→
+> S3（噪声库）→ S4（刚体环平流 + f64 相位表）→ S5（SS 结构 + PT 温度 + 灰大气 + 湍流 + 烟雾 + 尘埃）→
+> S6（体积光追 + Y(g·T) 三温度源）→ S7（postfx 物理后处理链）→ S8（视频）→ S9（文档）。
+> 涉及 bug 修复：`blackbody_luminance_ti` 返回 lnY（非 Y）、吸收系数用标定 kappa_vol、
+> doppler_lum/color 分离指数接入。
+>
 > **已废止章节（S2 起，2026-10-01）**：本文件下述内容与 v2.3 冲突，**以 [`docs/plans/v2_volumetric_video_plan.md`](plans/v2_volumetric_video_plan.md) 为准**，随 S3–S9 逐节改写——
 > §2.4 v2.2 成像契约（cinematic palette / visual_temp / 曝光 reference）；§3.6 调色与色调映射（Tanner Helland、palette_mode）；
 > §4.3 有限厚度积分中的颜色路径（`sample_observed_palette_color` 的可见色温链）；
