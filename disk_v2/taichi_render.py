@@ -35,6 +35,7 @@ import taichi as ti
 
 from .camera import build_camera_v1_compatible
 from .imaging import reference_exposure
+from .noise_ti import hashf as _hashf
 from .postfx import postfx
 from .params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams, DiskV2VolumeParams
 from .stats import RenderStats, compute_render_stats, hdr_luminance
@@ -189,6 +190,8 @@ class DiskV2Renderer:
         # 输出图像 field（HDR 浮点；Bloom + tonemap 在 Python 端 / 简化 kernel 完成）。
         self.hdr_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         self.volume_step_count = ti.field(dtype=ti.i32, shape=())
+        self.jitter_seed = ti.field(dtype=ti.i32, shape=())
+        self.jitter_seed[None] = 0
         self.image_field = ti.Vector.field(3, dtype=ti.f32, shape=(width, height))
         # 方向 1（2026-06-14）：背景与盘分离处理
         # - disk_hdr_field: 盘的物理通量（参与曝光 + tonemap + bloom）
@@ -325,6 +328,7 @@ class DiskV2Renderer:
                 ray_dir = (pixel_pos - cp).normalized()
 
                 pos = cp
+                step_idx = 0
                 dir_ = ray_dir
 
                 # 角动量平方 L² = |r × dir|²。
@@ -361,6 +365,12 @@ class DiskV2Renderer:
                         zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.05
                         d_slab = ti.max(ti.abs(pos[2]) - zb, 0.0) + ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
                         h = ti.min(h, 0.03 + 0.3 * d_slab)
+
+                    # 首步抖动：打乱采样网格周期性（对齐 Proto，消除方块锯齿）
+                    if step_idx == 0:
+                        jit = _hashf(i, j, self.jitter_seed[None])
+                        h = h * jit
+                    step_idx += 1
 
                     # RK4 主光线。
                     k1p = h * dir_
@@ -926,6 +936,7 @@ class DiskV2Renderer:
         if self.volume_params is not None:
             self.disk_ti.update_advection(2000.0)
         self.volume_step_count[None] = 0
+        self.jitter_seed[None] += 1
         self._ray_march_kernel()
 
         if self.use_postfx and self.volume_params is not None:
