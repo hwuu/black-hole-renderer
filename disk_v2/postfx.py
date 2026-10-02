@@ -21,6 +21,22 @@ import numpy as np
 
 from .palette import white_balance_gain
 
+
+def hdr_luminance(rgb_hdr: np.ndarray) -> np.ndarray:
+    """计算 HDR RGB 的 BT.709 亮度。
+
+    Args:
+        rgb_hdr: 形状 `(..., 3)` 的非负线性 HDR RGB。
+
+    Returns:
+        与输入去掉最后一维同形状的亮度标量场（float64，≥ 0）。
+
+    Formula:
+        `L = 0.2126·R + 0.7152·G + 0.0722·B`
+    """
+    rgb = np.asarray(rgb_hdr, dtype=np.float64)
+    return 0.2126 * rgb[..., 0] + 0.7152 * rgb[..., 1] + 0.0722 * rgb[..., 2]
+
 # ---------------------------------------------------------------------------
 # 盒式模糊（近似高斯）
 # ---------------------------------------------------------------------------
@@ -284,6 +300,25 @@ def adjust_saturation(rgb: np.ndarray, saturation: float = 1.0) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # 6. sRGB 编码
 # ---------------------------------------------------------------------------
+def srgb_decode(x: np.ndarray) -> np.ndarray:
+    """sRGB 编码值 → 线性光（IEC 61966-2-1，`srgb_encode` 的逆）。
+
+    Args:
+        x: sRGB 编码 RGB，`[0, 1]`，任意形状。
+
+    Returns:
+        同形状线性 RGB，`[0, 1]`。
+
+    Formula:
+        `x ≤ 0.04045：x/12.92`；否则 `((x + 0.055)/1.055)^2.4`
+
+    Physical Meaning:
+        天空盒 PNG（与程序星空）存的是 sRGB 编码值，必须先解码成线性光才能与盘的
+        线性 HDR 相加并参与 bloom / 色调映射，否则相当于叠加两次伽马。
+    """
+    return np.where(x <= 0.04045, x / 12.92, np.power((np.clip(x, 0, 1) + 0.055) / 1.055, 2.4))
+
+
 def srgb_encode(x: np.ndarray) -> np.ndarray:
     """线性 RGB → sRGB 编码。
 

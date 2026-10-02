@@ -6,8 +6,6 @@
 - 圆轨道局部速度 β = sqrt(M / (r − 2M))
 - 光子坐标方向 → 本地静止观者方向变换
 - 盘面 g-factor 与严格 GR 解析解对照（冲击参数由守恒量独立求得）
-- 550 nm Planck 波段亮度增强
-- 亮度 / 颜色频移强度指数
 - Taichi helper 与 NumPy reference parity
 """
 
@@ -21,8 +19,6 @@ from disk_v2.relativity import (
     exact_equatorial_g_factor,
     local_photon_direction,
     orbital_beta_local,
-    planck_band_boost,
-    scaled_shift_factors,
 )
 
 
@@ -126,40 +122,6 @@ class DiskGFactorTest(unittest.TestCase):
         self.assertEqual(disk_g_factor(pos, d, self.R_OBS).shape, (2,))
 
 
-class PlanckBandBoostTest(unittest.TestCase):
-    def test_unity_at_g_equal_one(self):
-        self.assertAlmostEqual(planck_band_boost(4500.0, 1.0), 1.0, places=12)
-
-    def test_monotonic_in_g(self):
-        g = np.linspace(0.5, 1.6, 23)
-        self.assertTrue(np.all(np.diff(planck_band_boost(4500.0, g)) > 0))
-
-    def test_rayleigh_jeans_limit(self):
-        """T ≫ hc/(λk) 时 B_ν ∝ T，增强 → g。"""
-        self.assertAlmostEqual(planck_band_boost(1e8, 1.3), 1.3, places=3)
-
-    def test_steeper_than_g4_for_cool_disk(self):
-        """4500 K 时 550 nm 处 hν/kT ≈ 5.8，增强应陡于 bolometric g⁴。"""
-        self.assertGreater(planck_band_boost(4500.0, 1.2), 1.2 ** 4)
-
-
-class ScaledShiftTest(unittest.TestCase):
-    def test_exponent_zero_disables_shift(self):
-        g_lum, g_col = scaled_shift_factors(1.3, 0.0, 0.0)
-        self.assertEqual(g_lum, 1.0)
-        self.assertEqual(g_col, 1.0)
-
-    def test_exponent_one_is_physical(self):
-        g_lum, g_col = scaled_shift_factors(0.8, 1.0, 1.0)
-        self.assertAlmostEqual(g_lum, 0.8)
-        self.assertAlmostEqual(g_col, 0.8)
-
-    def test_independent_exponents(self):
-        g_lum, g_col = scaled_shift_factors(1.2, 0.5, 2.2)
-        self.assertAlmostEqual(g_lum, 1.2 ** 0.5)
-        self.assertAlmostEqual(g_col, 1.2 ** 2.2)
-
-
 class TaichiParityTest(unittest.TestCase):
     """Taichi helper 与 NumPy reference 一致（f32 容差）。"""
 
@@ -216,25 +178,6 @@ class TaichiParityTest(unittest.TestCase):
 
         k()
         np.testing.assert_allclose(out.to_numpy(), disk_g_factor(self.pos, self.dirs, 60.0), rtol=1e-4)
-
-    def test_planck_boost_parity(self):
-        ti, T = self.ti, self.T
-        temps = np.array([1500.0, 3000.0, 4500.0, 9000.0])
-        gs = np.array([0.6, 0.9, 1.2, 1.5])
-        out = ti.field(ti.f32, shape=(4, 4))
-
-        @ti.kernel
-        def k():
-            for i, j in out:
-                out[i, j] = T.planck_band_boost_ti(temps_f[i], gs_f[j])
-
-        temps_f = ti.field(ti.f32, shape=4)
-        gs_f = ti.field(ti.f32, shape=4)
-        temps_f.from_numpy(temps.astype(np.float32))
-        gs_f.from_numpy(gs.astype(np.float32))
-        k()
-        expected = planck_band_boost(temps[:, None], gs[None, :])
-        np.testing.assert_allclose(out.to_numpy(), expected, rtol=1e-4)
 
 
 if __name__ == "__main__":

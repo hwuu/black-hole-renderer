@@ -124,5 +124,29 @@ class VolumeParamsTest(unittest.TestCase):
             DiskV2VolumeParams(dln_r=-1.0)
 
 
+class DiskGeometryParamsTest(unittest.TestCase):
+    """`DiskV2Params`：ISCO 钳制与半径顺序校验（自 test_disk_v2_physical_fields 迁入）。"""
+
+    def test_r_in_below_isco_is_clamped_with_warning(self):
+        import warnings
+
+        from disk_v2.params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            params = DiskV2Params(r_in=2.0, r_out=10.0)
+        self.assertEqual(params.r_in, SCHWARZSCHILD_ISCO_R_S)
+        self.assertTrue(any("ISCO" in str(w.message) for w in caught))
+
+    def test_r_out_must_exceed_clamped_r_in(self):
+        import warnings
+
+        from disk_v2.params import DiskV2Params
+        # r_in 钳制为 3.0 后，r_out=2.5 仍然 ≤ r_in，应 raise。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with self.assertRaises(ValueError):
+                DiskV2Params(r_in=2.0, r_out=2.5)
+
+
 if __name__ == "__main__":
     unittest.main()

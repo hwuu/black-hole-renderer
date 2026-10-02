@@ -6,8 +6,8 @@
 - CIE 黑体色度表：与数值积分参考一致、低温偏红 / 高温偏蓝单调、色温方向
 - 可见光亮度 Y(T)：单调、与数值积分一致、T = 0 或负温度行为
 - 白平衡：von Kries 增益、T_wb 黑体输出中性、亮度（BT.709 加权）守恒
-- palette_color 新语义（只剩 physical；cinematic 已删除）
-- Taichi parity：blackbody_color_ti / blackbody_luminance_ti / white_balance_gain_ti
+- Taichi parity：blackbody_color_ti / blackbody_luminance_ti
+- 查找表越界钳制
 """
 
 import math
@@ -15,11 +15,9 @@ import unittest
 
 import numpy as np
 
-from disk_v2.params import DiskV2PaletteParams
 from disk_v2.palette import (
     blackbody_color,
     blackbody_luminance,
-    palette_color,
     white_balance_gain,
 )
 
@@ -149,32 +147,6 @@ class WhiteBalanceTest(unittest.TestCase):
         self.assertTrue(np.all(g > 0))
 
 
-class PaletteSemanticsTest(unittest.TestCase):
-    def test_cinematic_mode_removed(self):
-        """palette_mode（含 'cinematic'）应已删除：字段不存在，传参被拒。"""
-        self.assertNotIn("palette_mode", DiskV2PaletteParams.__dataclass_fields__)
-        with self.assertRaises(TypeError):
-            DiskV2PaletteParams(palette_mode="cinematic")
-
-    def test_cinematic_helpers_removed(self):
-        """cinematic 相关函数与参数应已删除。"""
-        import disk_v2.palette as pal
-        for name in ("cinematic_color", "cinematic_visual_temperature",
-                     "physical_temperature_outer_K", "_rgb_saturation_boost"):
-            self.assertFalse(hasattr(pal, name), msg=name)
-        for field in ("cinematic_saturation", "cinematic_warm_shift",
-                      "visual_temp_outer_K", "visual_temp_inner_K",
-                      "cinematic_value_low_T", "cinematic_value_high_T"):
-            self.assertNotIn(field, DiskV2PaletteParams.__dataclass_fields__)
-
-    def test_palette_color_equals_blackbody_color(self):
-        """palette_color 直接返回黑体色（无二级映射）。"""
-        for t in (3000.0, 6000.0):
-            np.testing.assert_allclose(
-                np.asarray(palette_color(t, DiskV2PaletteParams())),
-                np.asarray(blackbody_color(t)), rtol=1e-12)
-
-
 class TaichiParityTest(unittest.TestCase):
     """Taichi 查表与 NumPy 参考一致（f32 容差）。"""
 
@@ -186,14 +158,9 @@ class TaichiParityTest(unittest.TestCase):
         from disk_v2 import taichi_impl as T
 
         cls.ti, cls.T = ti, T
-        cls.pal = DiskV2PaletteParams()
-        # 实例化 DiskV2Taichi 以构建 LUT field（cinematic 已删，is_cinematic 恒 False）
-        from disk_v2.params import DiskV2Params, DiskV2StructureParams
-        cls.disk = T.DiskV2Taichi(
-            DiskV2Params(r_in=3.0, r_out=30.0, T_peak_K=4500.0),
-            DiskV2StructureParams(),
-            cls.pal,
-        )
+        # 只上传查找表（不构造体积模型，避免编译整套体积 kernel）
+        cls.disk = T.DiskV2Taichi.__new__(T.DiskV2Taichi)
+        cls.disk._init_luts()
 
     def test_blackbody_color_parity(self):
         ti = self.ti
@@ -233,70 +200,9 @@ class TaichiParityTest(unittest.TestCase):
 def ti_exp(x):
     return np.exp(x)
 
-    def test_white_balance_parity(self):
-        """每档 white_balance_K 构造的 DiskV2Taichi，其 kernel 增益与 NumPy 一致。
 
-        增益在 __init__ 按 white_balance_K 预计算并上传 field（Taichi kernel
-        闭包不接受运行时向量参数），因此每个 T_wb 需要单独构造实例。
-        """
-        from disk_v2.params import DiskV2Params, DiskV2StructureParams
-        for twb in (3500.0, 4500.0, 5500.0, 6600.0):
-            disk = self.T.DiskV2Taichi(
-                DiskV2Params(r_in=3.0, r_out=30.0, T_peak_K=4500.0),
-                DiskV2StructureParams(),
-                DiskV2PaletteParams(white_balance_K=twb),
-            )
-            out = self.ti.Vector.field(3, self.ti.f32, shape=1)
-
-            @self.ti.kernel
-            def k():
-                out[0] = disk.white_balance_gain_ti(twb)
-
-            k()
-            np.testing.assert_allclose(
-                out.to_numpy()[0], np.asarray(white_balance_gain(twb)),
-                rtol=1e-6, atol=1e-7, err_msg=f"twb={twb}",
-            )
-
-
-class ContractAndBoundaryTest(unittest.TestCase):
-    """白平衡 kernel 契约与 LUT 越界行为。"""
-
-    @classmethod
-    def setUpClass(cls):
-        import taichi as ti
-        ti.init(arch=ti.cpu, default_fp=ti.f32)
-        from disk_v2 import taichi_impl as T
-        from disk_v2.params import (
-            DiskV2PaletteParams,
-            DiskV2Params,
-            DiskV2StructureParams,
-        )
-        cls.ti, cls.T = ti, T
-        # 构造温度与"调用温度"故意不同，锁定 kernel 增益取构造值的契约
-        cls.disk = T.DiskV2Taichi(
-            DiskV2Params(r_in=3.0, r_out=30.0, T_peak_K=4500.0),
-            DiskV2StructureParams(),
-            DiskV2PaletteParams(white_balance_K=5000.0),
-        )
-
-    def test_wb_kernel_ignores_runtime_argument(self):
-        """`white_balance_gain_ti(T_wb)` 的 T_wb 仅作文档语义：传任何值都返回
-        构造时 `white_balance_K`（5000 K）的增益——防止调用方误以为参数生效。"""
-        out = self.ti.Vector.field(3, self.ti.f32, shape=3)
-
-        @self.ti.kernel
-        def k():
-            out[0] = self.disk.white_balance_gain_ti(3000.0)
-            out[1] = self.disk.white_balance_gain_ti(5000.0)
-            out[2] = self.disk.white_balance_gain_ti(20000.0)
-
-        k()
-        expected = np.asarray(white_balance_gain(5000.0))
-        got = out.to_numpy()
-        np.testing.assert_allclose(got, np.stack([expected] * 3), rtol=1e-6, atol=1e-7)
-        # 与"参数生效"的假设相反：3000/20000 K 的增益必须不同于实际值
-        self.assertFalse(np.allclose(got[0], np.asarray(white_balance_gain(3000.0))))
+class LutBoundaryTest(unittest.TestCase):
+    """LUT 越界行为。"""
 
     def test_color_lut_clamps_out_of_range_temperature(self):
         """色度表 [1000, 40000] K 外的温度被端点钳制（而非外推）。

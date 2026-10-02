@@ -2,7 +2,7 @@
 
 用途：
     把"看图猜差距"变成客观验收。两边使用同一相机（dist = 40、仰角 7°、竖直 FOV 38°）、
-    同一盘参数（r_in = 3、r_out = 30、预设 M）、同一时刻 t = 2000、同一超采样，
+    同一盘参数（r_in = 3、r_out = 30、预设 M）、同一时刻 t（默认 2000，`--t` 可改）、同一超采样，
     分别输出线性 HDR，再各自按参考实现的自动曝光（盘区亮度 p99.9 → 0.9）归一后比较。
 
 输出：
@@ -36,13 +36,14 @@ CAM_DIST, CAM_ELEV_DEG, FOV_DEG = 40.0, 7.0, 38.0
 R_IN, R_OUT, T_FRAME = 3.0, 30.0, 2000.0
 
 
-def run_proto(w: int, h: int, ss: int, reuse: bool) -> tuple[np.ndarray, np.ndarray]:
+def run_proto(w: int, h: int, ss: int, reuse: bool, t: float = T_FRAME) -> tuple[np.ndarray, np.ndarray]:
     """子进程运行 Proto `frame`（独立 Taichi 运行时），读回 HDR 与 LDR。
 
     Args:
         w, h: 输出分辨率（像素）。
         ss: 每轴超采样倍率。
         reuse: True 时跳过渲染，直接读 `output/proto/` 中上一次同分辨率的结果（迭代调试用）。
+        t: 帧物理时间（r_s/c）。
 
     Returns:
         `(hdr, ldr)`：`(h, w, 3)` 线性 HDR float64；`(h, w, 3)` uint8 sRGB。
@@ -52,19 +53,20 @@ def run_proto(w: int, h: int, ss: int, reuse: bool) -> tuple[np.ndarray, np.ndar
     if not reuse:
         subprocess.run([sys.executable, PROTO, "frame", "--w", str(w), "--h", str(h), "--ss", str(ss),
                     "--r_out", str(R_OUT), "--dist", str(CAM_DIST), "--elev", str(CAM_ELEV_DEG),
-                        "--fov", str(FOV_DEG), "--t", str(T_FRAME)], check=True)
+                        "--fov", str(FOV_DEG), "--t", str(t)], check=True)
     hdr = np.transpose(np.load(os.path.join(PROTO_OUT, "frame_hdr.npy")), (1, 0, 2)).astype(np.float64)
     pngs = glob.glob(os.path.join(PROTO_OUT, f"frame_M_m3_R{R_OUT:g}_*_{w}x{h}.png"))
     ldr = np.asarray(Image.open(max(pngs, key=os.path.getmtime)).convert("RGB"))
     return hdr, ldr
 
 
-def run_v2(w: int, h: int, ss: int) -> tuple[np.ndarray, np.ndarray]:
+def run_v2(w: int, h: int, ss: int, t: float = T_FRAME) -> tuple[np.ndarray, np.ndarray]:
     """在本进程用 `DiskV2Renderer` 渲染同参数帧。
 
     Args:
         w, h: 输出分辨率（像素）。
         ss: 每轴超采样倍率。
+        t: 帧物理时间（r_s/c）。
 
     Returns:
         `(hdr, ldr)`：`(h, w, 3)` 线性 HDR；`(h, w, 3)` uint8 sRGB。
@@ -72,21 +74,19 @@ def run_v2(w: int, h: int, ss: int) -> tuple[np.ndarray, np.ndarray]:
     import taichi as ti
 
     ti.init(arch=ti.gpu, default_fp=ti.f32)
-    from disk_v2.params import DiskV2PaletteParams, DiskV2Params, DiskV2StructureParams, DiskV2VolumeParams
+    from disk_v2.params import DiskV2Params, DiskV2VolumeParams
     from disk_v2.taichi_render import DiskV2Renderer
 
     renderer = DiskV2Renderer(
         width=w, height=h,
         params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
-        structure_params=DiskV2StructureParams(use_visual_atlas=False),
-        palette_params=DiskV2PaletteParams(),
         skybox=np.zeros((64, 128, 3), np.float32),
-        r_max=90.0, auto_exposure=True, device="gpu",
-        volume_params=DiskV2VolumeParams(), use_postfx=True, ss=ss,
+        volume_params=DiskV2VolumeParams(),
+        r_max=90.0, sky_gain=0.0, ss=ss,
     )
     e = math.radians(CAM_ELEV_DEG)
     cam = [0.0, -CAM_DIST * math.cos(e), CAM_DIST * math.sin(e)]
-    img = renderer.render(cam_pos=cam, fov=FOV_DEG, t=T_FRAME)
+    img = renderer.render(cam_pos=cam, fov=FOV_DEG, t=t)
     return renderer.last_hdr.astype(np.float64), (np.clip(img, 0, 1) * 255 + 0.5).astype(np.uint8)
 
 
@@ -161,17 +161,18 @@ def main() -> None:
     ap.add_argument("--h", type=int, default=1080)
     ap.add_argument("--ss", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(ROOT, "output", "compare_v2_proto.png"))
+    ap.add_argument("--t", type=float, default=T_FRAME, help="帧物理时间（r_s/c），两边相同")
     ap.add_argument("--reuse_proto", action="store_true", help="复用上一次 Proto 输出（迭代调试用）")
     a = ap.parse_args()
 
-    hdr_p, ldr_p = run_proto(a.w, a.h, a.ss, a.reuse_proto)
-    hdr_v, ldr_v = run_v2(a.w, a.h, a.ss)
+    hdr_p, ldr_p = run_proto(a.w, a.h, a.ss, a.reuse_proto, a.t)
+    hdr_v, ldr_v = run_v2(a.w, a.h, a.ss, a.t)
 
     mp, mv = metrics(hdr_p), metrics(hdr_v)
     lp, lv = normalize(hdr_p), normalize(hdr_v)
     both = (lp > 0.01) & (lv > 0.01)
     log_err = np.abs(np.log(lv[both] / lp[both]))
-    print("\n指标            Proto      V2")
+    print(f"\n指标（t = {a.t:g}）     Proto      V2")
     for k, name in [("coverage", "盘覆盖率"), ("rb", "R/B"), ("lr", "左/右通量比"), ("lower_ring", "光子环下半部通量占比")]:
         print(f"  {name:<14s} {mp[k]:9.4f}  {mv[k]:9.4f}")
     print(f"  对数亮度 |ln(V2/Proto)| 中位数 {np.median(log_err):.3f}，p90 {np.percentile(log_err, 90):.3f}"

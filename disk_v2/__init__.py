@@ -1,106 +1,37 @@
-"""Disk V2 reference 层的对外导出接口。
+"""Disk V2：体积吸积盘（与参考实现 `scripts/proto_disk_reference.py` 预设 M 对齐）。
 
-本模块只负责汇总 `disk_v2` 当前已经稳定的几何函数、基础物理场函数、结构调制函数
-和参数对象，作为 reference 实现的包级入口。
+模块分层：
 
-这里不放具体实现逻辑；真正的实现分别位于 `geometry.py`、`physical_fields.py`、
-`structure_modulations.py`、`palette.py` 和 `params.py`。
+- `params.py`：参数对象（`DiskV2Params` 盘几何、`DiskV2VolumeParams` 体积模型）。
+- `physical_fields.py`：Page–Thorne 温度 / T_peak 推导、SS 外区 H(r)、Σ(r)（NumPy 参考）。
+- `relativity.py`：频移 g 的 NumPy 参考与严格 GR 对照。
+- `palette.py`：CIE 黑体色度 / 亮度查找表、von Kries 白平衡。
+- `noise_ti.py` / `advection.py`：程序化噪声与刚体环平流。
+- `taichi_impl.py`：体积密度场 `DiskV2Taichi.density_I` 与 Taichi 端频移。
+- `taichi_render.py`：主光追 `DiskV2Renderer`。
+- `postfx.py`：后处理链（白平衡 → bloom → 色散 → 保色度 ACES → sRGB）。
+
+包级只导出无 Taichi 依赖的参数与参考函数；渲染器请从 `disk_v2.taichi_render` 导入。
 """
 
-from .physical_fields import (
-    angular_velocity_field,
-    density_field,
-    midplane_density_field,
-    midplane_temperature_field,
-    raw_midplane_density_field,
-    raw_midplane_temperature_field,
-    temperature_field,
-)
-from .geometry import disk_half_thickness, disk_radial_mask, disk_radial_weight, disk_vertical_weight, disk_volume_mask
-from .structure_modulations import (
-    clump_modulation,
-    hotspot_modulation,
-    shear_modulation,
-    structure_modulation,
-    structure_modulation_density,
-    structure_modulation_emission,
-    weak_mode_modulation,
-)
-from .params import (
-    SCHWARZSCHILD_ISCO_R_S,
-    DiskV2PaletteParams,
-    DiskV2Params,
-    DiskV2StructureParams,
-    DiskV2VolumeParams,
-)
-from .palette import (
-    apply_exposure,
-    apply_palette,
-    blackbody_color,
-    blackbody_luminance,
-    gamma_correct,
-    palette_color,
-    render_hdr_to_ldr,
-    tonemap,
-    white_balance_gain,
-)
-from .imaging import (
-    physical_baseline_flux,
-    physical_baseline_volume_flux,
-    reference_exposure,
-    tau_effective_midplane,
-)
-from .relativity import (
-    doppler_g_factor,
-    gravitational_g_factor,
-    omega_kep,
-    omega_norm,
-    orbital_beta_local,
-    total_g_factor,
-)
+from .palette import blackbody_color, blackbody_luminance, white_balance_gain
+from .params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params, DiskV2VolumeParams
+from .physical_fields import derive_t_peak, page_thorne_flux, ss_half_thickness, ss_surface_density
+from .relativity import disk_g_factor, exact_equatorial_g_factor, local_photon_direction, orbital_beta_local
 
 __all__ = [
     "SCHWARZSCHILD_ISCO_R_S",
-    "DiskV2PaletteParams",
     "DiskV2Params",
-    "DiskV2StructureParams",
     "DiskV2VolumeParams",
-    "disk_half_thickness",
-    "disk_radial_mask",
-    "disk_radial_weight",
-    "disk_vertical_weight",
-    "disk_volume_mask",
-    "density_field",
-    "midplane_density_field",
-    "midplane_temperature_field",
-    "raw_midplane_density_field",
-    "raw_midplane_temperature_field",
-    "angular_velocity_field",
-    "temperature_field",
-    "weak_mode_modulation",
-    "shear_modulation",
-    "clump_modulation",
-    "hotspot_modulation",
-    "structure_modulation",
-    "structure_modulation_density",
-    "structure_modulation_emission",
     "blackbody_color",
     "blackbody_luminance",
-    "palette_color",
     "white_balance_gain",
-    "apply_exposure",
-    "tonemap",
-    "gamma_correct",
-    "render_hdr_to_ldr",
-    "apply_palette",
-    "tau_effective_midplane",
-    "physical_baseline_flux",
-    "physical_baseline_volume_flux",
-    "reference_exposure",
-    "omega_kep",
-    "omega_norm",
-    "gravitational_g_factor",
+    "derive_t_peak",
+    "page_thorne_flux",
+    "ss_half_thickness",
+    "ss_surface_density",
+    "disk_g_factor",
+    "exact_equatorial_g_factor",
+    "local_photon_direction",
     "orbital_beta_local",
-    "doppler_g_factor",
-    "total_g_factor",
 ]

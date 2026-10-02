@@ -19,12 +19,7 @@ import taichi as ti
 ti.init(arch=ti.gpu, default_fp=ti.f32)  # 无 GPU 时 Taichi 自动回退 CPU
 
 from disk_v2.advection import RigidRingBands  # noqa: E402
-from disk_v2.params import (  # noqa: E402
-    DiskV2PaletteParams,
-    DiskV2Params,
-    DiskV2StructureParams,
-    DiskV2VolumeParams,
-)
+from disk_v2.params import DiskV2Params, DiskV2VolumeParams  # noqa: E402
 from disk_v2.taichi_impl import _delayed_rot, _delayed_seed  # noqa: E402
 from disk_v2.taichi_render import DiskV2Renderer  # noqa: E402
 
@@ -38,11 +33,9 @@ def _make_renderer(width=24, height=14, ss=2):
     return DiskV2Renderer(
         width=width, height=height,
         params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
-        structure_params=DiskV2StructureParams(use_visual_atlas=False),
-        palette_params=DiskV2PaletteParams(),
         skybox=np.zeros((8, 16, 3), np.float32),
-        r_max=90.0, auto_exposure=True, device="gpu",
-        volume_params=DiskV2VolumeParams(), use_postfx=True, ss=ss,
+        volume_params=DiskV2VolumeParams(),
+        r_max=90.0, ss=ss,
     )
 
 
@@ -144,7 +137,8 @@ class TestVolumeRender(unittest.TestCase):
 
     def test_horizon_pixels_keep_disk_emission(self):
         eh = self.renderer.event_horizon_field.to_numpy() == 1
-        disk_hdr = self.renderer.disk_hdr_field.to_numpy().sum(-1)
+        # 天空为黑色 → hdr_field 即路上累积的盘发射
+        disk_hdr = self.renderer.hdr_field.to_numpy().sum(-1)
         self.assertTrue(eh.any())
         # 光子环下半部：先穿过盘再落入视界的光线，发射不应被清零
         self.assertTrue((disk_hdr[eh] > 0.0).any())
@@ -162,17 +156,64 @@ class TestVolumeRender(unittest.TestCase):
         self.assertEqual(a.shape, (14, 24, 3))
         self.assertGreater(float(np.abs(hdr_a - hdr_b).mean()), 0.0)
 
+    def test_sky_does_not_change_disk_or_exposure(self):
+        # 天空单独存 sky_field，不进入 last_hdr，也不影响自动曝光
+        r = self.renderer
+        seed = int(r.jitter_seed[None])
+        r.jitter_seed[None] = seed
+        r.render(cam_pos=CAM, fov=38.0)
+        hdr_black, wp_black = r.last_hdr.copy(), r.last_white_point
+        r.skybox_field.fill(1.0)
+        try:
+            r.jitter_seed[None] = seed
+            img_sky = r.render(cam_pos=CAM, fov=38.0)
+            np.testing.assert_array_equal(r.last_hdr, hdr_black)
+            self.assertEqual(r.last_white_point, wp_black)
+            self.assertGreater(float(r.sky_field.to_numpy().max()), 0.0)
+            self.assertTrue(np.isfinite(img_sky).all())
+        finally:
+            r.skybox_field.fill(0.0)
+
     def test_supersampling_internal_resolution(self):
         # ss = 2：内部按 (2W, 2H) 积分，输出按 (H, W) 盒式下采样
         self.assertEqual(self.renderer.hdr_field.shape, (48, 28))
 
-    def test_ss_requires_volume_postfx(self):
-        with self.assertRaises(ValueError):
-            DiskV2Renderer(
-                width=8, height=8, params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
-                structure_params=DiskV2StructureParams(), palette_params=DiskV2PaletteParams(),
-                skybox=np.zeros((8, 16, 3), np.float32), device="gpu", ss=2,
-            )
+
+class TestTiltEquivalence(unittest.TestCase):
+    """倾角等价：盘绕 x 轴倾 θ、相机仰角 e  ≡  盘不倾、相机仰角 e + θ（相机在 y-z 平面内）。
+
+    盘局部坐标下相机位于仰角 e + θ，相机 right 均为 +x，因此两幅图逐像素一致（f32 舍入内）。
+    同时检查亮侧 = 蓝移侧：逼近侧（图像左侧，盘逆时针）通量更大、B/R 更高。
+    """
+
+    def test_tilt_matches_elevation_shift_and_bright_side_is_blue(self):
+        tilt = 20.0
+
+        def cam(elev_deg):
+            e = math.radians(elev_deg)
+            return [0.0, -40.0 * math.cos(e), 40.0 * math.sin(e)]
+
+        flat = _shared_renderer()
+        tilted = DiskV2Renderer(
+            width=24, height=14, params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
+            skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(),
+            r_max=90.0, disk_tilt_deg=tilt, ss=2,
+        )
+        flat.jitter_seed[None] = 500
+        tilted.jitter_seed[None] = 500
+        flat.render(cam_pos=cam(7.0 + tilt), fov=38.0)
+        tilted.render(cam_pos=cam(7.0), fov=38.0)
+        a, b = tilted.last_hdr.astype(np.float64), flat.last_hdr.astype(np.float64)
+        w = np.array([0.2126, 0.7152, 0.0722])
+        la, lb = a @ w, b @ w
+        m = (la > 1e-3 * la.max()) & (lb > 1e-3 * lb.max())
+        self.assertTrue(m.any())
+        self.assertLess(float(np.median(np.abs(np.log(la[m] / lb[m])))), 1e-2)
+        self.assertAlmostEqual(float(la.sum() / lb.sum()), 1.0, places=3)
+        half = a.shape[1] // 2
+        self.assertGreater(la[:, :half].sum(), la[:, half:].sum())
+        self.assertGreater(a[:, :half, 2].sum() / a[:, :half, 0].sum(),
+                           a[:, half:, 2].sum() / a[:, half:, 0].sum())
 
 
 if __name__ == "__main__":
