@@ -53,7 +53,10 @@ class DiskV2Renderer:
         doppler_color: 多普勒颜色强度 s：色度用 `χ(T·g^s)`；1 = 物理。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
-        ss: 每轴超采样倍率（内部以 `ss·W × ss·H` 积分后盒式下采样）。
+        ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
+        opt_level: 优化级别（见 `docs/plans/v2_performance_plan.md` §3）：
+            0 参考实现；1 精确优化（输出与 0 在浮点舍入内一致）；2 盘内步长 ×2；
+            3 盘内步长 ×3（近似预览）。
         device: Taichi 未初始化时用于初始化的设备 `"cpu"` / `"gpu"`。
     """
 
@@ -70,6 +73,7 @@ class DiskV2Renderer:
         doppler_color: float = 1.5,
         sky_gain: float = 0.5,
         ss: int = 1,
+        opt_level: int = 0,
         device: str = "gpu",
     ) -> None:
         """初始化渲染器：上传天空盒、构造盘体 Taichi 句柄并编译主 kernel。"""
@@ -87,6 +91,11 @@ class DiskV2Renderer:
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
+        if opt_level not in (0, 1, 2, 3):
+            raise ValueError("opt_level must be 0, 1, 2 or 3")
+        self.opt_level = int(opt_level)
+        # 盘内步长放大系数（级别 2 = 2，级别 3 = 3；S0 实测 ×2 误差 0.25%）
+        self._step_c = {0: 1.0, 1: 1.0, 2: 2.0, 3: 3.0}[self.opt_level]
         self._iw = width * self.ss
         self._ih = height * self.ss
         # 最近一帧下采样后的盘发射 HDR `(H, W, 3)`（不含天空；曝光与对比均基于它）
@@ -94,7 +103,7 @@ class DiskV2Renderer:
         self.last_white_point: float = 1.0
         # 视频曝光锁定：非 None 时 render() 直接使用该曝光（参考实现视频首帧锁定）
         self.fixed_exposure: float | None = None
-        self.disk_ti = DiskV2Taichi(params=params, volume_params=self.volume_params)
+        self.disk_ti = DiskV2Taichi(params=params, volume_params=self.volume_params, opt_level=self.opt_level)
 
         iw, ih = self._iw, self._ih
         # 线性 HDR 分两路：盘发射 Σ T·ΔI_disk 与透过的天空 T_end·I_sky（线性光）。
@@ -137,6 +146,7 @@ class DiskV2Renderer:
         img_h = int(self._ih)
         static_cam = bool(disk._static_cam)
         light_delay = bool(disk._light_delay)
+        step_c = float(self._step_c)
 
         @ti.func
         def _compute_acceleration(pos, L2):
@@ -224,6 +234,13 @@ class DiskV2Renderer:
                 # 角动量平方 L² = |r × dir|²。
                 L_vec = pos.cross(dir_)
                 L2_val = L_vec.dot(L_vec)
+                # 光子环保护：冲击参数 b ≈ |x × d| 落在临界值 3√3/2 ≈ 2.6 附近（[2.4, 4.0]）的光线
+                # 形成光子环与阴影边缘，它们掠过极薄的内盘；这些光线保持原步长，避免放大步长后
+                # 漏采薄层、光子环断成点。该环带只占画面约 2%。
+                sc = step_c
+                b_imp = ti.sqrt(L2_val)
+                if b_imp > 2.4 and b_imp < 4.0:
+                    sc = 1.0
 
                 escaped = False
                 lam = 0.0
@@ -234,7 +251,7 @@ class DiskV2Renderer:
                 step_count = 0
                 affine = 0.0
 
-                while step_count < max_iter and transmittance > 1e-4:
+                while step_count < max_iter:
                     r_cur = pos.norm()
                     # 参考实现（模型 I）步长：位置的连续函数，避免条纹。
                     #   远场 h = min(0.06·r, 2)；近视界 h ≤ 0.02 + 0.06·(r − 1)；
@@ -248,10 +265,10 @@ class DiskV2Renderer:
                     zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.02
                     rad_out = ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
                     d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
-                    h = ti.min(h, 0.03 + 0.3 * d_slab)
+                    h = ti.min(h, sc * 0.03 + 0.3 * d_slab)
                     if ti.static(disk._smoke_on):
                         d_smoke = ti.max(ti.abs(pl[2]) - (disk._cl_extent * rc_h + 0.02), 0.0) + rad_out
-                        h = ti.min(h, ti.max(0.4 * disk._cl_width * rc_h, 0.03) + 0.3 * d_smoke)
+                        h = ti.min(h, sc * ti.max(0.4 * disk._cl_width * rc_h, 0.03) + 0.3 * d_smoke)
 
                     # 首步抖动：起点沿光线随机偏移 [0, h)，与超采样一起构成蒙特卡洛体积积分
                     if step_idx == 0:
@@ -325,6 +342,10 @@ class DiskV2Renderer:
                                 else:
                                     hdr_accum += transmittance * j_total * ds
                                 transmittance *= ti.exp(-alpha_seg)
+                    # 与参考实现一致：透射率低于 1e-3 即终止，并丢弃其后的天空贡献
+                    if transmittance < 1e-3:
+                        transmittance = 0.0
+                        break
                     if hit_horizon:
                         event_horizon_hit = True
                         transmittance = 0.0
@@ -382,48 +403,64 @@ class DiskV2Renderer:
             arr = arr.reshape(self.height, self.ss, self.width, self.ss, 3).mean(axis=(1, 3))
         return arr
 
-    def render(self, cam_pos: List[float], fov: float, t: float = 2000.0) -> np.ndarray:
-        """渲染单帧。
+    def render_hdr(self, cam_pos: List[float], fov: float, t: float = 2000.0):
+        """GPU 阶段：积分一帧，返回 `(disk_hdr, sky)`（均为 `(H, W, 3)` 线性光；无天空时 sky 为 None）。
 
         Args:
-            cam_pos: 相机位置 `[x, y, z]`，单位为 r_s。
+            cam_pos: 相机位置 `[x, y, z]`（r_s）。
             fov: 竖直视野角（度）。
-            t: 帧物理时间（r_s/c），决定刚体环平流相位；默认 2000（与参考实现单帧一致）。
-                视频逐帧递增传入。
+            t: 帧物理时间（r_s/c）。
 
         Returns:
-            `(height, width, 3)` float32 LDR `[0, 1]`（sRGB 编码）。
-
-        Notes:
-            管线（与参考实现 `render_hdr` + `tonemap` 一致）：
-
-            1. `_ray_march_kernel`：在 `(ss·W, ss·H)` 内部分辨率积分盘发射
-               `Σ T·ΔI_disk`（`hdr_field`）与透过的天空 `T_end·I_sky`（`sky_field`，线性光）
-            2. `ss×ss` 盒式下采样 → `last_hdr`（`(H, W, 3)` 盘发射线性 HDR）
-            3. 曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则
-               盘区亮度（`L > 1e-4`）p99.9 → 0.9。只看盘，天空不影响曝光
-            4. 合成 `x = exposure·disk + sky_gain·sky`
-            5. `postfx`：WB → bloom → 镶边 → 色散 → 保色度 ACES → sRGB
+            `(hdr, sky)`；同时写入 `last_hdr`。
         """
         self._setup_camera(cam_pos, fov)
         self.disk_ti.update_advection(float(t))
         self.jitter_seed[None] += 1
         self._ray_march_kernel()
-
         hdr = self._downsample(self.hdr_field)
         self.last_hdr = hdr
+        sky = self._downsample(self.sky_field) if self.sky_gain > 0.0 else None
+        return hdr, sky
+
+    def finish(self, hdr: np.ndarray, sky) -> np.ndarray:
+        """CPU 阶段：曝光、叠加天空、后处理（可与下一帧的 `render_hdr` 并行）。
+
+        Args:
+            hdr: `render_hdr` 返回的盘发射 HDR。
+            sky: `render_hdr` 返回的天空（线性光）或 None。
+
+        Returns:
+            `(H, W, 3)` float32 LDR `[0, 1]`（sRGB 编码）。
+
+        Notes:
+            曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则盘区亮度（`L > 1e-4`）
+            p99.9 → 0.9（参考实现预设 M），只看盘。合成 `x = exposure·disk + sky_gain·sky`，
+            再经 `postfx`：白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB。
+        """
         if self.fixed_exposure is not None:
             exposure = float(self.fixed_exposure)
         else:
             lum = hdr_luminance(hdr)
             lum = lum[lum > 1e-4]
-            # 参考实现 auto_exposure：盘区亮度 p99.9 → EXP_TARGET = 0.9（预设 M）
             exposure = 0.9 / max(float(np.percentile(lum, 99.9)), 1e-12) if lum.size else 1.0
-        # 天空在曝光之后以独立系数叠加，再一起进入 postfx（星点参与 bloom）；
-        # sky_gain = 0 时 x = hdr·exposure，与无天空路径逐位一致。
+        # 天空在曝光之后以独立系数叠加，再一起进入 postfx（星点参与 bloom）
         x = hdr * exposure
-        if self.sky_gain > 0.0:
-            x = x + self.sky_gain * self._downsample(self.sky_field)
+        if sky is not None:
+            x = x + self.sky_gain * sky
         img = postfx(x, exposure=1.0)
         self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
         return img.astype(np.float32) / 255.0
+
+    def render(self, cam_pos: List[float], fov: float, t: float = 2000.0) -> np.ndarray:
+        """渲染单帧：`finish(*render_hdr(...))`。
+
+        Args:
+            cam_pos: 相机位置 `[x, y, z]`，单位为 r_s。
+            fov: 竖直视野角（度）。
+            t: 帧物理时间（r_s/c），决定刚体环平流相位；默认 2000（与参考实现单帧一致）。
+
+        Returns:
+            `(height, width, 3)` float32 LDR `[0, 1]`（sRGB 编码）。
+        """
+        return self.finish(*self.render_hdr(cam_pos, fov, t))

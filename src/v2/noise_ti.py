@@ -291,3 +291,174 @@ def fbm_gradient(x, y, z, period, octaves: ti.template(), gain):
         f = 2 ** o
         s += gain ** o * gnoise(x * f, y * f, z * f, period * f)
     return s
+
+
+# ---------------------------------------------------------------------------
+# 优化级别 1：与上面的梯度噪声 / 值噪声逐位一致的快速实现
+# ---------------------------------------------------------------------------
+# 8 个角点在 x、y、z 上各只有 2 种取值：y 方向的周期回绕按轴算 2 次（原实现每角点 2 次取模，
+# 共 16 次），hash3 的前两级哈希按 (x)、(x, y) 前缀共享（24 次哈希降到 14 次）。
+# 哈希链与原实现完全相同，输出逐位一致。
+
+@ti.func
+def _grad_dot(h, dx, dy, dz):
+    """格点哈希 → 梯度向量 · 偏移向量（与 `_corner` 的梯度取法一致）。
+
+    Args:
+        h: 角点的 `hash3` 值（u32）。
+        dx, dy, dz: 采样点到该角点的偏移（格距单位）。
+
+    Returns:
+        标量 `gx·dx + gy·dy + gz·dz`。
+    """
+    gx = ti.cast(h & ti.u32(1023), ti.f32) / 511.5 - 1.0
+    gy = ti.cast((h >> ti.u32(10)) & ti.u32(1023), ti.f32) / 511.5 - 1.0
+    gz = ti.cast((h >> ti.u32(20)) & ti.u32(1023), ti.f32) / 511.5 - 1.0
+    return gx * dx + gy * dy + gz * dz
+
+
+@ti.func
+def _corner_hashes(xi, y0, y1, zi):
+    """8 个角点的 `hash3` 值，按 (x)、(x, y) 前缀共享哈希。
+
+    Args:
+        xi, zi: 左下角格点的 x、z 坐标（i32）。
+        y0, y1: 已按周期回绕的两个 y 格点坐标（i32）。
+
+    Returns:
+        8 个 u32，顺序 `(000, 100, 010, 110, 001, 101, 011, 111)`（下标依次为 x、y、z）。
+    """
+    hx0 = hash_u32(ti.cast(xi + 4096, ti.u32) * ti.u32(1597334677))
+    hx1 = hash_u32(ti.cast(xi + 1 + 4096, ti.u32) * ti.u32(1597334677))
+    cy0 = ti.cast(y0 + 4096, ti.u32) * ti.u32(1103515245)
+    cy1 = ti.cast(y1 + 4096, ti.u32) * ti.u32(1103515245)
+    h00 = hash_u32(hx0 ^ cy0)
+    h10 = hash_u32(hx1 ^ cy0)
+    h01 = hash_u32(hx0 ^ cy1)
+    h11 = hash_u32(hx1 ^ cy1)
+    cz0 = ti.cast(zi + 4096, ti.u32) * ti.u32(1234567891)
+    cz1 = ti.cast(zi + 1 + 4096, ti.u32) * ti.u32(1234567891)
+    return (hash_u32(h00 ^ cz0), hash_u32(h10 ^ cz0), hash_u32(h01 ^ cz0), hash_u32(h11 ^ cz0),
+            hash_u32(h00 ^ cz1), hash_u32(h10 ^ cz1), hash_u32(h01 ^ cz1), hash_u32(h11 ^ cz1))
+
+
+@ti.func
+def gnoise_fast(x, y, z, period):
+    """`gnoise` 的快速实现，输出逐位一致。
+
+    Args:
+        x, y, z: 连续坐标；y 方向周期为 `period`（正整数）。
+        period: y 方向周期。
+
+    Returns:
+        标量，约 `[-1, 1]`，零均值。
+    """
+    fx0 = ti.floor(x)
+    fy0 = ti.floor(y)
+    fz0 = ti.floor(z)
+    xi = ti.cast(fx0, ti.i32)
+    yi = ti.cast(fy0, ti.i32)
+    zi = ti.cast(fz0, ti.i32)
+    fx = x - fx0
+    fy = y - fy0
+    fz = z - fz0
+    ux = _fade(fx)
+    uy = _fade(fy)
+    uz = _fade(fz)
+    y0 = ((yi % period) + period) % period
+    y1 = (((yi + 1) % period) + period) % period
+    h000, h100, h010, h110, h001, h101, h011, h111 = _corner_hashes(xi, y0, y1, zi)
+    n000 = _grad_dot(h000, fx, fy, fz)
+    n100 = _grad_dot(h100, fx - 1.0, fy, fz)
+    n010 = _grad_dot(h010, fx, fy - 1.0, fz)
+    n110 = _grad_dot(h110, fx - 1.0, fy - 1.0, fz)
+    n001 = _grad_dot(h001, fx, fy, fz - 1.0)
+    n101 = _grad_dot(h101, fx - 1.0, fy, fz - 1.0)
+    n011 = _grad_dot(h011, fx, fy - 1.0, fz - 1.0)
+    n111 = _grad_dot(h111, fx - 1.0, fy - 1.0, fz - 1.0)
+    nx00 = n000 + ux * (n100 - n000)
+    nx10 = n010 + ux * (n110 - n010)
+    nx01 = n001 + ux * (n101 - n001)
+    nx11 = n011 + ux * (n111 - n011)
+    nxy0 = nx00 + uy * (nx10 - nx00)
+    nxy1 = nx01 + uy * (nx11 - nx01)
+    return nxy0 + uz * (nxy1 - nxy0)
+
+
+@ti.func
+def _hval(h):
+    """`hashf` 的取值步骤：u32 哈希 → `[-1, 1)`（与 `hashf(...)·2 − 1` 逐位一致）。"""
+    return ti.cast(h & ti.u32(0xFFFFFF), ti.f32) / 16777216.0 * 2.0 - 1.0
+
+
+@ti.func
+def vnoise_fast(x, y, z, period):
+    """`vnoise` 的快速实现，输出逐位一致。
+
+    Args:
+        x, y, z: 连续坐标；y 方向周期为 `period`（正整数）。
+        period: y 方向周期。
+
+    Returns:
+        标量，`[-1, 1]`，零均值。
+    """
+    fx0 = ti.floor(x)
+    fy0 = ti.floor(y)
+    fz0 = ti.floor(z)
+    xi = ti.cast(fx0, ti.i32)
+    yi = ti.cast(fy0, ti.i32)
+    zi = ti.cast(fz0, ti.i32)
+    fx = x - fx0
+    fy = y - fy0
+    fz = z - fz0
+    ux = _smooth3(fx)
+    uy = _smooth3(fy)
+    uz = _smooth3(fz)
+    y0 = ((yi % period) + period) % period
+    y1 = (((yi + 1) % period) + period) % period
+    h000, h100, h010, h110, h001, h101, h011, h111 = _corner_hashes(xi, y0, y1, zi)
+    v000 = _hval(h000)
+    v100 = _hval(h100)
+    v010 = _hval(h010)
+    v110 = _hval(h110)
+    v001 = _hval(h001)
+    v101 = _hval(h101)
+    v011 = _hval(h011)
+    v111 = _hval(h111)
+    a0 = v000 + ux * (v100 - v000)
+    a1 = v010 + ux * (v110 - v010)
+    a2 = v001 + ux * (v101 - v001)
+    a3 = v011 + ux * (v111 - v011)
+    b0 = a0 + uy * (a1 - a0)
+    b1 = a2 + uy * (a3 - a2)
+    return b0 + uz * (b1 - b0)
+
+
+@ti.func
+def cascade_fast(x, y, z, per_y, l0, l1, con):
+    """`cascade` 的快速实现（内部改用 `vnoise_fast`），输出逐位一致。参数与返回值同 `cascade`。"""
+    s = 0.0
+    i0 = ti.cast(ti.floor(l0), ti.i32)
+    for k in range(5):
+        lv = i0 + k
+        lvf = ti.cast(lv, ti.f32)
+        w = ti.min(ti.max(ti.min(l1, lvf + 1.0) - ti.max(l0, lvf), 0.0), 1.0)
+        if w > 0.0 and lv >= 0:
+            f = 1.0
+            per = per_y
+            for _q in range(lv):
+                f *= 3.0
+                per *= 3
+            n = vnoise_fast(x * f, y * f, z * f, per)
+            s += ti.log(1.0 + 0.1 * n * w)
+    return softplus(con * s)
+
+
+@ti.func
+def fbm_gradient_fast(x, y, z, period, octaves: ti.template(), gain):
+    """`fbm_gradient` 的快速实现（内部改用 `gnoise_fast`），输出逐位一致。参数与返回值同 `fbm_gradient`。"""
+    s = 0.0
+    for o in ti.static(range(octaves)):
+        f = 2 ** o
+        s += gain ** o * gnoise_fast(x * f, y * f, z * f, period * f)
+    return s

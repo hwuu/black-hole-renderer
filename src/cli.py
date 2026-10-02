@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import argparse
 import math
 import imageio.v3 as iio
@@ -80,13 +81,36 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disk_model", type=str, default="v1",
                         choices=["v1", "v2"],
                         help="吸积盘模型: v1（默认，零厚度倾斜平面 + 程序纹理）或 v2（有限厚度发射-吸收积分）")
-    parser.add_argument("--v2_ss", type=int, default=1,
-                        help="V2 体积模型超采样倍率（每轴），2 = 每像素 4 条光线 (default: 1)")
+    parser.add_argument("--v2_opt", type=int, default=None, choices=[0, 1, 2, 3],
+                        help="V2 优化级别：0 参考实现；1 精确优化（输出与 0 一致）；2 盘内步长 ×2；"
+                             "3 盘内步长 ×3（近似预览）。默认：单帧 1，视频 2")
+    parser.add_argument("--v2_supersample", type=int, default=None,
+                        help="V2 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿。默认：单帧 2，视频 1")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
                         help="V2 天空亮度系数（线性光，曝光之后叠加，不影响盘曝光；0 = 黑天空）(default: 0.5)")
     parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,
                         help="V2 视频模式：内缘开普勒轨道对应视频秒数 (default: 16.0)")
     return parser.parse_args()
+
+
+def resolve_v2_quality(args, video: bool):
+    """解析 V2 的优化级别与超采样倍率（未显式传入时按渲染模式取默认值）。
+
+    Args:
+        args: CLI 参数（读取 `--v2_opt`、`--v2_supersample`）。
+        video: 是否为视频模式。
+
+    Returns:
+        `(opt_level, supersample)`：单帧默认 `(1, 2)`，视频默认 `(2, 1)`。
+
+    Raises:
+        ValueError: `--v2_supersample < 1`。
+    """
+    opt = args.v2_opt if args.v2_opt is not None else (2 if video else 1)
+    ss = args.v2_supersample if args.v2_supersample is not None else (1 if video else 2)
+    if ss < 1:
+        raise ValueError(f"--v2_supersample must be >= 1, got {ss}")
+    return opt, ss
 
 
 def validate_args(args) -> None:
@@ -151,12 +175,15 @@ def main():
             ignore_taichi_cache=args.ignore_taichi_cache
         )
 
-    def _make_v2_renderer(args, width, height):
+    def _make_v2_renderer(args, width, height, video=False):
         """构造 V2 体积渲染器（单帧与视频共用）。
 
         Args:
-            args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_ss/--v2_sky_gain/--device`）。
+            args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
+                --v2_supersample/--v2_sky_gain/--device`）。
             width, height: 输出分辨率（像素）。
+            video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
+                （单帧 2、视频 1）未显式传入时的默认值。
 
         Returns:
             `DiskV2Renderer`，体积模型参数为预设 M（`DiskV2VolumeParams()` 默认值）。
@@ -167,6 +194,8 @@ def main():
         from src.v2.params import DiskV2Params, DiskV2VolumeParams
         from src.v2.taichi_render import DiskV2Renderer
 
+        opt, ss = resolve_v2_quality(args, video)
+        print(f"[V2] 优化级别 {opt}，超采样倍率 {ss}（每像素 {ss * ss} 条光线）")
         ti.init(arch=ti.gpu if args.device == "gpu" else ti.cpu, default_fp=ti.f32)
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         return DiskV2Renderer(
@@ -177,7 +206,8 @@ def main():
             r_max=max(args.r_max, 50.0),
             disk_tilt_deg=args.disk_tilt,
             sky_gain=args.v2_sky_gain,
-            ss=args.v2_ss,
+            ss=ss,
+            opt_level=opt,
             device=args.device,
         )
 
@@ -196,7 +226,7 @@ def main():
         import math as _math
         import time as _time
 
-        renderer = _make_v2_renderer(args, width, height)
+        renderer = _make_v2_renderer(args, width, height, video=True)
 
         # 物理时间步：内缘轨道周期 = v2_orbit_seconds 视频秒（r_in 取 ISCO 钳制后的值）
         r_in_m = renderer.params.r_in
@@ -216,19 +246,33 @@ def main():
         writer = iio.imopen(args.output, "w", plugin="pyav")
         writer.init_video_stream("libx264", fps=args.fps)
         start = _time.time()
+        pool = ThreadPoolExecutor(max_workers=1)
+        pending = None
+
+        def _write(frame):
+            writer.write_frame((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+
         for f in range(args.n_frames):
             t = t0 + f * dt_per_frame
             azim = base_azim + _math.radians(orbit_deg) * f / max(args.n_frames - 1, 1)
             cam_x = base_dist * _math.cos(base_elev) * _math.cos(azim)
             cam_y = base_dist * _math.cos(base_elev) * _math.sin(azim)
             cam_z = base_dist * _math.sin(base_elev)
-            frame = renderer.render(cam_pos=[cam_x, cam_y, cam_z], fov=fov, t=t)
+            hdr, sky = renderer.render_hdr(cam_pos=[cam_x, cam_y, cam_z], fov=fov, t=t)
             if renderer.fixed_exposure is None:
-                # 首帧自动曝光后锁定，避免逐帧曝光闪烁（参考实现 cmd_video 同款）
+                # 首帧同步处理并锁定曝光，避免逐帧曝光闪烁（参考实现 cmd_video 同款）
+                _write(renderer.finish(hdr, sky))
                 renderer.fixed_exposure = 1.0 / renderer.last_white_point
-            writer.write_frame((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+            else:
+                # 后处理与写帧交给单线程池（保持帧序），与下一帧的 GPU 积分并行
+                if pending is not None:
+                    pending.result()
+                pending = pool.submit(lambda h=hdr, s=sky: _write(renderer.finish(h, s)))
             if f % 24 == 0:
-                print(f"  frame {f}/{args.n_frames}  {_time.time() - start:.1f}s")
+                print(f"  frame {f}/{args.n_frames}  {_time.time() - start:.1f}s", flush=True)
+        if pending is not None:
+            pending.result()
+        pool.shutdown()
         writer.close()
         print(f"[V2 video] 完成: {args.output} ({_time.time() - start:.1f}s)")
 
@@ -244,7 +288,7 @@ def main():
         if args.video:
             _render_video_v2(args, width, height, fov)
         else:
-            renderer = _make_v2_renderer(args, width, height)
+            renderer = _make_v2_renderer(args, width, height, video=False)
             img = renderer.render(cam_pos=args.pov, fov=fov)
             save_image(img, args.output)
     elif args.interactive:

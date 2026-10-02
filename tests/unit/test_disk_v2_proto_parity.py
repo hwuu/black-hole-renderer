@@ -179,6 +179,23 @@ class TestVolumeRender(unittest.TestCase):
         self.assertEqual(self.renderer.hdr_field.shape, (48, 28))
 
 
+class TestOptLevel1Exact(unittest.TestCase):
+    """优化级别 1（快速噪声 + 共享带信息）与级别 0 输出一致（8 位输出每通道相差不超过 1）。"""
+
+    def test_level1_matches_level0(self):
+        r0 = _shared_renderer()
+        r1 = DiskV2Renderer(
+            width=24, height=14, params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
+            skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(),
+            r_max=90.0, ss=2, opt_level=1,
+        )
+        r0.jitter_seed[None] = 700
+        r1.jitter_seed[None] = 700
+        a = (r0.render(cam_pos=CAM, fov=38.0) * 255 + 0.5).astype(int)
+        b = (r1.render(cam_pos=CAM, fov=38.0) * 255 + 0.5).astype(int)
+        self.assertLessEqual(int(np.abs(a - b).max()), 1)
+
+
 class TestTiltEquivalence(unittest.TestCase):
     """倾角等价：盘绕 x 轴倾 θ、相机仰角 e  ≡  盘不倾、相机仰角 e + θ（相机在 y-z 平面内）。
 

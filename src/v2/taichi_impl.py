@@ -31,7 +31,15 @@ from .palette import (
     _LNY_T_MIN_K,
 )
 from .advection import RigidRingBands, make_fields, upload as adv_upload
-from .noise_ti import cascade, fbm_gradient, gnoise, hashf as _hashf
+from .noise_ti import (
+    cascade,
+    cascade_fast,
+    fbm_gradient,
+    fbm_gradient_fast,
+    gnoise,
+    gnoise_fast,
+    hashf as _hashf,
+)
 from .params import DiskV2Params, DiskV2VolumeParams
 
 
@@ -186,12 +194,14 @@ class DiskV2Taichi:
         `update_advection(t)` 上传当帧相位表。
     """
 
-    def __init__(self, params: DiskV2Params, volume_params: DiskV2VolumeParams) -> None:
+    def __init__(self, params: DiskV2Params, volume_params: DiskV2VolumeParams, opt_level: int = 0) -> None:
         self.params = params
         # 把 dataclass 的标量字段平铺为 self._<name>，便于 @ti.func 内访问。
         # Taichi 不接受 dataclass 作为 runtime 常量，必须用 Python float。
         self._r_in = float(params.r_in)
         self._r_out = float(params.r_out)
+        # 优化级别（编译期常量）：≥ 1 时噪声改用逐位一致的快速实现，并共享每采样点的带信息
+        self._opt = int(opt_level)
         self._init_luts()
         self.volume_params = volume_params
         self._init_volume_params(volume_params)
@@ -349,7 +359,7 @@ class DiskV2Taichi:
                 phi = (ti.cast(j, ti.f32) + 0.5) / n_phi * 2.0 * math.pi
                 zeta = ti.cast((i * 7 + j * 13) % 17, ti.f32) / 17.0 * 4.0 - 2.0
                 out_s[i, j] = self._eval_cloud(lnr, phi, zeta, 0.0, 0.0, 0.0)
-                out_l[i, j] = fbm_gradient(
+                out_l[i, j] = self._fbm(
                     ti.cast(i, ti.f32) / 16.0,
                     ti.cast(j, ti.f32) / n_phi * self._nphi_l,
                     ti.cast((i * 7 + j * 13) % 17, ti.f32) / 5.0,
@@ -405,6 +415,120 @@ class DiskV2Taichi:
 
     # ---- SS 结构 ----
 
+    # ---- 噪声分派（优化级别 ≥ 1 用快速实现，输出逐位一致） ----
+
+    @ti.func
+    def _gn(self, x, y, z, period):
+        """梯度噪声：级别 0 用 `gnoise`，级别 ≥ 1 用逐位一致的 `gnoise_fast`。"""
+        v = 0.0
+        if ti.static(self._opt >= 1):
+            v = gnoise_fast(x, y, z, period)
+        else:
+            v = gnoise(x, y, z, period)
+        return v
+
+    @ti.func
+    def _casc(self, x, y, z, per_y, l0, l1, con):
+        """乘性级联：级别 0 用 `cascade`，级别 ≥ 1 用逐位一致的 `cascade_fast`。"""
+        v = 0.0
+        if ti.static(self._opt >= 1):
+            v = cascade_fast(x, y, z, per_y, l0, l1, con)
+        else:
+            v = cascade(x, y, z, per_y, l0, l1, con)
+        return v
+
+    @ti.func
+    def _fbm(self, x, y, z, period, octaves: ti.template(), gain):
+        """梯度噪声 fBm：级别 0 用 `fbm_gradient`，级别 ≥ 1 用逐位一致的 `fbm_gradient_fast`。"""
+        v = 0.0
+        if ti.static(self._opt >= 1):
+            v = fbm_gradient_fast(x, y, z, period, octaves, gain)
+        else:
+            v = fbm_gradient(x, y, z, period, octaves, gain)
+        return v
+
+    @ti.func
+    def _band_info(self, lnr, phi, t_delay):
+        """核心层与烟雾层共用的刚体环带信息（优化级别 ≥ 1：每采样点只算一次）。
+
+        Args:
+            lnr: `ln r`。
+            phi: 盘局部方位角（rad）。
+            t_delay: 光行时间延迟（r_s/c）。
+
+        Returns:
+            `(w, ph, ox, oz)`：`w` 为 4 路（带 × 种子相位，下标 `2·db + p`）混合权重 `wb·wp`，
+            越界的带权重为 0；`ph` 为两条带的流坐标 φ；`ox`、`oz` 为 4 路种子偏移。
+            与 `_flow_I` / `_turb_pair_smoke` 内部的同名量逐位一致。
+        """
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        w = ti.Vector([0.0, 0.0, 0.0, 0.0])
+        ox = ti.Vector([0.0, 0.0, 0.0, 0.0])
+        oz = ti.Vector([0.0, 0.0, 0.0, 0.0])
+        ph = ti.Vector([0.0, 0.0])
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            idx = bi - self._adv_core_f.b_lo
+            if 0 <= idx < self._adv_core_f.rot.shape[0]:
+                ph[db] = phi - _delayed_rot(self._adv_core_f.rot[idx], self._adv_core_f.om_b[idx], t_delay) - self._adv_core_f.phi_b[idx]
+                for p in ti.static(range(2)):
+                    fr, cyc = _delayed_seed(self._adv_core_f.frac[idx][p], self._adv_core_f.cyc[idx][p], self._adv_core_f.t_life[idx], t_delay)
+                    wp = ti.sin(math.pi * fr) ** 2
+                    w[2 * db + p] = wb * wp
+                    ox[2 * db + p] = _hashf(bi, cyc, 2 * p) * 97.0
+                    oz[2 * db + p] = _hashf(bi, cyc, 2 * p + 1) * 97.0
+        return w, ph, ox, oz
+
+    @ti.func
+    def _flow_shared(self, r, z, w, ph, ox, oz):
+        """`_flow_I` 的共享带信息版本（逐位一致；跳过权重为 0 的组合，加 0 不改变结果）。
+
+        Args:
+            r, z: 盘局部半径与高度（r_s）。
+            w, ph, ox, oz: `_band_info` 的返回值。
+
+        Returns:
+            `(c, tn)`：主云级联值与厚度扰动级联值（≥ 0）。
+        """
+        r_rg = 2.0 * r
+        lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
+        con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
+        c = 0.0
+        tn = 0.0
+        for k in ti.static(range(4)):
+            if w[k] != 0.0:
+                cc, tt = self._flow_noise_core(r, ph[k // 2], z, ox[k], oz[k], lev_cut, con)
+                c += w[k] * cc
+                tn += w[k] * tt
+        return c, tn
+
+    @ti.func
+    def _smoke_shared(self, lnr, zeta, loff, w, ph, ox, oz):
+        """`_turb_pair_smoke` 的共享带信息版本（逐位一致，单位方差）。
+
+        Args:
+            lnr: `ln r`。
+            zeta: 层内竖直坐标 `(z − z_k)/σ_k`。
+            loff: 层偏移。
+            w, ph, ox, oz: `_band_info` 的返回值。
+
+        Returns:
+            标量，零均值、约单位方差。
+        """
+        acc = 0.0
+        wsq = 0.0
+        for k in ti.static(range(4)):
+            if w[k] != 0.0:
+                n = self._eval_cloud(lnr, ph[k // 2], zeta, ox[k], oz[k], loff)
+                acc += w[k] * n
+                wsq += w[k] * w[k]
+        return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._smoke_norm
+
     @ti.func
     def _ss_half_thickness(self, r):
         """SS 外区标高 H = HR_REF·r·(r/r_ref)^{1/8}·(f/f_ref)^{3/20}。"""
@@ -441,10 +565,10 @@ class DiskV2Taichi:
     @ti.func
     def _flow_noise_core(self, ru, th, z, ox, oz, lev_cut, con):
         """主云 + 厚度扰动两路级联。"""
-        c = cascade(self._kr_i * ru + ox, th / (2.0 * math.pi) * self._nphi_i,
+        c = self._casc(self._kr_i * ru + ox, th / (2.0 * math.pi) * self._nphi_i,
                     self._kr_i * z + oz, self._nphi_i,
                     self._l0_i - lev_cut, self._l0_i + 2.0 - lev_cut, con)
-        tn = cascade(self._kt_i * ru + ox + 17.0, th / (2.0 * math.pi) * self._nphi_t,
+        tn = self._casc(self._kt_i * ru + ox + 17.0, th / (2.0 * math.pi) * self._nphi_t,
                      oz + 5.0, self._nphi_t, self._lt0_i, self._lt0_i + 2.0, self._con_i)
         return c, tn
 
@@ -464,7 +588,7 @@ class DiskV2Taichi:
         lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
         con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
         b0 = ti.floor(fb)
         fbf = fb - b0
         c = 0.0
@@ -502,7 +626,7 @@ class DiskV2Taichi:
             标量级联值（≥ 0），尘埃密度的结构因子。
         """
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
         b0 = ti.floor(fb)
         fbf = fb - b0
         out = 0.0
@@ -519,7 +643,7 @@ class DiskV2Taichi:
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 40 + 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 41 + 2 * p) * 97.0
-                    out += wb * wp * cascade(
+                    out += wb * wp * self._casc(
                         2.0 * r + ox, phi_rigid / (2.0 * math.pi) * 9.0, 2.0 * z + oz, 9, 0.0, 6.0, 80.0)
         return out
 
@@ -558,7 +682,7 @@ class DiskV2Taichi:
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 7 + p) * 97.0
                     oz = _hashf(bi, cyc, 11 + p) * 97.0
-                    n = fbm_gradient(lnr * self._fr_l + ox,
+                    n = self._fbm(lnr * self._fr_l + ox,
                                      phi0 / (2.0 * math.pi) * self._nphi_l,
                                      oz, self._nphi_l, 3, 0.5)
                     w = wb * wp
@@ -574,8 +698,8 @@ class DiskV2Taichi:
         x = lnr * self._fr_c + ox + 57.3 + layer_off
         y = phi0 / (2.0 * math.pi) * self._nphi_c
         z = zeta * self._fz_c + oz + 41.9 + 0.37 * layer_off
-        wx = gnoise(x * 0.37 + 2.1, y * 0.5, z * 0.5 + 1.3, self._nphi_c // 2)
-        return fbm_gradient(x + 0.9 * wx, y, z, self._nphi_c, 5, 0.5)
+        wx = self._gn(x * 0.37 + 2.1, y * 0.5, z * 0.5 + 1.3, self._nphi_c // 2)
+        return self._fbm(x + 0.9 * wx, y, z, self._nphi_c, 5, 0.5)
 
     @ti.func
     def _turb_pair_smoke(self, r, phi, zeta, t_delay, loff):
@@ -591,7 +715,7 @@ class DiskV2Taichi:
             标量，零均值、约单位方差（除以 `smoke_norm`）。
         """
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * gnoise(lnr * 4.0, 0.37, 11.3, 8)
+        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
         b0 = ti.floor(fb)
         fbf = fb - b0
         acc = 0.0
@@ -656,6 +780,15 @@ class DiskV2Taichi:
             xi = (r - self._r_in) / ti.min(self._r_out - self._r_in, 6.0)
             dust_bound = h_geo * ti.max(0.0, 1.0 - 5.0 * xi * xi)
             az = ti.abs(z)
+            # 优化级别 ≥ 1：核心层与各烟雾层共用的带信息每采样点只算一次
+            lnr = ti.log(r)
+            bw = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            bph = ti.Vector([0.0, 0.0])
+            box = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            boz = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            if ti.static(self._opt >= 1):
+                if az < ti.max(zc, self._cl_extent * r):
+                    bw, bph, box, boz = self._band_info(lnr, phi, t)
             # 烟雾层
             if ti.static(self._smoke_on):
                 if az < self._cl_extent * r:
@@ -666,7 +799,12 @@ class DiskV2Taichi:
                             amp = self._cl_amp_norm * ti.exp(-self._cl_decay * ti.abs(kf))
                             rho_c = self._smoke_i * sig * amp * ti.exp(-0.5 * dz * dz) / (
                                 2.5066283 * self._cl_width * r)
-                            nc = self._turb_pair_smoke(r, phi, dz, t, 131.7 * ti.cast(kk + 1, ti.f32))
+                            loff = 131.7 * ti.cast(kk + 1, ti.f32)
+                            nc = 0.0
+                            if ti.static(self._opt >= 1):
+                                nc = self._smoke_shared(lnr, dz, loff, bw, bph, box, boz)
+                            else:
+                                nc = self._turb_pair_smoke(r, phi, dz, t, loff)
                             cov = 1.0 / (1.0 + ti.exp(-(nc - self._cloud_c0) / self._cloud_soft))
                             ab_sm = rho_c * ti.exp(
                                 self._sigma_c * nc - 0.5 * self._sigma_c * self._sigma_c) * cov
@@ -676,7 +814,12 @@ class DiskV2Taichi:
             # 核心
             if az < ti.max(zc, dust_bound):
                 if az < zc:
-                    c, tn = self._flow_I(r, phi, z, t)
+                    c = 0.0
+                    tn = 0.0
+                    if ti.static(self._opt >= 1):
+                        c, tn = self._flow_shared(r, z, bw, bph, box, boz)
+                    else:
+                        c, tn = self._flow_I(r, phi, z, t)
                     softsat = 1.0 - 1.0 / (ti.max(tn, 0.0) + 1.0)
                     h_s = ti.max(h_cap * (1.0 - self._surf_noise + self._surf_noise * softsat), 1e-6)
                     zs = 3.0 * h_s
