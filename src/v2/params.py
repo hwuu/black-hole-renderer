@@ -76,6 +76,11 @@ class DiskV2VolumeParams:
             同步缩放；柱密度与光学深度不变。1 = 预设 M 的视觉厚度（与参考实现对齐）；默认 1/9 使
             H/r ≈ 0.003（接近 Shakura–Sunyaev 物理量级），消除贴盘面视角的遮挡黑墙
             （见 docs/plans/v2_edge_on_plan.md）。
+        lum_temp_scale: 亮度温度倍率 s（> 0）：亮度按 `Y(s·g·T) / Y(s·T_peak)` 计算，色度仍按真实温度。
+            1 = 物理（与参考实现对齐）；默认 1.25 为艺术夸张：外盘亮度提高（r = 20 处为峰值的 1.2%，
+            s = 1 时 0.4%），贴盘面视角下外盘不再全黑；温度结构的亮度放大倍数（T_peak 处
+            dlnY/dlnT）从 5.7 降到 4.6，纹理基本保留。
+            多普勒亮度指数按 `palette.doppler_lum_compensation` 同步补偿，左右明暗不对称不变。
         r_ref: SS 剖面归一参考半径（r_s）。
         surf_noise: 表面起伏幅度：H_s = H·(1 - SURF_NOISE + SURF_NOISE·softsat(tn))。
         grey_mix: 灰大气强度：温度倍率 = 1 + GREY_MIX·(T_grey/T_eff - 1)；0 = 竖直均匀，1 = 完整灰大气。
@@ -109,6 +114,7 @@ class DiskV2VolumeParams:
     hr_ref: float = 0.027
     r_ref: float = 10.0
     thickness_scale: float = 1.0 / 9.0
+    lum_temp_scale: float = 1.25
     surf_noise: float = 0.6
     grey_mix: float = 0.5
     grey_cap: float = 1.19
@@ -163,6 +169,8 @@ class DiskV2VolumeParams:
             raise ValueError("core_floor must be in [0, 1]")
         if self.thickness_scale <= 0.0:
             raise ValueError("thickness_scale must be positive")
+        if self.lum_temp_scale <= 0.0:
+            raise ValueError("lum_temp_scale must be positive")
         if self.tau_i <= 0.0:
             raise ValueError("tau_i must be positive")
         if self.smoke_i < 0.0:

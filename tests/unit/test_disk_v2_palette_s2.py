@@ -5,6 +5,7 @@
 覆盖：
 - CIE 黑体色度表：与数值积分参考一致、低温偏红 / 高温偏蓝单调、色温方向
 - 可见光亮度 Y(T)：单调、与数值积分一致、T = 0 或负温度行为
+- 亮度温度倍率：亮度对数斜率 dlnY/dlnT、多普勒亮度指数补偿系数
 - 白平衡：von Kries 增益、T_wb 黑体输出中性、亮度（BT.709 加权）守恒
 - Taichi parity：blackbody_color_ti / blackbody_luminance_ti
 - 查找表越界钳制
@@ -18,6 +19,8 @@ import numpy as np
 from src.v2.palette import (
     blackbody_color,
     blackbody_luminance,
+    doppler_lum_compensation,
+    luminance_log_slope,
     white_balance_gain,
 )
 
@@ -114,6 +117,27 @@ class BlackbodyLuminanceTest(unittest.TestCase):
     def test_zero_temperature_returns_zero(self):
         self.assertEqual(blackbody_luminance(0.0), 0.0)
         self.assertEqual(blackbody_luminance(-1.0), 0.0)
+
+
+class LuminanceTempScaleTest(unittest.TestCase):
+    """亮度温度倍率 s：亮度对数斜率与多普勒亮度指数补偿系数。"""
+
+    def test_log_slope_matches_numerical_integration(self):
+        """dlnY/dlnT 与独立数值积分差分一致；4500 K 处约 5.7，随温度单调减小。"""
+        e = 1e-3
+        for t in (2000.0, 4500.0, 9000.0):
+            ref = (math.log(_ref_lum(t * (1 + e))) - math.log(_ref_lum(t * (1 - e)))) / (2 * e)
+            self.assertAlmostEqual(luminance_log_slope(t) / ref, 1.0, delta=1e-3, msg=f"T={t}")
+        self.assertAlmostEqual(luminance_log_slope(4500.0), 5.8, delta=0.3)
+        slopes = [luminance_log_slope(t) for t in (2000.0, 4500.0, 9000.0, 40000.0)]
+        self.assertTrue(all(b < a for a, b in zip(slopes, slopes[1:])), msg=slopes)
+
+    def test_compensation_identity_and_direction(self):
+        """s = 1 时补偿系数精确为 1；s > 1 时 > 1，且使 T_peak 处亮度对频移的敏感度不变。"""
+        self.assertEqual(doppler_lum_compensation(4500.0, 1.0), 1.0)
+        k = doppler_lum_compensation(4500.0, 1.25)
+        self.assertGreater(k, 1.0)
+        self.assertAlmostEqual(k * luminance_log_slope(1.25 * 4500.0), luminance_log_slope(4500.0), places=9)
 
 
 class WhiteBalanceTest(unittest.TestCase):

@@ -311,9 +311,11 @@ class DiskV2Taichi:
         else:
             from .physical_fields import derive_t_peak
             self._t_peak_vol = derive_t_peak(vp.bh_mass_msun, vp.mdot_edd)
-        # ln Y(T_peak)（Y(g·T)/Y(T_peak) 用）
+        # 亮度温度倍率 s：亮度按 Y(s·g·T)/Y(s·T_peak) 计算（1 = 物理，见 DiskV2VolumeParams）
+        self._lum_ts = float(vp.lum_temp_scale)
+        # ln Y(s·T_peak)（Y(s·g·T)/Y(s·T_peak) 用；s = 1 时即 ln Y(T_peak)）
         self._ln_y_peak = math.log(
-            max(_blackbody_luminance_exact(self._t_peak_vol), 1e-300)
+            max(_blackbody_luminance_exact(self._lum_ts * self._t_peak_vol), 1e-300)
         )
 
         # κ 预设 1.0（density_I 的灰大气 tau_z 在标定期间引用 κ）

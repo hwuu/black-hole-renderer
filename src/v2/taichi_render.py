@@ -26,6 +26,7 @@ import taichi as ti
 
 from .camera import build_camera_v1_compatible
 from .noise_ti import hashf as _hashf
+from .palette import doppler_lum_compensation
 from .params import DiskV2Params, DiskV2VolumeParams
 from .postfx import hdr_luminance, postfx, srgb_decode
 from .taichi_impl import DiskV2Taichi, disk_g_factor_ti
@@ -51,7 +52,9 @@ class DiskV2Renderer:
         disk_tilt_deg: 盘倾角（度），盘面绕世界 x 轴旋转（俯仰）。
         disk_roll_deg: 盘滚转角（度），盘面绕世界 y 轴旋转；相机位于 y 轴负方向时，
             正值使盘面在画面上左低右高。
-        doppler_lum: 多普勒亮度强度 s：亮度用 `Y(g^s·T)`；1 = 物理。
+        doppler_lum: 多普勒亮度强度 p：亮度用 `Y(s·g^{p·k}·T)`；1 = 物理。s 为
+            `volume_params.lum_temp_scale`，k = `palette.doppler_lum_compensation(T_peak, s)`
+            （s = 1 时 k = 1）。
         doppler_color: 多普勒颜色强度 s：色度用 `χ(T·g^s)`；1 = 物理。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
@@ -108,6 +111,9 @@ class DiskV2Renderer:
         # 视频曝光锁定：非 None 时 render() 直接使用该曝光（参考实现视频首帧锁定）
         self.fixed_exposure: float | None = None
         self.disk_ti = DiskV2Taichi(params=params, volume_params=self.volume_params, opt_level=self.opt_level)
+        # 亮度温度倍率 s ≠ 1 时补偿多普勒亮度指数，保持左右明暗不对称（s = 1 时补偿系数精确为 1）
+        self._doppler_lum_eff = self.doppler_lum * doppler_lum_compensation(
+            self.disk_ti._t_peak_vol, self.volume_params.lum_temp_scale)
 
         iw, ih = self._iw, self._ih
         # 线性 HDR 分两路：盘发射 Σ T·ΔI_disk 与透过的天空 T_end·I_sky（线性光）。
@@ -338,13 +344,14 @@ class DiskV2Renderer:
                                 r_local, z_local, phi_local, t_delay, dm[2])
                             if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
                                 g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
-                                g_lum = ti.pow(g_phys, self.doppler_lum)
                                 g_col = ti.pow(g_phys, self.doppler_color)
+                                # 亮度温度 = s·g^{doppler_lum_eff}·T（s 为亮度温度倍率；色度不乘 s）
+                                g_lum = ti.pow(g_phys, self._doppler_lum_eff) * disk._lum_ts
                                 T_K = disk._page_thorne_temperature(r_local)
-                                # 核心：Y(g·T·tf_c)·χ(g·T·tf_c)
+                                # 核心：Y(s·g·T·tf_c)/Y(s·T_peak)·χ(g·T·tf_c)
                                 Tc = T_K * tf_c
                                 src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Tc * g_col)
-                                # 其他（尘埃）：Y(g·T)·χ(g·T)
+                                # 其他（尘埃）：Y(s·g·T)/Y(s·T_peak)·χ(g·T)
                                 src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(T_K * g_col)
                                 # 烟雾：T_smoke = SMOKE_TR·T
                                 src_s = src_o

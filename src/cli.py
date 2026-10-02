@@ -93,6 +93,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2_thickness_scale", type=float, default=None,
                         help="V2 盘厚缩放：盘与烟雾层厚度同乘该值，柱密度不变；1 = 预设 M 视觉厚度"
                              "（与参考实现对齐），默认 1/9（H/r ≈ 0.003，接近物理量级）")
+    parser.add_argument("--v2_lum_temp_scale", type=float, default=None,
+                        help="V2 亮度温度倍率 s：亮度按 Y(s·T)/Y(s·T_peak) 计算，色度不变；1 = 物理"
+                             "（与参考实现对齐），默认 1.25（外盘更亮，贴盘面视角外盘不全黑）")
     parser.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
@@ -120,6 +123,19 @@ def resolve_v2_quality(args, video: bool):
     if ss < 1:
         raise ValueError(f"--v2_supersample must be >= 1, got {ss}")
     return opt, ss
+
+
+def v2_volume_overrides(args) -> dict:
+    """收集 CLI 显式传入的 V2 体积参数覆盖项（未传入的保持 `DiskV2VolumeParams` 默认值）。
+
+    Args:
+        args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`，None = 未传入）。
+
+    Returns:
+        `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
+    """
+    fields = {"thickness_scale": args.v2_thickness_scale, "lum_temp_scale": args.v2_lum_temp_scale}
+    return {k: v for k, v in fields.items() if v is not None}
 
 
 def validate_args(args) -> None:
@@ -212,8 +228,7 @@ def main():
             params=DiskV2Params(r_in=args.disk_inner_radius, r_out=args.disk_outer_radius,
                                  disk_spin=-1.0 if args.v2_reverse_rotation else 1.0),
             skybox=skybox,
-            volume_params=(DiskV2VolumeParams() if args.v2_thickness_scale is None
-                           else DiskV2VolumeParams(thickness_scale=args.v2_thickness_scale)),
+            volume_params=DiskV2VolumeParams(**v2_volume_overrides(args)),
             r_max=max(args.r_max, 50.0),
             disk_tilt_deg=args.disk_tilt,
             disk_roll_deg=args.v2_disk_roll,

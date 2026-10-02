@@ -233,6 +233,59 @@ def blackbody_luminance(
     return out
 
 
+def luminance_log_slope(t_k: float) -> float:
+    """黑体可见光亮度对温度的对数斜率 `dlnY/dlnT`（直接积分 + 中心差分）。
+
+    Args:
+        t_k: 温度（K），标量，> 0。
+
+    Returns:
+        标量，> 0。4500 K 附近 ≈ 5.7（Wien 段，温度起伏 1% → 亮度起伏约 6%）；
+        温度升高时单调减小，Rayleigh–Jeans 极限趋于 1。
+
+    Formula:
+        ```
+        dlnY/dlnT ≈ [ln Y(T·(1+ε)) − ln Y(T·(1−ε))] / (2ε)，ε = 1e-3
+        ```
+        `Y(T) = ∫ B_λ(T)·ȳ(λ) dλ`（`_blackbody_luminance_exact`）。
+
+    Physical Meaning:
+        温度结构与频移 g 对亮度的放大倍数：亮度 ∝ T^{dlnY/dlnT}（局部）。
+    """
+    eps = 1.0e-3
+    return (math.log(_blackbody_luminance_exact(t_k * (1.0 + eps)))
+            - math.log(_blackbody_luminance_exact(t_k * (1.0 - eps)))) / (2.0 * eps)
+
+
+def doppler_lum_compensation(t_peak_K: float, lum_temp_scale: float) -> float:
+    """亮度温度倍率 s 下，使多普勒亮度不对称保持不变的指数补偿系数。
+
+    Args:
+        t_peak_K: 盘峰值温度（K），> 0。
+        lum_temp_scale: 亮度温度倍率 s（> 0）；亮度按 `Y(s·T)` 计算。
+
+    Returns:
+        标量补偿系数 k > 0；s = 1 时精确返回 1.0。有效多普勒亮度指数 = `doppler_lum · k`。
+        s > 1 时 k > 1（s = 1.25、预设 M 的 T_peak 时 k ≈ 1.23）。
+
+    Formula:
+        ```
+        k = [dlnY/dlnT](T_peak) / [dlnY/dlnT](s·T_peak)
+        ```
+        亮度对频移的对数敏感度为 `doppler_lum · dlnY/dlnT(s·T)`；乘 k 后在 T_peak 处与 s = 1 相同。
+
+    Physical Meaning:
+        s > 1 让亮度–温度关系变缓（外盘更亮、纹理对比度降低），频移造成的左右明暗不对称
+        也会同比减弱；本系数把这部分补回，使 s 只影响径向亮度分布与结构对比度。
+
+    Simplifications:
+        - 只在 T_peak 一点匹配；其他温度处的不对称与 s = 1 有小幅差异。
+    """
+    if lum_temp_scale == 1.0:
+        return 1.0
+    return luminance_log_slope(t_peak_K) / luminance_log_slope(lum_temp_scale * t_peak_K)
+
+
 def white_balance_gain(
     T_wb: float,
 ) -> np.ndarray:

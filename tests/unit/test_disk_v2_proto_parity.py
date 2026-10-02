@@ -248,6 +248,45 @@ class TestThicknessScale(unittest.TestCase):
         self.assertAlmostEqual(flux(-7.0) / flux(7.0), 1.0, delta=0.10)
 
 
+class TestLumTempScale(unittest.TestCase):
+    """亮度温度倍率 s：峰值归一取 Y(s·T_peak)，外盘变亮，多普勒左右明暗不对称经补偿保持不变。"""
+
+    def test_peak_normalization_and_doppler_compensation(self):
+        from src.v2.palette import _blackbody_luminance_exact, doppler_lum_compensation
+        r = _shared_renderer()
+        d = r.disk_ti
+        s = DiskV2VolumeParams().lum_temp_scale
+        self.assertAlmostEqual(s, 1.25)
+        self.assertAlmostEqual(d._ln_y_peak, math.log(_blackbody_luminance_exact(s * d._t_peak_vol)), places=9)
+        self.assertAlmostEqual(r._doppler_lum_eff, 0.55 * doppler_lum_compensation(d._t_peak_vol, s), places=9)
+
+    def test_outer_disk_brighter_with_same_asymmetry(self):
+        w = np.array([0.2126, 0.7152, 0.0722])
+
+        def render(s):
+            r = DiskV2Renderer(
+                width=48, height=27, params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
+                skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(lum_temp_scale=s),
+                r_max=90.0, ss=2,
+            )
+            r.jitter_seed[None] = 800
+            r.render(cam_pos=CAM, fov=38.0)
+            return r.last_hdr.astype(np.float64) @ w
+
+        phys, art = render(1.0), render(1.25)
+        half = phys.shape[1] // 2
+
+        def lr(lum):
+            return float(lum[:, :half].sum() / lum[:, half:].sum())
+
+        def median_rel(lum):
+            return float(np.median(lum[lum > 1e-4 * lum.max()]) / lum.max())
+
+        # 实测：左右通量比 4.03 → 4.03（补偿后相差 0.1%）；盘区亮度中位数 / 峰值 0.0014 → 0.0028
+        self.assertAlmostEqual(lr(art) / lr(phys), 1.0, delta=0.05)
+        self.assertGreater(median_rel(art) / median_rel(phys), 1.5)
+
+
 class TestTiltEquivalence(unittest.TestCase):
     """倾角等价：盘绕 x 轴倾 θ、相机仰角 e  ≡  盘不倾、相机仰角 e + θ（相机在 y-z 平面内）。
 
