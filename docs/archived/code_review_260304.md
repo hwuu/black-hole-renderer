@@ -1,3 +1,9 @@
+> **已归档（2026-10-02）**
+>
+> 归档原因：2026-03 OpenCode 重构工作的代码审查记录，审查意见已全部处理完毕（见同批 code_review_response / code_review_final）。
+
+---
+
 # Code Review - OpenCode 重构工作
 
 **审查日期**: 2026-03-04
