@@ -86,6 +86,8 @@ def parse_args() -> argparse.Namespace:
                              "3 盘内步长 ×3（近似预览）。默认：单帧 1，视频 2")
     parser.add_argument("--v2_supersample", type=int, default=None,
                         help="V2 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿。默认：单帧 2，视频 1")
+    parser.add_argument("--v2_sky_rot_deg_per_sec", type=float, default=0.0,
+                        help="V2 视频模式：天空方位自转速度（度/视频秒），正值使星空向画面右方漂移；0 关闭 (default: 0)")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
                         help="V2 天空亮度系数（线性光，曝光之后叠加，不影响盘曝光；0 = 黑天空）(default: 0.5)")
     parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,

@@ -121,7 +121,8 @@ class DiskV2Renderer:
         self.sky_w = int(sky_w)
         self.sky_h = int(sky_h)
         self.skybox_field = ti.Vector.field(3, dtype=ti.f32, shape=(sky_w, sky_h))
-        sky_lin = srgb_decode(np.clip(skybox.astype(np.float64), 0.0, 1.0)).astype(np.float32)
+        # float32 解码：8K 等距柱状图在 float64 下需要约 800 MB 中间缓冲
+        sky_lin = srgb_decode(np.clip(skybox.astype(np.float32), 0.0, 1.0)).astype(np.float32)
         self.skybox_field.from_numpy(np.transpose(sky_lin, (1, 0, 2)))
 
         # 相机参数 field（每帧更新）。
