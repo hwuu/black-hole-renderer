@@ -178,11 +178,11 @@ python -m unittest tests/e2e_render.py
 # V1 默认渲染
 python render.py --pov 20 0 2 --fov 60 --ar1 2 --ar2 10 --disk_tilt 20 --resolution hd -o output/*.png
 
-# V2 渲染（预设 M 构图；1080p 加 --v2_ss 2 去噪）
+# V2 渲染（预设 M 构图；默认优化级别 1、超采样倍率 2；--v2_opt / --v2_supersample 可覆盖）
 python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
-                 --ar1 3 --ar2 30 -r fhd --v2_ss 2 --device gpu -o output/v2.png
+                 --ar1 3 --ar2 30 -r fhd --device gpu -o output/v2.png
 
-# V2 视频（内缘一圈 16 s）
+# V2 视频（内缘一圈 16 s；默认优化级别 2、超采样倍率 1）
 python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
                  --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
 

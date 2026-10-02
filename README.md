@@ -49,9 +49,9 @@ V2 用 3D 体积密度场（SS 外区结构 + Page–Thorne 温度 + 灰大气 +
 [`docs/plans/v2_volumetric_video_plan.md`](docs/plans/v2_volumetric_video_plan.md) §2。
 
 ```bash
-# 单帧（预设 M 构图；1080p 建议 --v2_ss 2）
+# 单帧（预设 M 构图；默认优化级别 1、超采样倍率 2）
 python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
-                 --ar1 3 --ar2 30 -r fhd --v2_ss 2 --device gpu -o output/v2.png
+                 --ar1 3 --ar2 30 -r fhd --device gpu -o output/v2.png
 
 # 视频（内缘一圈 16 s，可加 --orbit 环绕）
 python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
@@ -112,7 +112,8 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--disk_model` | 吸积盘模型: `v1` / `v2` | v1 |
-| `--v2_ss` | 体积模型超采样倍率（每轴），2 = 每像素 4 条光线 | 1 |
+| `--v2_opt` | 优化级别：0 参考实现；1 精确优化（输出与 0 一致）；2 盘内步长 ×2（视觉等价）；3 盘内步长 ×3（近似预览）。见 `docs/plans/v2_performance_plan.md` | 单帧 1，视频 2 |
+| `--v2_supersample` | 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿 | 单帧 2，视频 1 |
 | `--v2_orbit_seconds` | 视频模式：内缘开普勒轨道一圈对应的视频秒数 | 16.0 |
 | `--v2_sky_gain` | 天空亮度系数（sRGB 解码为线性光后，曝光之后叠加；不影响盘曝光；0 = 黑天空） | 0.5 |
 
@@ -126,7 +127,7 @@ V2 同时使用通用参数 `--pov`、`--fov`、`--ar1`、`--ar2`、`--disk_tilt
 - 仅支持 `--device gpu`（CPU 单帧也要数分钟）；不支持 `--interactive`。
 - 曝光自动：盘区亮度 p99.9 映射到 0.9（只看盘，天空不参与）；视频首帧计算后锁定。
 - 天空：`--texture` 读等距柱状 PNG，不传则程序生成星空；双线性采样，星点参与 bloom。
-- 速度（M 系列 GPU 实测，稳态每帧）：960×540 ≈ 4.8 s；1080p ≈ 15.8 s；1080p `--v2_ss 2` ≈ 52 s。
+- 速度（M 系列 GPU 实测）：960×540、每像素 1 条光线单帧，级别 0 4.6 s，级别 1 4.0 s，级别 2 2.3 s，级别 3 1.7 s；1080p 视频每帧级别 2 约 11 s、级别 3 约 6 s。超采样倍率 N 耗时约为 N² 倍。
 - 与参考实现对比验收：`python scripts/compare_v2_proto.py`。
 
 ## 物理模型
