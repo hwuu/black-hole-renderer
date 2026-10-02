@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import numpy as np
 import taichi as ti
 
-from disk_v2 import noise_ti as N
+from src.v2 import noise_ti as N
 
 _MASK32 = 0xFFFFFFFF
 

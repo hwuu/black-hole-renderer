@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-from disk_v2.camera import build_camera_v1_compatible
+from src.v2.camera import build_camera_v1_compatible
 from render import build_camera
 
 

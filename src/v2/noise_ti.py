@@ -13,7 +13,7 @@
 NumPy 镜像（`tests/unit/test_disk_v2_noise_ti.py` 内）逐位对齐做 parity。
 
 坐标约定：调用方传"拉格朗日流坐标"，噪声本身不感知时间/旋转
-（平流由 `disk_v2/advection.py` 负责）；y 方向周期必须为正整数，
+（平流由 `src/v2/advection.py` 负责）；y 方向周期必须为正整数，
 否则无缝性不成立（由 `cascade`/`fbm_gradient` 内部按八度翻倍保持）。
 """
 

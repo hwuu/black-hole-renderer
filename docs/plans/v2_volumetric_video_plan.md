@@ -13,7 +13,7 @@
 > **术语表**（本文为已冻结的实施记录，保留当时的用语）：
 > - **参考实现 / Proto**：`scripts/proto_disk_reference.py`，独立单文件渲染器，参数组合的定稿名为预设 M。
 > - **mode 3 / 刚体环平流**：按 ln r 分带、带内刚体旋转、带间平滑混合、种子有限寿命交叉淡化的平流方案（§4.1）。
-> - **V2**：`disk_v2/` 包的工程实现，与参考实现逐像素对齐（§10、§12）。
+> - **V2**：`src/v2/` 包的工程实现，与参考实现逐像素对齐（§10、§12）。
 > - **S0–S9**：本方案 §5 的实施步骤编号。
 >
 > **真源关系**：模型、分层与概念边界以 [`docs/design_ad_v2.md`](../design_ad_v2.md)（v2.3）为准。本方案替代已归档的 [`v2_visual_recovery_plan.md`](../archived/v2_visual_recovery_plan.md) 中"预烘焙 visual atlas 作为主结构"的决定；旧 atlas 模型已于 2026-10-02 删除（§11）。
@@ -26,9 +26,9 @@
 
 | 编号 | 现象 | 根因 | 证据 |
 |------|------|------|------|
-| R1 | 烟雾/体积感看不出来 | V2 默认 `use_visual_atlas=True`，主光追退化为"中面单次命中 + 2D atlas 查表"（`disk_v2/taichi_render.py:471`），没有真正的体积积分；atlas 只有 `(r, φ)`，无 z 结构 | 代码阅读 |
+| R1 | 烟雾/体积感看不出来 | V2 默认 `use_visual_atlas=True`，主光追退化为"中面单次命中 + 2D atlas 查表"（`src/v2/taichi_render.py:471`），没有真正的体积积分；atlas 只有 `(r, φ)`，无 z 结构 | 代码阅读 |
 | R2 | 纹理卷成圈 | 任何 `f(φ − Ω(r)·t)` 形式在 t 无界时螺旋倾角 `tan i = 1/(1.5·Ω·t)` 单调趋零 | 原型 `winding`：naive 30 圈后倾角 6°→1.5° |
-| R3 | 多普勒强度偏高 | `schwarzschild_orbital_beta_ti` 用 `1 − 3M/r`，应为 `1 − 2M/r`（ISCO 处 0.577 vs 0.5） | `disk_v2/taichi_impl.py:67`、`disk_v2/relativity.py:131` |
+| R3 | 多普勒强度偏高 | `schwarzschild_orbital_beta_ti` 用 `1 − 3M/r`，应为 `1 − 2M/r`（ISCO 处 0.577 vs 0.5） | `src/v2/taichi_impl.py:67`、`src/v2/relativity.py:131` |
 | R4 | 多普勒角度偏差 | `cosθ` 用坐标方向，未变换到本地静止观者方向；与严格 GR 最大差 5.6% | 原型 `physcheck` [1] |
 | R5 | 颜色发灰、蓝移被吃掉 | Tanner Helland 输出是 sRGB 编码值，被当线性光使用，末端再做一次 gamma（双重 gamma） | 原型对比：修正后饱和度 0.33→0.49 |
 | R6 | bloom 盖住云雾与蓝移 | bloom 在 LDR 域对整盘加性叠加（`_bloom_kernel`），并用逐通道衰减硬凑色偏 | 原型：整盘 bloom 使局部对比损失 40% |
@@ -203,7 +203,7 @@ S(T, g)   = Y(g_lum·T)/Y(T_peak) · χ(T·g_col)，g_lum = g^{doppler_lum}，g_
 5. 横向色散：R 放大 `(1+k)`、B 缩小 `(1−k)`，双线性重采样。
 6. 保色度 ACES：只对亮度做 ACES，RGB 等比缩放；超出色域通道按比例收回并向白少量混合（`w = clip((max−1)·0.12, 0, 0.25)`）。
 7. sRGB 编码。天空盒在相同链路之前以线性光合成（天空盒 PNG 先解码）。
-- 实现位置：新增 `disk_v2/postfx.py`（NumPy，1080p 约 0.3 s）；若视频性能不够再移到 Taichi（见 §6）。
+- 实现位置：新增 `src/v2/postfx.py`（NumPy，1080p 约 0.3 s）；若视频性能不够再移到 Taichi（见 §6）。
 - 替换 `taichi_render.py` 现有 `_disk_tonemap_kernel` + `_bloom_kernel` + `_compose_kernel`。
 
 ### 4.5 视频
@@ -227,13 +227,13 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 | 步骤 | 内容 | 修改/新增文件 | 测试要点 |
 |------|------|---------------|----------|
 | S0 ✅ | 原型入库作为参考实现与验收脚本（v0.5 更新为 M，L / J2 / H 保留为预设） | `scripts/proto_disk_reference.py` | 默认输出与用户确认的 M 图逐像素一致；L / J2 / H 复现命令与历史图一致；`physcheck` 通过 |
-| S1 ✅ | 相对论修正：β、本地方向 cosθ、Planck 波段增强、`doppler_lum/color`（helper；渲染核接线在 S6） | `disk_v2/relativity.py`、`disk_v2/taichi_impl.py`、新增 `tests/unit/test_disk_v2_relativity_s1.py` | β(ISCO)=0.5；g 与严格 GR 误差 < 0.1%；逼近侧 g>1、远离侧 g<1；Planck 比值随 g 单调；指数为 0 时 g=1 |
-| S2 | 颜色与亮度链路：CIE 黑体色度表、可见光亮度 ln Y(T) 表、白平衡、删除 cinematic palette | `disk_v2/palette.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 6500K 近中性（色度偏差 < 3%）；低温偏红、高温偏蓝单调；Y(T) 单调且与数值积分误差 < 1%；WB=T 时该温度黑体中性；cinematic 相关测试删除 |
-| S3 | Taichi 噪声库：周期 value noise、乘性级联（小数八度 + softplus）、周期梯度噪声 fBm（烟雾 / 低频层）、1D 噪声 | 新增 `disk_v2/noise_ti.py` | φ 周期无缝（首尾差 < 1e-5）；同种子可复现；级联输出 ≥ 0、小数八度在整数处连续；fBm 归一后单位方差 |
-| S4 | 刚体环平流（主云、厚度扰动、烟雾、低频层共用）+ CPU f64 相位表 + 光行时间 | 新增 `disk_v2/advection.py` | 带权重和 = 1；种子切换时权重为 0；长时间（30 圈）倾角不衰减；纹理 Δφ 与 Ω·Δt 一致（误差 < 1°）；t = 1e6 时相位精度（与 f64 参考对比） |
-| S5 | 3D 场（M）：第 1 层 M、Ṁ → T_peak；Page–Thorne T(r)；SS H(r)/Σ(r) + 竖直高斯；噪声表面；灰大气 + 温度起伏；温和密度起伏；烟雾（温度比）；开普勒尘埃；大尺度低频；替换 atlas | `disk_v2/geometry.py`、`disk_v2/physical_fields.py`、`disk_v2/structure_modulations.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py` | 盘外 = 0；ρ ≥ 0；T_peak(1e8 M☉, 1.7e-6) = 4509 K；PT 峰值 4.8 r_s；核心柱密度 = Σ'（误差 < 2%）；τ_z 与数值积分一致；灰大气倍率 ∈ [1, GREY_CAP]；各层随 Ω 同步转动；与参考实现同参数 parity |
-| S6 | 体积光追为默认路径、连续步长 + 起点抖动、静止观者相机、g 接入、Y(g·T) 源函数（核心 / 烟雾 / 尘埃分温度）；删除 atlas / thin-layer | `disk_v2/taichi_render.py`、删除 `disk_v2/visual_atlas.py` | 渲染可复现（同参数、同抖动种子 hash 一致）；1080p ss=2 GPU 单帧 ≤ 30 s；与参考实现同参数时逼近/远离侧色相与盘带亮度剖面一致 |
-| S7 | 后处理替换 | 新增 `disk_v2/postfx.py`，修改 `disk_v2/taichi_render.py` | bloom 对盘面局部对比损失 < 35%；光晕点亮暗区 5–15%；高光外缘 B/G 升高；零强度时各效果为恒等 |
+| S1 ✅ | 相对论修正：β、本地方向 cosθ、Planck 波段增强、`doppler_lum/color`（helper；渲染核接线在 S6） | `src/v2/relativity.py`、`src/v2/taichi_impl.py`、新增 `tests/unit/test_disk_v2_relativity_s1.py` | β(ISCO)=0.5；g 与严格 GR 误差 < 0.1%；逼近侧 g>1、远离侧 g<1；Planck 比值随 g 单调；指数为 0 时 g=1 |
+| S2 | 颜色与亮度链路：CIE 黑体色度表、可见光亮度 ln Y(T) 表、白平衡、删除 cinematic palette | `src/v2/palette.py`、`src/v2/taichi_impl.py`、`src/v2/params.py` | 6500K 近中性（色度偏差 < 3%）；低温偏红、高温偏蓝单调；Y(T) 单调且与数值积分误差 < 1%；WB=T 时该温度黑体中性；cinematic 相关测试删除 |
+| S3 | Taichi 噪声库：周期 value noise、乘性级联（小数八度 + softplus）、周期梯度噪声 fBm（烟雾 / 低频层）、1D 噪声 | 新增 `src/v2/noise_ti.py` | φ 周期无缝（首尾差 < 1e-5）；同种子可复现；级联输出 ≥ 0、小数八度在整数处连续；fBm 归一后单位方差 |
+| S4 | 刚体环平流（主云、厚度扰动、烟雾、低频层共用）+ CPU f64 相位表 + 光行时间 | 新增 `src/v2/advection.py` | 带权重和 = 1；种子切换时权重为 0；长时间（30 圈）倾角不衰减；纹理 Δφ 与 Ω·Δt 一致（误差 < 1°）；t = 1e6 时相位精度（与 f64 参考对比） |
+| S5 | 3D 场（M）：第 1 层 M、Ṁ → T_peak；Page–Thorne T(r)；SS H(r)/Σ(r) + 竖直高斯；噪声表面；灰大气 + 温度起伏；温和密度起伏；烟雾（温度比）；开普勒尘埃；大尺度低频；替换 atlas | `src/v2/geometry.py`、`src/v2/physical_fields.py`、`src/v2/structure_modulations.py`、`src/v2/taichi_impl.py`、`src/v2/params.py` | 盘外 = 0；ρ ≥ 0；T_peak(1e8 M☉, 1.7e-6) = 4509 K；PT 峰值 4.8 r_s；核心柱密度 = Σ'（误差 < 2%）；τ_z 与数值积分一致；灰大气倍率 ∈ [1, GREY_CAP]；各层随 Ω 同步转动；与参考实现同参数 parity |
+| S6 | 体积光追为默认路径、连续步长 + 起点抖动、静止观者相机、g 接入、Y(g·T) 源函数（核心 / 烟雾 / 尘埃分温度）；删除 atlas / thin-layer | `src/v2/taichi_render.py`、删除 `src/v2/visual_atlas.py` | 渲染可复现（同参数、同抖动种子 hash 一致）；1080p ss=2 GPU 单帧 ≤ 30 s；与参考实现同参数时逼近/远离侧色相与盘带亮度剖面一致 |
+| S7 | 后处理替换 | 新增 `src/v2/postfx.py`，修改 `src/v2/taichi_render.py` | bloom 对盘面局部对比损失 < 35%；光晕点亮暗区 5–15%；高光外缘 B/G 升高；零强度时各效果为恒等 |
 | S8 | V2 视频 | `render.py` | 相邻帧差无尖峰；亮度波动 < 1%；`--resume` 结果与连续渲染逐帧一致；V1 e2e 基线不变 |
 | S9 | CLI 按三层分组（与参考实现一致）、README、设计文档、AGENTS 踩坑 | `render.py`、`README.md`、`docs/design_ad_v2.md`、`docs/design.md`、`AGENTS.md` | 文档与参数名一致；`--help` 分组与 §2 三层一致 |
 
@@ -265,7 +265,7 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 ## 8. 已决事项（2026-10-01 用户确认）
 
 1. **原型入库**：`scripts/proto_disk_reference.py`，作为参考实现与 `physcheck` 验收工具（S0 已完成）。
-2. **atlas 路径删除**：删除 `disk_v2/visual_atlas.py`、thin-layer 分支、`--v2_turbulence_strength` / `--v2_spiral_warp_strength` / `--v2_alpha_clip_threshold` / `--v2_atlas_*` / `--v2_disable_visual_atlas`，以及 `tests/unit/test_disk_v2_visual_atlas.py`（S5/S6）。
+2. **atlas 路径删除**：删除 `src/v2/visual_atlas.py`、thin-layer 分支、`--v2_turbulence_strength` / `--v2_spiral_warp_strength` / `--v2_alpha_clip_threshold` / `--v2_atlas_*` / `--v2_disable_visual_atlas`，以及 `tests/unit/test_disk_v2_visual_atlas.py`（S5/S6）。
 3. **`--v2_lum_power` 删除**：由 Planck 波段增强 + `--v2_doppler_lum` 取代（helper 在 S1 提供，CLI 删除与渲染核接线在 S6）。
 4. **V2 默认外半径 30**：`ar1 = 3, ar2 = 30`；推荐相机 `dist = 60`、竖直 fov 38°、仰角 7°。
 6. **盘体形态定稿 J2**（v0.4，已被 7 取代）：模型 I + H 烟雾 + 大尺度明暗，对比度 50；旋转保留 mode 3（mode 4 螺线内流对比后未采用）；H 保留为可退回预设。

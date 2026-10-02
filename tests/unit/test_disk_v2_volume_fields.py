@@ -26,13 +26,13 @@ R_IN, R_OUT = 3.0, 30.0
 class PageThorneTest(unittest.TestCase):
     def test_t_peak_derivation(self):
         """T_peak(1e8 M☉, 1.7e-6 Ṁ_Edd) ≈ 4509 K。"""
-        from disk_v2.physical_fields import derive_t_peak
+        from src.v2.physical_fields import derive_t_peak
         tp = derive_t_peak(1.0e8, 1.7e-6)
         self.assertAlmostEqual(tp, 4509.0, delta=20.0)
 
     def test_pt_peak_radius(self):
         """Page–Thorne 温度峰值位于 r ≈ 4.8 r_s（牛顿近似 4.08）。"""
-        from disk_v2.physical_fields import page_thorne_flux
+        from src.v2.physical_fields import page_thorne_flux
         rs = np.linspace(3.0, 30.0, 20001)
         f = page_thorne_flux(rs)
         r_peak = rs[int(np.argmax(f))]
@@ -43,7 +43,7 @@ class PageThorneTest(unittest.TestCase):
 class SSFieldTest(unittest.TestCase):
     def test_half_thickness_grows_slowly(self):
         """SS 外区 H/r 随 r^{1/8} 缓慢增大，且 H 在内区有限。"""
-        from disk_v2.physical_fields import ss_half_thickness
+        from src.v2.physical_fields import ss_half_thickness
         h5 = float(ss_half_thickness(5.0, R_IN, 0.027, 10.0))
         h20 = float(ss_half_thickness(20.0, R_IN, 0.027, 10.0))
         self.assertGreater(h5, 0.0)
@@ -52,7 +52,7 @@ class SSFieldTest(unittest.TestCase):
 
     def test_surface_density_positive_and_decays(self):
         """Σ(r) > 0 且从内到外衰减；外缘截断为 0。"""
-        from disk_v2.physical_fields import ss_surface_density
+        from src.v2.physical_fields import ss_surface_density
         s5 = float(ss_surface_density(5.0, R_IN, R_OUT, 10.0))
         s15 = float(ss_surface_density(15.0, R_IN, R_OUT, 10.0))
         s_out = float(ss_surface_density(R_OUT, R_IN, R_OUT, 10.0))
@@ -62,7 +62,7 @@ class SSFieldTest(unittest.TestCase):
 
     def test_column_density_matches_gaussian(self):
         """竖直高斯解析：∫ρ dz = Σ'（误差 < 1%）。"""
-        from disk_v2.physical_fields import ss_half_thickness, ss_surface_density
+        from src.v2.physical_fields import ss_half_thickness, ss_surface_density
         h = float(ss_half_thickness(6.0, R_IN, 0.027, 10.0))
         sig = float(ss_surface_density(6.0, R_IN, R_OUT, 10.0))
         # ∫ Σ/(√(2π)H)·exp(-z²/2H²) dz = Σ
@@ -95,7 +95,7 @@ class GreyAtmosphereTest(unittest.TestCase):
 class VolumeParamsTest(unittest.TestCase):
     def test_defaults_match_reference_preset_M(self):
         """DiskV2VolumeParams 默认值 = 参考实现预设 M。"""
-        from disk_v2.params import DiskV2VolumeParams
+        from src.v2.params import DiskV2VolumeParams
         vp = DiskV2VolumeParams()
         self.assertEqual(vp.bh_mass_msun, 1.0e8)
         self.assertAlmostEqual(vp.mdot_edd, 1.7e-6)
@@ -115,7 +115,7 @@ class VolumeParamsTest(unittest.TestCase):
         self.assertTrue(vp.light_delay)
 
     def test_validation(self):
-        from disk_v2.params import DiskV2VolumeParams
+        from src.v2.params import DiskV2VolumeParams
         with self.assertRaises(ValueError):
             DiskV2VolumeParams(grey_mix=-0.1)
         with self.assertRaises(ValueError):
@@ -130,7 +130,7 @@ class DiskGeometryParamsTest(unittest.TestCase):
     def test_r_in_below_isco_is_clamped_with_warning(self):
         import warnings
 
-        from disk_v2.params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params
+        from src.v2.params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             params = DiskV2Params(r_in=2.0, r_out=10.0)
@@ -140,7 +140,7 @@ class DiskGeometryParamsTest(unittest.TestCase):
     def test_r_out_must_exceed_clamped_r_in(self):
         import warnings
 
-        from disk_v2.params import DiskV2Params
+        from src.v2.params import DiskV2Params
         # r_in 钳制为 3.0 后，r_out=2.5 仍然 ≤ r_in，应 raise。
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")

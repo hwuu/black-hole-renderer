@@ -14,7 +14,7 @@ import unittest
 
 import numpy as np
 
-from disk_v2.relativity import (
+from src.v2.relativity import (
     disk_g_factor,
     exact_equatorial_g_factor,
     local_photon_direction,
@@ -130,7 +130,7 @@ class TaichiParityTest(unittest.TestCase):
         import taichi as ti
 
         ti.init(arch=ti.cpu, default_fp=ti.f32)
-        from disk_v2 import taichi_impl as T
+        from src.v2 import taichi_impl as T
 
         cls.ti = ti
         cls.T = T

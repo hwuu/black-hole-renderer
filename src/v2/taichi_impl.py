@@ -3,7 +3,7 @@
 本模块提供 `DiskV2Renderer` 主光追 kernel 所需的 `@ti.func` 构件：
 
 - 频移：`disk_g_factor_ti`（静止观者本地方向 + 圆轨道 Doppler + 引力红移），
-  与 `disk_v2.relativity.disk_g_factor`（NumPy 参考）parity。
+  与 `src.v2.relativity.disk_g_factor`（NumPy 参考）parity。
 - 刚体环平流相位的光行时间换算：`_delayed_rot` / `_delayed_seed`。
 - `DiskV2Taichi`：把 `DiskV2Params` / `DiskV2VolumeParams` 平铺为 Python 标量
   （Taichi `@ti.func` 不接受 dataclass 常量），上传 Page–Thorne 温度表、

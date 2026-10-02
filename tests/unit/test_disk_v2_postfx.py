@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 import numpy as np
 
-from disk_v2.postfx import (
+from src.v2.postfx import (
     apply_bloom,
     apply_fringe,
     apply_lateral_ca,

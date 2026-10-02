@@ -11,7 +11,7 @@
 - `taichi_render.py`：主光追 `DiskV2Renderer`。
 - `postfx.py`：后处理链（白平衡 → bloom → 色散 → 保色度 ACES → sRGB）。
 
-包级只导出无 Taichi 依赖的参数与参考函数；渲染器请从 `disk_v2.taichi_render` 导入。
+包级只导出无 Taichi 依赖的参数与参考函数；渲染器请从 `src.v2.taichi_render` 导入。
 """
 
 from .palette import blackbody_color, blackbody_luminance, white_balance_gain

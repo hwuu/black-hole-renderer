@@ -4674,8 +4674,8 @@ if __name__ == "__main__":
         Notes:
             逃逸半径下限取 `max(--r_max, 50)`；渲染器内部再与 `2·相机距离`、`1.6·r_out` 取大。
         """
-        from disk_v2.params import DiskV2Params, DiskV2VolumeParams
-        from disk_v2.taichi_render import DiskV2Renderer
+        from src.v2.params import DiskV2Params, DiskV2VolumeParams
+        from src.v2.taichi_render import DiskV2Renderer
 
         ti.init(arch=ti.gpu if args.device == "gpu" else ti.cpu, default_fp=ti.f32)
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)

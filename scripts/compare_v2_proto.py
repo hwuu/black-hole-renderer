@@ -74,8 +74,8 @@ def run_v2(w: int, h: int, ss: int, t: float = T_FRAME) -> tuple[np.ndarray, np.
     import taichi as ti
 
     ti.init(arch=ti.gpu, default_fp=ti.f32)
-    from disk_v2.params import DiskV2Params, DiskV2VolumeParams
-    from disk_v2.taichi_render import DiskV2Renderer
+    from src.v2.params import DiskV2Params, DiskV2VolumeParams
+    from src.v2.taichi_render import DiskV2Renderer
 
     renderer = DiskV2Renderer(
         width=w, height=h,
@@ -162,7 +162,7 @@ def main() -> None:
     ap.add_argument("--ss", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(ROOT, "output", "compare_v2_proto.png"))
     ap.add_argument("--t", type=float, default=T_FRAME, help="帧物理时间（r_s/c），两边相同")
-    ap.add_argument("--reuse_proto", action="store_true", help="复用上一次 Proto 输出（迭代调试用）")
+    ap.add_argument("--reuse_proto", action="store_true", help="复用 output/proto 中上一次的 Proto 输出；--t 必须与那次一致（HDR 文件按时间覆盖）")
     a = ap.parse_args()
 
     hdr_p, ldr_p = run_proto(a.w, a.h, a.ss, a.reuse_proto, a.t)
@@ -180,7 +180,7 @@ def main() -> None:
 
     from PIL import Image
 
-    top = label(ldr_v, "V2 (disk_v2.DiskV2Renderer)")
+    top = label(ldr_v, "V2 (src.v2.DiskV2Renderer)")
     bottom = label(ldr_p, "Proto (scripts/proto_disk_reference.py, preset M)")
     sep = np.full((4, a.w, 3), 60, np.uint8)
     os.makedirs(os.path.dirname(a.out), exist_ok=True)

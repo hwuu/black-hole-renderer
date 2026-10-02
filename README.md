@@ -118,7 +118,7 @@ python render.py --video --orbit --resume -o output/demo.mp4
 
 V2 同时使用通用参数 `--pov`、`--fov`、`--ar1`、`--ar2`、`--disk_tilt`、`--r_max`（V2 下限 50）、
 `--texture`、`--video`、`--orbit`、`--orbit_degrees`、`--n_frames`、`--fps`。
-物理模型与视觉参数取预设 M（`disk_v2.params.DiskV2VolumeParams` 默认值），暂不开放 CLI。
+物理模型与视觉参数取预设 M（`src.v2.params.DiskV2VolumeParams` 默认值），暂不开放 CLI。
 
 **V2 使用注意**：
 

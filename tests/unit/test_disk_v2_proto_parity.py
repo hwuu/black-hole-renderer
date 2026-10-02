@@ -18,10 +18,10 @@ import taichi as ti
 
 ti.init(arch=ti.gpu, default_fp=ti.f32)  # 无 GPU 时 Taichi 自动回退 CPU
 
-from disk_v2.advection import RigidRingBands  # noqa: E402
-from disk_v2.params import DiskV2Params, DiskV2VolumeParams  # noqa: E402
-from disk_v2.taichi_impl import _delayed_rot, _delayed_seed  # noqa: E402
-from disk_v2.taichi_render import DiskV2Renderer  # noqa: E402
+from src.v2.advection import RigidRingBands  # noqa: E402
+from src.v2.params import DiskV2Params, DiskV2VolumeParams  # noqa: E402
+from src.v2.taichi_impl import _delayed_rot, _delayed_seed  # noqa: E402
+from src.v2.taichi_render import DiskV2Renderer  # noqa: E402
 
 R_IN, R_OUT = 3.0, 30.0
 CAM_ELEV = math.radians(7.0)

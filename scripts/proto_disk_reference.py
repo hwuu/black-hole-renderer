@@ -1,4 +1,4 @@
-"""吸积盘真实感参考实现（独立脚本，不依赖 render.py / disk_v2）。
+"""吸积盘真实感参考实现（独立脚本，不依赖 render.py / src.v2）。
 
 用途：
 1. V2 体积云雾 + 动态旋转方案的**视觉验收基准**（docs/plans/v2_volumetric_video_plan.md §2）。

@@ -20,8 +20,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import numpy as np
 import taichi as ti
 
-from disk_v2 import advection as ADV
-from disk_v2 import noise_ti as N
+from src.v2 import advection as ADV
+from src.v2 import noise_ti as N
 
 R_IN, R_OUT, DLN, K_RIGID = 3.0, 30.0, math.log(1.22), 4.0
 

@@ -15,7 +15,7 @@ import unittest
 
 import numpy as np
 
-from disk_v2.palette import (
+from src.v2.palette import (
     blackbody_color,
     blackbody_luminance,
     white_balance_gain,
@@ -155,7 +155,7 @@ class TaichiParityTest(unittest.TestCase):
         import taichi as ti
 
         ti.init(arch=ti.cpu, default_fp=ti.f32)
-        from disk_v2 import taichi_impl as T
+        from src.v2 import taichi_impl as T
 
         cls.ti, cls.T = ti, T
         # 只上传查找表（不构造体积模型，避免编译整套体积 kernel）
@@ -211,7 +211,7 @@ class LutBoundaryTest(unittest.TestCase):
         高于 40000 K 取 40000 K 的颜色。该行为由设计决定（§2.2 表范围），
         本测试锁定之，防止未来被改成外推。
         """
-        from disk_v2.palette import _BB_T_MAX_K, _BB_T_MIN_K
+        from src.v2.palette import _BB_T_MAX_K, _BB_T_MIN_K
         below = np.asarray(blackbody_color(300.0))
         at_min = np.asarray(blackbody_color(_BB_T_MIN_K))
         np.testing.assert_allclose(below, at_min, rtol=1e-12)
@@ -219,7 +219,7 @@ class LutBoundaryTest(unittest.TestCase):
         at_max = np.asarray(blackbody_color(_BB_T_MAX_K))
         np.testing.assert_allclose(above, at_max, rtol=1e-12)
         # 亮度表 [300, 60000] K 同样钳制
-        from disk_v2.palette import _LNY_T_MAX_K, _LNY_T_MIN_K
+        from src.v2.palette import _LNY_T_MAX_K, _LNY_T_MIN_K
         self.assertEqual(blackbody_luminance(1.0), blackbody_luminance(_LNY_T_MIN_K))
         self.assertEqual(blackbody_luminance(1.0e7), blackbody_luminance(_LNY_T_MAX_K))
 

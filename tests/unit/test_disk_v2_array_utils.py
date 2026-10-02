@@ -5,7 +5,7 @@ import unittest
 
 import numpy as np
 
-from disk_v2._array_utils import _restore_bool, _restore_shape, _to_array
+from src.v2._array_utils import _restore_bool, _restore_shape, _to_array
 
 
 class DiskV2ArrayUtilsTest(unittest.TestCase):

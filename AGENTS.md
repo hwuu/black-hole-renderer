@@ -145,7 +145,7 @@ python -m unittest tests/e2e_render.py
     - 根因：Taichi 1.7.4 只允许 Python float/int/bool 作为 runtime 常量，不接受任意 dataclass 字段
     - 修复：在 `__init__` 里把 dataclass 字段平铺为 `self._r_in = float(params.r_in)`，
       `@ti.func` 内只访问平铺字段
-    - 文件位置：`disk_v2/taichi_impl.py:DiskV2Taichi.__init__`
+    - 文件位置：`src/v2/taichi_impl.py:DiskV2Taichi.__init__`
 
 25. **Taichi `@ti.func` 不接受类型注解** (V2 实施时踩到)
     - 现象：`def foo(x: ti.f32) -> ti.f32:` 抛 `TaichiSyntaxError: Invalid type annotation`
@@ -165,7 +165,7 @@ python -m unittest tests/e2e_render.py
     - 现象：`F_clump` 全强度进发射 → 鬣狗斑；高频 `F_shear` 试验 → 斑马纹；二者叠加易全白/灰脏
     - 修复：主结构改预烘焙 `visual_atlas`（V1 云雾 + spiral warp + alpha clip）；`F_clump` 仅弱密度自遮挡（`clump_strength≈0.12`, `clump_emission_weight=0`）；`shear_strength` 默认 0
  - 验收：`bash scripts/v2_visual_acceptance.sh`；固定相机 `pov=24 0 8, ar1=2, ar2=15`
-    - 文件：`disk_v2/visual_atlas.py`、`disk_v2/taichi_impl.py`、`disk_v2/params.py`
+    - 文件：`src/v2/visual_atlas.py`、`src/v2/taichi_impl.py`、`src/v2/params.py`
 
 ---
 
@@ -200,7 +200,7 @@ python scripts/compare_v2_proto.py
       都变成 ~exp(32) ≈ 1e14，冷区红光不被压制
     - 修复：返回 `lnY`（与参考实现 `ln_luminance` 一致），kernel 用
       `exp(lnY(T) - lnY(T_peak))` 得到正确比值
-    - 文件位置：`disk_v2/taichi_impl.py:blackbody_luminance_ti`
+    - 文件位置：`src/v2/taichi_impl.py:blackbody_luminance_ti`
 
 29. **`from __future__ import annotations` 使 `ti.template()` 失效（S5 踩到）**
     - 现象：标定 kernel 编译报 `TaichiSyntaxError: Invalid type annotation`
@@ -208,7 +208,7 @@ python scripts/compare_v2_proto.py
       字符串，Taichi 无法把字符串 `'ti.template()'` 解析回类型
     - 修复：`taichi_impl.py` 移除该 import（其余模块可用，但含 `@ti.kernel`
       定义的文件不可用）
-    - 文件位置：`disk_v2/taichi_impl.py`
+    - 文件位置：`src/v2/taichi_impl.py`
 
 30. **渲染核内 `self.xxx` 属性必须在 `_compile_kernels()` 之前赋值（S6 踩到）**
     - 现象：`AttributeError: 'DiskV2Renderer' object has no attribute 'volume_params'`
@@ -216,7 +216,7 @@ python scripts/compare_v2_proto.py
       `self.volume_params`，但该属性在 `_compile_kernels()` 之后才赋值
     - 修复：把 `self.volume_params = volume_params` 移到
       `self._compile_kernels()` 之前
-    - 文件位置：`disk_v2/taichi_render.py:__init__`
+    - 文件位置：`src/v2/taichi_render.py:__init__`
 
 31. **移植 Proto 时凭印象改写 → V2 与 Proto 长期对不上（2026-10 修复）**
     - 现象：多轮"看图 → 猜原因 → 补一处"仍差距大：烟雾看不见、光子环下半部消失、锯齿
