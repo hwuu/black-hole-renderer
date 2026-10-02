@@ -32,5 +32,18 @@ class ResolveV2QualityTest(unittest.TestCase):
             _args("--v2_ss", "2")
 
 
+class V2VolumeOverridesTest(unittest.TestCase):
+    """`v2_volume_overrides`：只收集显式传入的体积参数。"""
+
+    def test_unset_flags_keep_defaults(self):
+        self.assertEqual(cli.v2_volume_overrides(_args()), {})
+        self.assertIsNone(_args().v2_doppler_lum)
+
+    def test_explicit_flags_collected(self):
+        a = _args("--v2_az_stretch", "1.0", "--v2_core_contrast", "0.6", "--v2_doppler_lum", "0.45")
+        self.assertEqual(cli.v2_volume_overrides(a), {"core_az_stretch": 1.0, "core_contrast": 0.6})
+        self.assertEqual(a.v2_doppler_lum, 0.45)
+
+
 if __name__ == "__main__":
     unittest.main()

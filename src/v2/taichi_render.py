@@ -52,7 +52,8 @@ class DiskV2Renderer:
         disk_tilt_deg: 盘倾角（度），盘面绕世界 x 轴旋转（俯仰）。
         disk_roll_deg: 盘滚转角（度），盘面绕世界 y 轴旋转；相机位于 y 轴负方向时，
             正值使盘面在画面上左低右高。
-        doppler_lum: 多普勒亮度强度 p：亮度用 `Y(s·g^{p·k}·T)`；1 = 物理。s 为
+        doppler_lum: 多普勒亮度强度 p（≥ 0）：亮度用 `Y(s·g^{p·k}·T)`；1 = 物理，0 = 无多普勒明暗；
+            默认 0.5（预设 M 定稿 0.55，略减弱左右明暗不对称）。s 为
             `volume_params.lum_temp_scale`，k = `palette.doppler_lum_compensation(T_peak, s)`
             （s = 1 时 k = 1）。
         doppler_color: 多普勒颜色强度 s：色度用 `χ(T·g^s)`；1 = 物理。
@@ -75,7 +76,7 @@ class DiskV2Renderer:
         r_max: float = 10.0,
         disk_tilt_deg: float = 0.0,
         disk_roll_deg: float = 0.0,
-        doppler_lum: float = 0.55,
+        doppler_lum: float = 0.5,
         doppler_color: float = 1.5,
         sky_gain: float = 0.5,
         ss: int = 1,

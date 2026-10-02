@@ -81,8 +81,11 @@ def run_v2(w: int, h: int, ss: int, t: float = T_FRAME) -> tuple[np.ndarray, np.
         width=w, height=h,
         params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
         skybox=np.zeros((64, 128, 3), np.float32),
-        # 预设 M 视觉厚度、物理亮度温度，与参考实现对齐
-        volume_params=DiskV2VolumeParams(thickness_scale=1.0, lum_temp_scale=1.0),
+        # 预设 M 视觉厚度、物理亮度温度、外圈细节与多普勒亮度全取参考实现的值（历史对比工具）
+        volume_params=DiskV2VolumeParams(thickness_scale=1.0, lum_temp_scale=1.0, core_az_stretch=0.0,
+                                         core_oct_gain=1.0, band_seam_fix=False, core_contrast=1.0,
+                                         outer_detail_fade=1.0),
+        doppler_lum=0.55,
         r_max=90.0, sky_gain=0.0, ss=ss,
     )
     e = math.radians(CAM_ELEV_DEG)

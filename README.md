@@ -116,6 +116,9 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--v2_supersample` | 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿 | 单帧 2，视频 1 |
 | `--v2_thickness_scale` | 盘厚缩放：盘与烟雾层厚度同乘该值，柱密度不变；1 = 预设 M 视觉厚度（与参考实现对齐） | 1/9（H/r ≈ 0.003） |
 | `--v2_lum_temp_scale` | 亮度温度倍率 s：亮度按 Y(s·T)/Y(s·T_peak) 计算，色度不变；1 = 物理（与参考实现对齐），>1 时外盘更亮、纹理对比度略降（艺术夸张），多普勒明暗不对称自动补偿 | 1.25 |
+| `--v2_az_stretch` | 主云方位拉长系数 s（≥ 0）：絮状结构沿旋转方向的拉长程度。方位周期随半径增长，各半径长宽比一致：1 = 长宽比约 4–5（开普勒剪切下的物理形状）；>1 更拉长、流动感更强（长宽比约与 s 成正比）；0 = 方位周期固定（旧版，外圈被拉成长条、细节少） | 1.5 |
+| `--v2_core_contrast` | 主云明暗起伏系数 α（> 0）：缩放絮状结构的明暗对比，不改变形状。1 = 原始起伏（颗粒感强）；越小越柔和，过小时外圈结构被烟雾层条纹盖过 | 0.4 |
+| `--v2_doppler_lum` | 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗 | 0.5 |
 | `--v2_disk_roll` | 盘滚转角（度），绕世界 y 轴；相机在 -y 方向时正值使盘面在画面上左低右高 | 0 |
 | `--v2_reverse_rotation` | 反转吸积盘旋转方向（平流结构与多普勒频移整体反向） | 关闭 |
 | `--v2_orbit_seconds` | 视频模式：内缘开普勒轨道一圈对应的视频秒数 | 16.0 |
@@ -123,7 +126,10 @@ python render.py --video --orbit --resume -o output/demo.mp4
 
 V2 同时使用通用参数 `--pov`、`--fov`、`--ar1`、`--ar2`、`--disk_tilt`、`--r_max`（V2 下限 50）、
 `--texture`、`--video`、`--orbit`、`--orbit_degrees`、`--n_frames`、`--fps`。
-物理模型与视觉参数取预设 M（`src.v2.params.DiskV2VolumeParams` 默认值），暂不开放 CLI。
+其余物理模型与视觉参数取 `src.v2.params.DiskV2VolumeParams` 默认值（每个字段的含义、公式与取值范围见其
+docstring），不开放 CLI。其中外圈细节相关的 `core_oct_gain`（逐八度增益 0.69，Kolmogorov 谱）、
+`band_seam_fix`（刚体环带接缝修复，开）、`outer_detail_fade`（参考实现外圈降细节的保留比例，0）
+说明见 [`docs/plans/v2_edge_on_plan.md`](docs/plans/v2_edge_on_plan.md) §10。
 
 **V2 使用注意**：
 
@@ -132,7 +138,6 @@ V2 同时使用通用参数 `--pov`、`--fov`、`--ar1`、`--ar2`、`--disk_tilt
 - 曝光自动：盘区亮度 p99.9 映射到 0.9（只看盘，天空不参与）；视频首帧计算后锁定。
 - 天空：`--texture` 读等距柱状 PNG，不传则程序生成星空；双线性采样，星点参与 bloom。
 - 速度（M 系列 GPU 实测）：960×540、每像素 1 条光线单帧，级别 0 4.6 s，级别 1 4.0 s，级别 2 2.3 s，级别 3 1.7 s；1080p 视频每帧级别 2 约 11 s、级别 3 约 6 s。超采样倍率 N 耗时约为 N² 倍。以上为盘厚缩放 1 时的数据；默认盘厚 1/9 约慢 30%（720p 级别 3 约 4.8 s/帧）。
-- 与参考实现对比验收：`python scripts/compare_v2_proto.py`。
 
 ## 物理模型
 

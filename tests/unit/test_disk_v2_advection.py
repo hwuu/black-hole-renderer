@@ -143,7 +143,7 @@ class PatternShiftTest(unittest.TestCase):
                 oz = N.hashf(self.bi, cy, 1) * 97.0
                 c = N.cascade(0.2 * self.r + ox,
                               phi0 / (2.0 * math.pi) * 2.0,
-                              0.0 + oz, 2, 3.0, 5.0, 50.0)
+                              0.0 + oz, 2, 3.0, 5.0, 50.0, 1.0)
                 out[i] = w0 * wb_lo * c
                 _ = om
                 _ = t_life

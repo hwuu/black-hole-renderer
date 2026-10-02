@@ -42,6 +42,9 @@ from .noise_ti import (
 )
 from .params import DiskV2Params, DiskV2VolumeParams
 
+# core_az_stretch = 1 时方位周期等于基础周期 n 的参考半径（r_s）：r_b = 6·s 处 n_φ = n。
+# 取 6（≈ ISCO 外侧亮区）使内区特征与参考实现相同，外圈按 r_b/(6·s) 增加周期。
+_AZ_REF_R = 6.0
 
 
 @ti.func
@@ -273,6 +276,15 @@ class DiskV2Taichi:
         self._kt_i = float(vp.kt_i)
         self._nphi_t = int(vp.nphi_t)
         self._lt0_i = float(vp.lt0_i)
+        # 外圈细节（含义与公式见 DiskV2VolumeParams 同名字段）
+        self._az_ref_r = _AZ_REF_R * float(vp.core_az_stretch)  # 0 = 方位周期固定（参考实现）
+        self._oct_gain = float(vp.core_oct_gain)
+        self._seam_fix = bool(vp.band_seam_fix)
+        self._core_contrast = float(vp.core_contrast)
+        self._outer_fade = float(vp.outer_detail_fade)
+        # 保方差混合的单图案均值 m（主云 c / 厚度扰动 tn；_calibrate_volume 中标定，标定前取 1）
+        self._mc_single = 1.0
+        self._mt_single = 1.0
         # 尘埃
         self._dust_em = float(vp.dust_em)
         self._dust_s = float(vp.dust_s)
@@ -336,6 +348,7 @@ class DiskV2Taichi:
             ```
             smoke_norm = std(_eval_cloud(ln r, φ, ζ; 0, 0, 0))     （原始烟雾 fBm）
             low_norm   = std(fbm_3oct(i/16, j/512·NPHI_L, ((7i+13j) mod 17)/5))
+            m_c, m_t   = mean(单图案 c_k, tn_k)    （仅 band_seam_fix；保方差混合的均值项）
             ⟨c⟩        = mean(c(r, φ, z=0))
             κ          = TAU_I / mean(∫(ab_c + ab_o) dz)，r ∈ [5.5, 6.5]
             ```
@@ -349,6 +362,8 @@ class DiskV2Taichi:
 
         Simplifications:
             std 在 t = 2000、无刚体环相位下标定，视作全时段常数（fBm 统计平稳）。
+            单图案均值 m 用 4096 个随机 (r, φ, 种子偏移) 样本估计（r ∈ [r_in + 0.5, min(r_out, 20)]，
+            与 ⟨c⟩ 同区间），视作与半径无关的常数。
         """
         import taichi as ti
 
@@ -375,6 +390,26 @@ class DiskV2Taichi:
         _raw_noise(sbuf, lbuf)
         self._smoke_norm = max(float(sbuf.to_numpy().std()), 1e-6)
         self._low_norm = max(float(lbuf.to_numpy().std()), 1e-6)
+
+        # 保方差混合的单图案均值 m：必须先于 ⟨c⟩（⟨c⟩ 经 _flow_I 使用 m）
+        if self._seam_fix:
+            mbuf = ti.Vector.field(2, dtype=ti.f32, shape=4096)
+
+            @ti.kernel
+            def _single_mean(out: ti.template()):
+                for i in out:
+                    r = self._r_in + 0.5 + _hashf(i, 13, 7) * (ti.min(self._r_out, 20.0) - self._r_in - 0.5)
+                    phi = _hashf(i, 15, 11) * 2.0 * math.pi
+                    lev_cut, con = self._outer_cut(r)
+                    bi = ti.cast(ti.floor(self._band_coord(ti.log(r), phi)), ti.i32)
+                    n_i, n_t = self._band_nphi(bi)
+                    cc, tt = self._flow_noise_core(r, phi, 0.0, _hashf(i, 17, 3) * 97.0,
+                                                   _hashf(i, 19, 5) * 97.0, lev_cut, con, n_i, n_t)
+                    out[i] = ti.Vector([cc, tt])
+
+            _single_mean(mbuf)
+            m = mbuf.to_numpy().mean(0)
+            self._mc_single, self._mt_single = float(m[0]), float(m[1])
 
         # ⟨c⟩
         cbuf = ti.field(dtype=ti.f32, shape=4096)  # 与参考实现 calibrate_I 同样本数
@@ -435,13 +470,13 @@ class DiskV2Taichi:
         return v
 
     @ti.func
-    def _casc(self, x, y, z, per_y, l0, l1, con):
-        """乘性级联：级别 0 用 `cascade`，级别 ≥ 1 用逐位一致的 `cascade_fast`。"""
+    def _casc(self, x, y, z, per_y, l0, l1, con, gain):
+        """乘性级联：级别 0 用 `cascade`，级别 ≥ 1 用逐位一致的 `cascade_fast`（参数同 `cascade`）。"""
         v = 0.0
         if ti.static(self._opt >= 1):
-            v = cascade_fast(x, y, z, per_y, l0, l1, con)
+            v = cascade_fast(x, y, z, per_y, l0, l1, con, gain)
         else:
-            v = cascade(x, y, z, per_y, l0, l1, con)
+            v = cascade(x, y, z, per_y, l0, l1, con, gain)
         return v
 
     @ti.func
@@ -464,22 +499,27 @@ class DiskV2Taichi:
             t_delay: 光行时间延迟（r_s/c）。
 
         Returns:
-            `(w, ph, ox, oz)`：`w` 为 4 路（带 × 种子相位，下标 `2·db + p`）混合权重 `wb·wp`，
-            越界的带权重为 0；`ph` 为两条带的流坐标 φ；`ox`、`oz` 为 4 路种子偏移。
+            `(w, ph, ox, oz, nb)`：`w` 为 4 路（带 × 种子相位，下标 `2·db + p`）混合权重 `wb·wp`，
+            越界的带权重为 0；`ph` 为两条带的流坐标 φ；`ox`、`oz` 为 4 路种子偏移；
+            `nb` 为两条带的方位周期 `(n_i, n_t)`（下标 `2·db`、`2·db + 1`，见 `_band_nphi`）。
             与 `_flow_I` / `_turb_pair_smoke` 内部的同名量逐位一致。
         """
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        fb = self._band_coord(lnr, phi)
         b0 = ti.floor(fb)
         fbf = fb - b0
         w = ti.Vector([0.0, 0.0, 0.0, 0.0])
         ox = ti.Vector([0.0, 0.0, 0.0, 0.0])
         oz = ti.Vector([0.0, 0.0, 0.0, 0.0])
         ph = ti.Vector([0.0, 0.0])
+        nb = ti.Vector([0.0, 0.0, 0.0, 0.0])
         for db in ti.static(range(2)):
             bi = ti.cast(b0, ti.i32) + db
             wb = ti.cos(0.5 * math.pi * fbf) ** 2
             if db == 1:
                 wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            n_i, n_t = self._band_nphi(bi)
+            nb[2 * db] = n_i
+            nb[2 * db + 1] = n_t
             idx = bi - self._adv_core_f.b_lo
             if 0 <= idx < self._adv_core_f.rot.shape[0]:
                 ph[db] = phi - _delayed_rot(self._adv_core_f.rot[idx], self._adv_core_f.om_b[idx], t_delay) - self._adv_core_f.phi_b[idx]
@@ -489,29 +529,36 @@ class DiskV2Taichi:
                     w[2 * db + p] = wb * wp
                     ox[2 * db + p] = _hashf(bi, cyc, 2 * p) * 97.0
                     oz[2 * db + p] = _hashf(bi, cyc, 2 * p + 1) * 97.0
-        return w, ph, ox, oz
+        return w, ph, ox, oz, nb
 
     @ti.func
-    def _flow_shared(self, r, z, w, ph, ox, oz):
+    def _flow_shared(self, r, z, w, ph, ox, oz, nb):
         """`_flow_I` 的共享带信息版本（逐位一致；跳过权重为 0 的组合，加 0 不改变结果）。
 
         Args:
             r, z: 盘局部半径与高度（r_s）。
-            w, ph, ox, oz: `_band_info` 的返回值。
+            w, ph, ox, oz, nb: `_band_info` 的返回值。
 
         Returns:
-            `(c, tn)`：主云级联值与厚度扰动级联值（≥ 0）。
+            `(c, tn)`：主云级联值与厚度扰动级联值（≥ 0），混合方式同 `_flow_I`。
         """
-        r_rg = 2.0 * r
-        lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
-        con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
+        lev_cut, con = self._outer_cut(r)
         c = 0.0
         tn = 0.0
+        wsq = 0.0
         for k in ti.static(range(4)):
             if w[k] != 0.0:
-                cc, tt = self._flow_noise_core(r, ph[k // 2], z, ox[k], oz[k], lev_cut, con)
-                c += w[k] * cc
-                tn += w[k] * tt
+                cc, tt = self._flow_noise_core(r, ph[k // 2], z, ox[k], oz[k], lev_cut, con,
+                                               nb[2 * (k // 2)], nb[2 * (k // 2) + 1])
+                if ti.static(self._seam_fix):
+                    c += w[k] * (cc - self._mc_single)
+                    tn += w[k] * (tt - self._mt_single)
+                    wsq += w[k] * w[k]
+                else:
+                    c += w[k] * cc
+                    tn += w[k] * tt
+        if ti.static(self._seam_fix):
+            c, tn = self._blend_finish(c, tn, wsq)
         return c, tn
 
     @ti.func
@@ -570,13 +617,146 @@ class DiskV2Taichi:
     # ---- 主云流动噪声 ----
 
     @ti.func
-    def _flow_noise_core(self, ru, th, z, ox, oz, lev_cut, con):
-        """主云 + 厚度扰动两路级联。"""
-        c = self._casc(self._kr_i * ru + ox, th / (2.0 * math.pi) * self._nphi_i,
-                    self._kr_i * z + oz, self._nphi_i,
-                    self._l0_i - lev_cut, self._l0_i + 2.0 - lev_cut, con)
-        tn = self._casc(self._kt_i * ru + ox + 17.0, th / (2.0 * math.pi) * self._nphi_t,
-                     oz + 5.0, self._nphi_t, self._lt0_i, self._lt0_i + 2.0, self._con_i)
+    def _band_coord(self, lnr, phi):
+        """刚体环带坐标 fb（整数 = 带中心，相邻整数之间按 cos² / sin² 混合两带）。
+
+        Args:
+            lnr: `ln r`（r 单位 r_s）。
+            phi: 盘局部方位角（rad）；仅 `band_seam_fix` 时参与。
+
+        Returns:
+            标量带坐标，`floor(fb)` 为下侧带号。
+
+        Formula:
+            ```
+            fb = (ln r − ln r0) / dln_r + 0.35·gn(4·ln r, y, 11.3; 周期 8)
+            y  = 0.37（参考实现，边界为正圆）  或  8·φ/(2π)（接缝修复，边界随方位起伏，每圈 8 个周期）
+            ```
+
+        Physical Meaning:
+            刚体环带是流场的分段近似；带边界只是数值构造，不应在图像上留下同心圆。
+            边界随 φ 起伏后，任一圆周上的点分属不同的带相位，接缝被打散。
+        """
+        fb = 0.0
+        if ti.static(self._seam_fix):
+            fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, phi / (2.0 * math.pi) * 8.0, 11.3, 8)
+        else:
+            fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        return fb
+
+    @ti.func
+    def _blend_finish(self, c, tn, wsq):
+        """保方差混合的收尾：由去均值加权和恢复主云 c 与厚度扰动 tn。
+
+        Args:
+            c, tn: 去均值加权和 `Σw_k(c_k − m_c)`、`Σw_k(tn_k − m_t)`。
+            wsq: 权重平方和 `Σw_k²`（≥ 0）。
+
+        Returns:
+            `(c, tn)`：标量，≥ 0；`wsq ≈ 0`（所有带越界）时为 `(0, 0)`。
+
+        Formula:
+            ```
+            c  = max(m_c + α·Σw_k(c_k − m_c) / √Σw_k², 0)
+            tn = max(m_t +   Σw_k(tn_k − m_t) / √Σw_k², 0)
+            ```
+            α = `core_contrast`；m_c、m_t 为 `_calibrate_volume` 标定的单图案均值。
+
+        Physical Meaning:
+            k 个独立图案的线性混合 Σw_k·c_k 方差为 Σw_k²·Var（Σw_k = 1 时 ≤ Var），
+            除以 √Σw_k² 使混合后的起伏方差在带内、带间处处相等（无接缝），均值保持 m。
+
+        Simplifications:
+            各图案视作独立同分布；截断到 0 只影响 α·起伏 < −m 的少数深暗缝。
+        """
+        oc = 0.0
+        ot = 0.0
+        if wsq > 1e-12:
+            inv = 1.0 / ti.sqrt(wsq)
+            oc = ti.max(self._mc_single + self._core_contrast * c * inv, 0.0)
+            ot = ti.max(self._mt_single + tn * inv, 0.0)
+        return oc, ot
+
+    @ti.func
+    def _band_nphi(self, bi):
+        """核心刚体环带 bi 的方位基频周期 `(n_i, n_t)`（主云 / 厚度扰动，浮点存整数）。
+
+        Args:
+            bi: 带号（i32）；带中心半径 `r_b = exp(ln r0 + bi·dln_r)`。
+
+        Returns:
+            `(n_i, n_t)`：标量，正整数值的 f32；`core_az_stretch = 0` 时恒为 `(nphi_i, nphi_t)`。
+
+        Formula:
+            ```
+            n_φ(b) = max(n, round(n · r_b / (6·s)))，s = core_az_stretch，n = nphi_i 或 nphi_t
+            ```
+            方位特征尺寸 ≈ 2π·r_b / (n_φ·3^l) ≈ 2π·6·s / (n·3^l)，与半径无关；径向尺寸 ∝ 1/kr_i 也与
+            半径无关，故长宽比恒定，且约与 s 成正比。
+
+        Physical Meaning:
+            开普勒剪切 q = −dlnΩ/dlnr = 3/2 与半径无关，湍流团块被剪切拉长的比例也与半径无关。
+
+        Simplifications:
+            周期按带取整（φ 无缝要求整数周期），相邻带周期可能差 1，由带间混合平滑。
+        """
+        n_i = float(self._nphi_i)
+        n_t = float(self._nphi_t)
+        if ti.static(self._az_ref_r > 0.0):
+            q = ti.exp(self._lnr0_r + ti.cast(bi, ti.f32) * self._dln_r) / self._az_ref_r
+            n_i = ti.max(n_i, ti.round(n_i * q))
+            n_t = ti.max(n_t, ti.round(n_t * q))
+        return n_i, n_t
+
+    @ti.func
+    def _outer_cut(self, r):
+        """主云级联的外圈细节衰减：截掉的起始八度数与级联对比度。
+
+        Args:
+            r: 盘局部半径（r_s）。
+
+        Returns:
+            `(lev_cut, con)`：标量；`lev_cut ≥ 0`（八度数），`con ≤ con_i`；r ≤ 5 时为 `(0, con_i)`。
+
+        Formula:
+            ```
+            lev_cut = f · 0.91 · ln(1 + 0.066·max(0, 2r − 10))
+            con     = con_i − f · 80 · ln(1 + 0.006·max(0, 2r − 10))
+            ```
+            f = `outer_detail_fade`；f = 1 与参考实现逐位一致（乘 1.0 精确）。
+
+        Physical Meaning:
+            参考实现为外圈降细节的视觉经验式；f = 0 关闭（外圈保留全部八度与对比度）。
+        """
+        x = ti.max(0.0, 2.0 * r - 10.0)
+        lev_cut = self._outer_fade * 0.91 * ti.log(1.0 + 0.066 * x)
+        con = self._con_i - self._outer_fade * 80.0 * ti.log(1.0 + 0.006 * x)
+        return lev_cut, con
+
+    @ti.func
+    def _flow_noise_core(self, ru, th, z, ox, oz, lev_cut, con, n_i, n_t):
+        """主云 + 厚度扰动两路级联（单个带 × 种子相位的图案）。
+
+        Args:
+            ru, z: 半径与高度（r_s）。
+            th: 带内流坐标 φ（rad）。
+            ox, oz: 种子偏移。
+            lev_cut, con: `_outer_cut` 的返回值。
+            n_i, n_t: 该带的方位周期（`_band_nphi`）。
+
+        Returns:
+            `(c_k, tn_k)`：标量，≥ 0。
+        """
+        if ti.static(self._az_ref_r == 0.0):
+            # 周期固定时用编译期常数（与参考实现逐位一致；运行期变量会改变编译器的常数折叠）
+            n_i = float(self._nphi_i)
+            n_t = float(self._nphi_t)
+        c = self._casc(self._kr_i * ru + ox, th / (2.0 * math.pi) * n_i,
+                    self._kr_i * z + oz, ti.cast(n_i, ti.i32),
+                    self._l0_i - lev_cut, self._l0_i + 2.0 - lev_cut, con, self._oct_gain)
+        tn = self._casc(self._kt_i * ru + ox + 17.0, th / (2.0 * math.pi) * n_t,
+                     oz + 5.0, ti.cast(n_t, ti.i32), self._lt0_i, self._lt0_i + 2.0, self._con_i,
+                     self._oct_gain)
         return c, tn
 
     @ti.func
@@ -590,16 +770,21 @@ class DiskV2Taichi:
 
         Returns:
             `(c, tn)`：主云级联值（≥ 0）与厚度扰动级联值（≥ 0）。
+
+        Formula:
+            ```
+            参考实现：      c = Σ_k w_k·c_k                       （w_k = wb·wp，Σw_k = 1）
+            band_seam_fix： c = m + α·Σ_k w_k(c_k − m) / √Σw_k²  （见 `_blend_finish`）
+            ```
         """
-        r_rg = 2.0 * r
-        lev_cut = 0.91 * ti.log(1.0 + 0.066 * ti.max(0.0, r_rg - 10.0))
-        con = self._con_i - 80.0 * ti.log(1.0 + 0.006 * ti.max(0.0, r_rg - 10.0))
+        lev_cut, con = self._outer_cut(r)
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        fb = self._band_coord(lnr, phi)
         b0 = ti.floor(fb)
         fbf = fb - b0
         c = 0.0
         tn = 0.0
+        wsq = 0.0
         for db in ti.static(range(2)):
             bi = ti.cast(b0, ti.i32) + db
             wb = ti.cos(0.5 * math.pi * fbf) ** 2
@@ -614,9 +799,17 @@ class DiskV2Taichi:
                     wp = ti.sin(math.pi * fr) ** 2
                     ox = _hashf(bi, cyc, 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
-                    cc, tt = self._flow_noise_core(r, phi_rigid, z, ox, oz, lev_cut, con)
-                    c += wb * wp * cc
-                    tn += wb * wp * tt
+                    n_i, n_t = self._band_nphi(bi)
+                    cc, tt = self._flow_noise_core(r, phi_rigid, z, ox, oz, lev_cut, con, n_i, n_t)
+                    if ti.static(self._seam_fix):
+                        c += wb * wp * (cc - self._mc_single)
+                        tn += wb * wp * (tt - self._mt_single)
+                        wsq += (wb * wp) * (wb * wp)
+                    else:
+                        c += wb * wp * cc
+                        tn += wb * wp * tt
+        if ti.static(self._seam_fix):
+            c, tn = self._blend_finish(c, tn, wsq)
         return c, tn
 
     # ---- 尘埃 ----
@@ -633,7 +826,7 @@ class DiskV2Taichi:
             标量级联值（≥ 0），尘埃密度的结构因子。
         """
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        fb = self._band_coord(lnr, phi)
         b0 = ti.floor(fb)
         fbf = fb - b0
         out = 0.0
@@ -651,7 +844,7 @@ class DiskV2Taichi:
                     ox = _hashf(bi, cyc, 40 + 2 * p) * 97.0
                     oz = _hashf(bi, cyc, 41 + 2 * p) * 97.0
                     out += wb * wp * self._casc(
-                        2.0 * r + ox, phi_rigid / (2.0 * math.pi) * 9.0, 2.0 * z + oz, 9, 0.0, 6.0, 80.0)
+                        2.0 * r + ox, phi_rigid / (2.0 * math.pi) * 9.0, 2.0 * z + oz, 9, 0.0, 6.0, 80.0, 1.0)
         return out
 
     # ---- 低频调制 ----
@@ -722,7 +915,7 @@ class DiskV2Taichi:
             标量，零均值、约单位方差（除以 `smoke_norm`）。
         """
         lnr = ti.log(r)
-        fb = (lnr - self._lnr0_r) / self._dln_r + 0.35 * self._gn(lnr * 4.0, 0.37, 11.3, 8)
+        fb = self._band_coord(lnr, phi)
         b0 = ti.floor(fb)
         fbf = fb - b0
         acc = 0.0
@@ -793,9 +986,10 @@ class DiskV2Taichi:
             bph = ti.Vector([0.0, 0.0])
             box = ti.Vector([0.0, 0.0, 0.0, 0.0])
             boz = ti.Vector([0.0, 0.0, 0.0, 0.0])
+            bnb = ti.Vector([0.0, 0.0, 0.0, 0.0])
             if ti.static(self._opt >= 1):
                 if az < ti.max(zc, self._cl_extent * r):
-                    bw, bph, box, boz = self._band_info(lnr, phi, t)
+                    bw, bph, box, boz, bnb = self._band_info(lnr, phi, t)
             # 烟雾层
             if ti.static(self._smoke_on):
                 if az < self._cl_extent * r:
@@ -824,7 +1018,7 @@ class DiskV2Taichi:
                     c = 0.0
                     tn = 0.0
                     if ti.static(self._opt >= 1):
-                        c, tn = self._flow_shared(r, z, bw, bph, box, boz)
+                        c, tn = self._flow_shared(r, z, bw, bph, box, boz, bnb)
                     else:
                         c, tn = self._flow_I(r, phi, z, t)
                     softsat = 1.0 - 1.0 / (ti.max(tn, 0.0) + 1.0)

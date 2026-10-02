@@ -96,6 +96,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2_lum_temp_scale", type=float, default=None,
                         help="V2 亮度温度倍率 s：亮度按 Y(s·T)/Y(s·T_peak) 计算，色度不变；1 = 物理"
                              "（与参考实现对齐），默认 1.25（外盘更亮，贴盘面视角外盘不全黑）")
+    parser.add_argument("--v2_az_stretch", type=float, default=None,
+                        help="V2 主云方位拉长系数 s（≥ 0）：吸积盘絮状结构沿旋转方向的拉长程度。"
+                             "s > 0 时方位周期随半径增长，使各半径的结构长宽比保持一致：1 = 长宽比约 4–5"
+                             "（各半径一致，开普勒剪切下的物理形状）；>1 = 更拉长、流动感更强"
+                             "（长宽比约与 s 成正比，1.5 时约 6–9）；0 = 方位周期固定（旧版，外圈结构被拉成长条、细节少）。"
+                             "默认 1.5")
+    parser.add_argument("--v2_core_contrast", type=float, default=None,
+                        help="V2 主云明暗起伏系数 α（> 0）：缩放絮状结构的明暗对比，不改变结构形状。"
+                             "1 = 原始起伏（颗粒感强）；越小越柔和，过小时外圈结构会被烟雾层的条纹盖过。"
+                             "默认 0.4")
+    parser.add_argument("--v2_doppler_lum", type=float, default=None,
+                        help="V2 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算"
+                             "（g 为频移因子）。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗；"
+                             "默认 0.5（预设 M 定稿为 0.55，本版略减弱）")
     parser.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
@@ -129,12 +143,14 @@ def v2_volume_overrides(args) -> dict:
     """收集 CLI 显式传入的 V2 体积参数覆盖项（未传入的保持 `DiskV2VolumeParams` 默认值）。
 
     Args:
-        args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`，None = 未传入）。
+        args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_az_stretch`、
+            `--v2_core_contrast`，None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
     """
-    fields = {"thickness_scale": args.v2_thickness_scale, "lum_temp_scale": args.v2_lum_temp_scale}
+    fields = {"thickness_scale": args.v2_thickness_scale, "lum_temp_scale": args.v2_lum_temp_scale,
+              "core_az_stretch": args.v2_az_stretch, "core_contrast": args.v2_core_contrast}
     return {k: v for k, v in fields.items() if v is not None}
 
 
@@ -205,7 +221,8 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--device`）。
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--device`；`--v2_doppler_lum`
+                未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
                 （单帧 2、视频 1）未显式传入时的默认值。
@@ -234,6 +251,7 @@ def main():
             disk_roll_deg=args.v2_disk_roll,
             sky_gain=args.v2_sky_gain,
             ss=ss,
+            **({} if args.v2_doppler_lum is None else {"doppler_lum": args.v2_doppler_lum}),
             opt_level=opt,
             device=args.device,
         )

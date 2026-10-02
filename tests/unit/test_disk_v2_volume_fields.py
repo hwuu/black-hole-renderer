@@ -113,6 +113,11 @@ class VolumeParamsTest(unittest.TestCase):
         self.assertAlmostEqual(vp.hr_ref, 0.027)
         self.assertAlmostEqual(vp.thickness_scale, 1.0 / 9.0)
         self.assertAlmostEqual(vp.lum_temp_scale, 1.25)
+        self.assertAlmostEqual(vp.core_az_stretch, 1.5)
+        self.assertAlmostEqual(vp.core_oct_gain, 0.69)
+        self.assertTrue(vp.band_seam_fix)
+        self.assertAlmostEqual(vp.core_contrast, 0.4)
+        self.assertAlmostEqual(vp.outer_detail_fade, 0.0)
         self.assertTrue(vp.dust_kepler)
         self.assertTrue(vp.static_cam)
         self.assertTrue(vp.light_delay)
@@ -127,6 +132,17 @@ class VolumeParamsTest(unittest.TestCase):
             DiskV2VolumeParams(dln_r=-1.0)
         with self.assertRaises(ValueError):
             DiskV2VolumeParams(lum_temp_scale=0.0)
+
+    def test_outer_detail_validation(self):
+        """外圈细节参数：取值范围，以及 core_contrast ≠ 1 必须配合接缝修复。"""
+        from src.v2.params import DiskV2VolumeParams
+        for kw in (dict(core_az_stretch=-1.0), dict(core_oct_gain=0.0), dict(core_contrast=0.0),
+                   dict(outer_detail_fade=1.5), dict(band_seam_fix=False, core_contrast=0.4)):
+            with self.assertRaises(ValueError, msg=str(kw)):
+                DiskV2VolumeParams(**kw)
+        # 参考实现取值组合合法
+        DiskV2VolumeParams(core_az_stretch=0.0, core_oct_gain=1.0, band_seam_fix=False,
+                           core_contrast=1.0, outer_detail_fade=1.0)
 
 
 class DiskGeometryParamsTest(unittest.TestCase):

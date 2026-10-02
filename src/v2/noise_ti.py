@@ -223,8 +223,8 @@ def softplus(x):
 
 
 @ti.func
-def cascade(x, y, z, per_y, l0, l1, con):
-    """乘性级联噪声（倍率 3、八度等权、小数八度）+ softplus 软阈值。
+def cascade(x, y, z, per_y, l0, l1, con, gain):
+    """乘性级联噪声（倍率 3、逐八度增益、小数八度）+ softplus 软阈值。
 
     Args:
         x, y, z: 连续坐标；y 以 `per_y·3^l` 为周期（每八度自动翻三倍）。
@@ -232,16 +232,18 @@ def cascade(x, y, z, per_y, l0, l1, con):
         l0, l1: 八度区间 `[l0, l1)`，可为小数（权重按覆盖长度线性取值，
             整数边界处连续）。
         con: 软阈值对比度（越大暗缝越深、亮丝越锐）。
+        gain: 逐八度增益 γ（> 0）：相对首个迭代八度 ⌊l0⌋，第 l 个八度的扰动幅度乘 γ^(l − ⌊l0⌋)。
+            1 = 八度等权（参考实现）；3^(-1/3) ≈ 0.69 对应 Kolmogorov 谱 k^(-5/3)。
 
     Returns:
         标量，≥ 0。大部分区域接近 0（暗缝），少数区域近似线性（亮丝）。
 
     Formula:
         ```
-        S   = Σ_l w_l · ln(1 + 0.1·n_l)，w_l = clamp(min(l1, l+1) − max(l0, l), 0, 1)
-        out = softplus(con · S) = ln(1 + (Π_l (1 + 0.1·w_l·n_l))^con)
+        S   = Σ_l ln(1 + 0.1·w_l·γ^(l−⌊l0⌋)·n_l)，w_l = clamp(min(l1, l+1) − max(l0, l), 0, 1)
+        out = softplus(con · S) = ln(1 + (Π_l (1 + 0.1·w_l·γ^(l−⌊l0⌋)·n_l))^con)
         ```
-        `n_l = vnoise(3^l·p, per_y·3^l)`；倍率 3 + 等权 → 大小尺度对比相当。
+        `n_l = vnoise(3^l·p, per_y·3^l)`；倍率 3 + γ = 1 → 大小尺度对比相当，γ < 1 → 高频变弱。
 
     Physical Meaning:
         湍流密度场的"暗背景 + 锐亮丝"一维化近似：乘性级联使任一八度的
@@ -249,9 +251,10 @@ def cascade(x, y, z, per_y, l0, l1, con):
 
     Simplifications:
         - 内部最多迭代 5 个整数八度（`l1 − l0 ≤ 5` 约定由调用方保证）。
-        - 八度增益固定 1（等权），不做增益参数化。
+        - 增益为几何级数，不随位置变化；γ = 1 时与旧版逐位一致（乘 1.0 精确）。
     """
     s = 0.0
+    gl = 1.0  # 当前八度的累计增益 γ^k
     i0 = ti.cast(ti.floor(l0), ti.i32)
     for k in range(5):
         lv = i0 + k
@@ -264,7 +267,8 @@ def cascade(x, y, z, per_y, l0, l1, con):
                 f *= 3.0
                 per *= 3
             n = vnoise(x * f, y * f, z * f, per)
-            s += ti.log(1.0 + 0.1 * n * w)
+            s += ti.log(1.0 + 0.1 * n * w * gl)
+        gl *= gain
     return softplus(con * s)
 
 
@@ -435,9 +439,10 @@ def vnoise_fast(x, y, z, period):
 
 
 @ti.func
-def cascade_fast(x, y, z, per_y, l0, l1, con):
+def cascade_fast(x, y, z, per_y, l0, l1, con, gain):
     """`cascade` 的快速实现（内部改用 `vnoise_fast`），输出逐位一致。参数与返回值同 `cascade`。"""
     s = 0.0
+    gl = 1.0
     i0 = ti.cast(ti.floor(l0), ti.i32)
     for k in range(5):
         lv = i0 + k
@@ -450,7 +455,8 @@ def cascade_fast(x, y, z, per_y, l0, l1, con):
                 f *= 3.0
                 per *= 3
             n = vnoise_fast(x * f, y * f, z * f, per)
-            s += ti.log(1.0 + 0.1 * n * w)
+            s += ti.log(1.0 + 0.1 * n * w * gl)
+        gl *= gain
     return softplus(con * s)
 
 

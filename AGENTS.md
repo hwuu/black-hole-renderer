@@ -91,7 +91,7 @@
 - `src/cli.py`
   - 参数解析与模式分发（V1 / V2、单帧 / 视频）
 - `scripts/`
-  - `proto_disk_reference.py` V2 验收基准（参考实现）；`compare_v2_proto.py` V2 对比工具
+  - `proto_disk_reference.py` V2 参考实现（历史基准）；`compare_v2_proto.py` V2 对比工具（2026-10-02 起不再作为验收项）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
 
 ### 视频旋转算法速记
@@ -189,8 +189,6 @@ python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
 # V2 单测全部
 python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
 
-# V2 vs Proto 同参数对比（1080p 上下拼图 + 数值指标；改 V2 体积路径后必跑）
-python scripts/compare_v2_proto.py
 ```
 
 
@@ -225,10 +223,17 @@ python scripts/compare_v2_proto.py
     - 现象：多轮"看图 → 猜原因 → 补一处"仍差距大：烟雾看不见、光子环下半部消失、锯齿
     - 根因：未逐行对照移植，累积 13 处偏差（噪声未归一化、视界清零发射、合成重复乘透射率、
       `CORE_OPAC` 漏乘发射、混入 `opacity_scale`、低频带中心约定不同、光行时间无效等）
-    - 规则：改 V2 体积路径后**必须**跑 `python scripts/compare_v2_proto.py`，看数值指标再看图；
+    - 规则（已废止，2026-10-02）：当前 V2 视觉已优于 Proto，**不再**与 Proto 对比；新功能改为保证
+      "参数取旧值时与改动前逐位一致"（用 `git archive HEAD src` 导出旧版对比渲染）；
       详见 `docs/plans/v2_volumetric_video_plan.md` §10
     - 保护测试：`tests/unit/test_disk_v2_proto_parity.py`
 
 32. **Taichi `@ti.func` 内不能把 dataclass 绑定到局部变量**
     - 现象：`f = self._adv_core_f` 抛 `Invalid constant scalar data type: RigidRingFields`
     - 修复：直接写全路径 `self._adv_core_f.rot[idx]`（与 #24 同源）
+
+33. **V2 单测慢的主要原因是 Taichi 编译**（2026-10-02 实测）
+    - 现象：`test_disk_v2_proto_parity.py` 单文件约 12.5 分钟，其余 V2 单测合计仅数秒
+    - 根因：每构造一个 `DiskV2Renderer`，体积 kernel 首帧编译约 60–70 s；该文件内构造了 6 个
+    - 做法：迭代期只跑改动相关的轻量单测（`test_disk_v2_volume_fields` / `noise_ti` / `advection` / `v2_cli` 等）；
+      提交前再跑一次全量；小样渲染用 360p（`640×360`）

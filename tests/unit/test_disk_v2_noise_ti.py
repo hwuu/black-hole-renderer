@@ -98,8 +98,9 @@ def _vnoise(x, y, z, period):
     return (a0 + ux * (a1 - a0)) * (1 - uz) + (a2 + ux * (a3 - a2)) * uz
 
 
-def _cascade(x, y, z, per_y, l0, l1, con):
-    s = 0.0
+def _cascade(x, y, z, per_y, l0, l1, con, gain=1.0):
+    """`noise_ti.cascade` 的 NumPy 镜像（逐八度增益 gain^(l − ⌊l0⌋)）。"""
+    s, gl = 0.0, 1.0
     i0 = int(np.floor(l0))
     for k in range(5):
         lv = i0 + k
@@ -110,7 +111,8 @@ def _cascade(x, y, z, per_y, l0, l1, con):
             for _ in range(lv):
                 f *= 3.0
                 per *= 3
-            s += np.log(1.0 + 0.1 * _vnoise(x * f, y * f, z * f, per) * w)
+            s += np.log(1.0 + 0.1 * _vnoise(x * f, y * f, z * f, per) * w * gl)
+        gl *= gain
     sp = con * s
     return sp if sp >= 20.0 else np.log(1.0 + np.exp(sp))
 
@@ -195,10 +197,19 @@ class NoiseParityTest(unittest.TestCase):
         l1s = l0s + 2.0
         per = 10
         args = list(self.pts.T) + [np.full(self.n, per), l0s, l1s, np.full(self.n, 50.0)]
-        out = _KernelHarness.run(N.cascade, args)
-        exp = np.array([_cascade(p[0], p[1], p[2], per, l0s[i], l1s[i], 50.0)
-                        for i, p in enumerate(self.pts)])
-        np.testing.assert_allclose(out, exp, rtol=1e-4, atol=1e-5)
+        for gain in (1.0, 0.69):
+            out = _KernelHarness.run(N.cascade, args, extra=(gain,))
+            exp = np.array([_cascade(p[0], p[1], p[2], per, l0s[i], l1s[i], 50.0, gain)
+                            for i, p in enumerate(self.pts)])
+            np.testing.assert_allclose(out, exp, rtol=1e-4, atol=1e-5)
+
+    def test_cascade_fast_matches_cascade_with_gain(self):
+        """`cascade_fast` 与 `cascade` 在 gain ≠ 1 时同样逐位一致。"""
+        args = list(self.pts.T) + [np.full(self.n, 10), np.full(self.n, 3.0), np.full(self.n, 5.0),
+                                   np.full(self.n, 50.0)]
+        a = _KernelHarness.run(N.cascade, args, extra=(0.69,))
+        b = _KernelHarness.run(N.cascade_fast, args, extra=(0.69,))
+        np.testing.assert_array_equal(a, b)
 
     def test_fbm_parity(self):
         # octaves 是 ti.template()（编译期常量），不能用 harness 闭包传，
@@ -261,6 +272,7 @@ class PropertyTest(unittest.TestCase):
             N.cascade,
             list(self.pts.T) + [np.full(self.n, per), np.full(self.n, 2.0),
                                 np.full(self.n, 4.0), np.full(self.n, 50.0)],
+            extra=(1.0,),
         )
         self.assertTrue(np.all(out >= 0.0))
         # 实测分布（con=50, [2,4) 八度）：min≈0、p30≈0.2、p50≈0.7、max≈6.6；
@@ -278,6 +290,7 @@ class PropertyTest(unittest.TestCase):
                 N.cascade,
                 list(self.pts.T) + [np.full(self.n, per), np.full(self.n, l0),
                                     np.full(self.n, l0 + 2.0), np.full(self.n, 50.0)],
+                extra=(1.0,),
             )
 
         a = run(2.0 - eps)

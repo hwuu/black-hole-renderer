@@ -99,6 +99,30 @@ class DiskV2VolumeParams:
         fr_l / nphi_l / dln_l / k_rigid_l: 低频层宽带刚体环参数。
         kr_i / nphi_i / l0_i / con_i: 主云乘性级联噪声参数（径向基频 / 方位周期 / 起始八度 / 对比度）。
         kt_i / nphi_t / lt0_i: 厚度扰动噪声参数。
+        core_az_stretch: 主云方位拉长系数 s（≥ 0，无量纲）。s > 0 时刚体环带 b（中心半径 r_b）的方位
+            基频周期为 `n_φ(b) = max(n, round(n·r_b / (6·s)))`（n = `nphi_i` 或 `nphi_t`），使方位
+            特征尺寸 `2π·r_b / (n_φ·3^l)` 不再随半径线性增长，与固定的径向尺寸 `1/kr_i` 保持恒定比例。
+            s = 1：各半径长宽比约 4–5（剪切 q = 3/2 与半径无关，物理上长宽比恒定）；s > 1：特征整体
+            沿方位拉长（长宽比约与 s 成正比，外圈流动感更强）。默认 1.5（艺术取值）。
+            0 = 方位周期固定为 n（参考实现；外圈特征被拉长到长宽比 ~40、每圈特征数不随半径增加）。
+        core_oct_gain: 主云 / 厚度扰动级联的逐八度增益 γ（> 0）：第 k 个八度的扰动幅度乘 γ^k。
+            γ = 0.69 ≈ 3^(-1/3) 对应 Kolmogorov 谱 E(k) ∝ k^(-5/3)（级联倍率 3），高频细节变弱；
+            默认 0.69。1 = 八度等权（参考实现）。
+        band_seam_fix: 刚体环带接缝修复（默认 True），两部分：
+            (1) 带边界扰动随方位变化（参考实现的扰动只随 ln r 变化，边界是正圆，正视时可见同心环）；
+            (2) 带间混合改为保方差：`c = m + Σw_k(c_k − m) / √Σw_k²`（m 为单图案均值，构造时标定），
+            参考实现的 `Σw_k·c_k`（Σw_k = 1）在两带正中把起伏方差降到 50%（标准差 71%），形成带状明暗接缝。
+            False = 参考实现。(1) 作用于共用带坐标的主云、厚度扰动、烟雾与尘埃；(2) 作用于主云与
+            厚度扰动（烟雾本来就按 √Σw_k² 归一，尘埃很弱且只在内区，保持线性混合）。
+        core_contrast: 主云起伏系数 α（> 0）：保方差混合中 `c = m + α·Σw_k(c_k − m)/√Σw_k²`，
+            统一缩放主云密度的明暗起伏，不改变特征形状与分布；只作用于主云 c，不作用于厚度扰动 tn。
+            默认 0.4（降低高频颗粒感；外圈 r ≳ 20 处主云起伏不再占主导，结构以烟雾层的方位条纹为主）。
+            1 = 不缩放。≠ 1 时要求 `band_seam_fix = True`（参考实现的混合没有 m 项，无从缩放）。
+        outer_detail_fade: 参考实现外圈细节衰减的保留比例 f ∈ [0, 1]：
+            `lev_cut = f·0.91·ln(1 + 0.066·max(0, 2r − 10))`（截掉的起始八度数），
+            `con = con_i − f·80·ln(1 + 0.006·max(0, 2r − 10))`（级联对比度）。
+            1 = 参考实现（外圈截高频、降对比度，r = 25 处截掉约 1.2 个八度、对比度从 50 降到 33）；默认 0：
+            外圈与内圈同等细节（外盘温度起伏在 Wien 段亮度更敏感，衰减无物理依据）。
         dust_em / dust_s / dust_kepler / dust_on: 内区尘埃参数。
         dln_r / k_rigid: 刚体环带宽与种子寿命（核心 + 烟雾 + 尘埃共用）。
         light_delay: 1 = 采样时间 = t - 光程（光行时间）。
@@ -149,6 +173,11 @@ class DiskV2VolumeParams:
     kt_i: float = 2.0
     nphi_t: int = 9
     lt0_i: float = 0.7
+    core_az_stretch: float = 1.5
+    core_oct_gain: float = 0.69
+    band_seam_fix: bool = True
+    core_contrast: float = 0.4
+    outer_detail_fade: float = 0.0
     dust_em: float = 0.02
     dust_s: float = 1.0
     dust_kepler: bool = True
@@ -171,6 +200,16 @@ class DiskV2VolumeParams:
             raise ValueError("thickness_scale must be positive")
         if self.lum_temp_scale <= 0.0:
             raise ValueError("lum_temp_scale must be positive")
+        if self.core_az_stretch < 0.0:
+            raise ValueError("core_az_stretch must be >= 0 (0 = fixed azimuthal period)")
+        if self.core_oct_gain <= 0.0:
+            raise ValueError("core_oct_gain must be positive")
+        if self.core_contrast <= 0.0:
+            raise ValueError("core_contrast must be positive")
+        if self.core_contrast != 1.0 and not self.band_seam_fix:
+            raise ValueError("core_contrast != 1 requires band_seam_fix = True")
+        if not 0.0 <= self.outer_detail_fade <= 1.0:
+            raise ValueError("outer_detail_fade must be in [0, 1]")
         if self.tau_i <= 0.0:
             raise ValueError("tau_i must be positive")
         if self.smoke_i < 0.0:

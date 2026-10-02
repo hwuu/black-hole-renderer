@@ -19,6 +19,7 @@ import taichi as ti
 ti.init(arch=ti.gpu, default_fp=ti.f32)  # 无 GPU 时 Taichi 自动回退 CPU
 
 from src.v2.advection import RigidRingBands  # noqa: E402
+from src.v2.noise_ti import hashf  # noqa: E402
 from src.v2.params import DiskV2Params, DiskV2VolumeParams  # noqa: E402
 from src.v2.taichi_impl import _delayed_rot, _delayed_seed  # noqa: E402
 from src.v2.taichi_render import DiskV2Renderer  # noqa: E402
@@ -26,6 +27,9 @@ from src.v2.taichi_render import DiskV2Renderer  # noqa: E402
 R_IN, R_OUT = 3.0, 30.0
 CAM_ELEV = math.radians(7.0)
 CAM = [0.0, -40.0 * math.cos(CAM_ELEV), 40.0 * math.sin(CAM_ELEV)]
+# 外圈细节参数的参考实现取值（隔离其他功能的测试用；含义见 DiskV2VolumeParams）
+REF_DETAIL = dict(core_az_stretch=0.0, core_oct_gain=1.0, band_seam_fix=False,
+                  core_contrast=1.0, outer_detail_fade=1.0)
 
 
 def _make_renderer(width=24, height=14, ss=2):
@@ -258,7 +262,7 @@ class TestLumTempScale(unittest.TestCase):
         s = DiskV2VolumeParams().lum_temp_scale
         self.assertAlmostEqual(s, 1.25)
         self.assertAlmostEqual(d._ln_y_peak, math.log(_blackbody_luminance_exact(s * d._t_peak_vol)), places=9)
-        self.assertAlmostEqual(r._doppler_lum_eff, 0.55 * doppler_lum_compensation(d._t_peak_vol, s), places=9)
+        self.assertAlmostEqual(r._doppler_lum_eff, 0.5 * doppler_lum_compensation(d._t_peak_vol, s), places=9)
 
     def test_outer_disk_brighter_with_same_asymmetry(self):
         w = np.array([0.2126, 0.7152, 0.0722])
@@ -266,7 +270,7 @@ class TestLumTempScale(unittest.TestCase):
         def render(s):
             r = DiskV2Renderer(
                 width=48, height=27, params=DiskV2Params(r_in=R_IN, r_out=R_OUT),
-                skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(lum_temp_scale=s),
+                skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(lum_temp_scale=s, **REF_DETAIL),
                 r_max=90.0, ss=2,
             )
             r.jitter_seed[None] = 800
@@ -282,9 +286,100 @@ class TestLumTempScale(unittest.TestCase):
         def median_rel(lum):
             return float(np.median(lum[lum > 1e-4 * lum.max()]) / lum.max())
 
+        # 外圈细节取参考值（实测数据在该条件下得到；新默认下中位数比约 1.4）
         # 实测：左右通量比 4.03 → 4.03（补偿后相差 0.1%）；盘区亮度中位数 / 峰值 0.0014 → 0.0028
         self.assertAlmostEqual(lr(art) / lr(phys), 1.0, delta=0.05)
         self.assertGreater(median_rel(art) / median_rel(phys), 1.5)
+
+
+class TestOuterDetail(unittest.TestCase):
+    """外圈细节：方位周期随半径增长、外圈衰减关闭、保方差混合（默认参数）。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.disk = _shared_renderer().disk_ti
+        cls.vp = DiskV2VolumeParams()
+
+    def test_band_azimuthal_period(self):
+        """n_φ(b) = max(n, round(n·r_b/(6·s)))，内区不低于基础周期，外圈随半径增加。"""
+        d, vp = self.disk, self.vp
+        bands = list(range(d._adv_core_f.b_lo, d._adv_core_f.b_lo + 12))
+        out = ti.Vector.field(2, ti.f32, shape=len(bands))
+
+        @ti.kernel
+        def run():
+            for i in range(len(bands)):
+                n_i, n_t = d._band_nphi(d._adv_core_f.b_lo + i)
+                out[i] = ti.Vector([n_i, n_t])
+
+        run()
+        got = out.to_numpy()
+        for k, b in enumerate(bands):
+            q = math.exp(d._lnr0_r + b * d._dln_r) / (6.0 * vp.core_az_stretch)
+            self.assertEqual(got[k, 0], max(vp.nphi_i, round(vp.nphi_i * q)))
+            self.assertEqual(got[k, 1], max(vp.nphi_t, round(vp.nphi_t * q)))
+        self.assertGreater(got[-1, 1], got[0, 1])
+
+    def test_outer_cut_disabled(self):
+        """outer_detail_fade = 0：外圈不截八度、对比度保持 con_i。"""
+        d = self.disk
+        out = ti.Vector.field(2, ti.f32, shape=())
+
+        @ti.kernel
+        def run():
+            lev, con = d._outer_cut(25.0)
+            out[None] = ti.Vector([lev, con])
+
+        run()
+        lev, con = out[None].to_numpy()
+        self.assertEqual(lev, 0.0)
+        self.assertAlmostEqual(con, self.vp.con_i, places=5)
+
+    def test_blend_finish_formula(self):
+        """c = max(m_c + α·S/√Σw², 0)，tn = max(m_t + S_t/√Σw², 0)；Σw² ≈ 0 时为 0。"""
+        d = self.disk
+        self.assertGreater(d._mc_single, 0.0)
+        self.assertGreater(d._mt_single, 0.0)
+        out = ti.Vector.field(4, ti.f32, shape=())
+
+        @ti.kernel
+        def run():
+            c, tn = d._blend_finish(0.3, -0.2, 0.25)
+            c0, t0 = d._blend_finish(0.3, -0.2, 0.0)
+            out[None] = ti.Vector([c, tn, c0, t0])
+
+        run()
+        c, tn, c0, t0 = out[None].to_numpy()
+        self.assertAlmostEqual(c, max(d._mc_single + self.vp.core_contrast * 0.3 / 0.5, 0.0), places=5)
+        self.assertAlmostEqual(tn, max(d._mt_single - 0.2 / 0.5, 0.0), places=5)
+        self.assertEqual((c0, t0), (0.0, 0.0))
+
+    def test_no_band_seam(self):
+        """接缝修复后主云起伏在带中心与两带正中一致（参考实现两带正中只剩约 71%）。
+
+        对每个采样点按其自身带坐标的小数部分 fbf 分组：fbf ≈ 0 / 1 为带中心，fbf ≈ 0.5 为两带正中。
+        """
+        d = self.disk
+        n = 65536
+        cs = ti.field(ti.f32, n)
+        fs = ti.field(ti.f32, n)
+
+        @ti.kernel
+        def run():
+            for i in range(n):
+                r = 8.0 + 14.0 * hashf(i, 31, 1)
+                phi = 2.0 * math.pi * hashf(i, 31, 2)
+                fb = d._band_coord(ti.log(r), phi)
+                c, _tn = d._flow_I(r, phi, 0.0, 0.0)
+                cs[i] = c
+                fs[i] = fb - ti.floor(fb)
+
+        run()
+        c, f = cs.to_numpy(), fs.to_numpy()
+        mid = np.abs(f - 0.5) < 0.1
+        edge = np.abs(f - 0.5) > 0.4
+        ratio = (c[mid].std() / c[mid].mean()) / (c[edge].std() / c[edge].mean())
+        self.assertAlmostEqual(float(ratio), 1.0, delta=0.12)
 
 
 class TestTiltEquivalence(unittest.TestCase):
