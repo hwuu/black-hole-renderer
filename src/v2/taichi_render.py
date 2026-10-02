@@ -48,7 +48,9 @@ class DiskV2Renderer:
         skybox: 天空盒 `(tex_h, tex_w, 3)` float32 数组，`[0, 1]`，等距柱状投影。
         volume_params: `DiskV2VolumeParams`（体积密度场与物理模型参数，默认预设 M）。
         r_max: 逃逸半径下限；实际 `r_escape = max(r_max, 2·cam_distance, 1.6·r_out)`。
-        disk_tilt_deg: 盘倾角（度），盘面绕世界 x 轴旋转。
+        disk_tilt_deg: 盘倾角（度），盘面绕世界 x 轴旋转（俯仰）。
+        disk_roll_deg: 盘滚转角（度），盘面绕世界 y 轴旋转；相机位于 y 轴负方向时，
+            正值使盘面在画面上左低右高。
         doppler_lum: 多普勒亮度强度 s：亮度用 `Y(g^s·T)`；1 = 物理。
         doppler_color: 多普勒颜色强度 s：色度用 `χ(T·g^s)`；1 = 物理。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
@@ -69,6 +71,7 @@ class DiskV2Renderer:
         volume_params: Optional[DiskV2VolumeParams] = None,
         r_max: float = 10.0,
         disk_tilt_deg: float = 0.0,
+        disk_roll_deg: float = 0.0,
         doppler_lum: float = 0.55,
         doppler_color: float = 1.5,
         sky_gain: float = 0.5,
@@ -86,6 +89,7 @@ class DiskV2Renderer:
         self.volume_params = volume_params if volume_params is not None else DiskV2VolumeParams()
         self.r_max = float(r_max)
         self.disk_tilt_rad = math.radians(disk_tilt_deg)
+        self.disk_roll_rad = math.radians(disk_roll_deg)
         self.doppler_lum = float(doppler_lum)
         self.doppler_color = float(doppler_color)
         self.sky_gain = float(sky_gain)
@@ -140,6 +144,8 @@ class DiskV2Renderer:
         """编译主光追 kernel（闭包捕获盘体句柄与编译期常量）。"""
         disk = self.disk_ti
         tilt = float(self.disk_tilt_rad)
+        roll = float(self.disk_roll_rad)
+        g_spin = float(self.params.disk_spin)
         rs = float(_RS)
         sky_w = int(self.sky_w)
         sky_h = int(self.sky_h)
@@ -186,15 +192,26 @@ class DiskV2Renderer:
 
         @ti.func
         def _world_to_local_disk(pos):
-            """世界坐标 → 盘体局部坐标（盘面绕 x 轴倾斜 tilt 弧度）。
+            """世界坐标 → 盘体局部坐标（先俯仰 tilt 绕 x 轴、后滚转 roll 绕 y 轴的逆变换）。
 
-            Formula: `x' = x`，`y' = y·cos t + z·sin t`，`z' = −y·sin t + z·cos t`。
+            Formula:
+                ```
+                (x₁, y₁, z₁) = (x, y·cos t + z·sin t, −y·sin t + z·cos t)   # 俯仰逆变换
+                x' = x₁·cos r + z₁·sin r                                      # 滚转逆变换
+                y' = y₁
+                z' = −x₁·sin r + z₁·cos r
+                ```
             """
             sin_t = ti.sin(tilt)
             cos_t = ti.cos(tilt)
-            x_local = pos[0]
-            y_local = pos[1] * cos_t + pos[2] * sin_t
-            z_local = -pos[1] * sin_t + pos[2] * cos_t
+            x1 = pos[0]
+            y1 = pos[1] * cos_t + pos[2] * sin_t
+            z1 = -pos[1] * sin_t + pos[2] * cos_t
+            sin_r = ti.sin(roll)
+            cos_r = ti.cos(roll)
+            x_local = x1 * cos_r + z1 * sin_r
+            y_local = y1
+            z_local = -x1 * sin_r + z1 * cos_r
             return ti.Vector([x_local, y_local, z_local], dt=ti.f32)
 
         @ti.kernel
@@ -317,7 +334,7 @@ class DiskV2Renderer:
                             em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
                                 r_local, z_local, phi_local, t_delay, dm[2])
                             if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
-                                g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs)
+                                g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
                                 g_lum = ti.pow(g_phys, self.doppler_lum)
                                 g_col = ti.pow(g_phys, self.doppler_color)
                                 T_K = disk._page_thorne_temperature(r_local)

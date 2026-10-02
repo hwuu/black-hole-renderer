@@ -174,7 +174,7 @@ class TaichiParityTest(unittest.TestCase):
         @ti.kernel
         def k():
             for i in p_f:
-                out[i] = T.disk_g_factor_ti(p_f[i], d_f[i], 60.0, 1.0)
+                out[i] = T.disk_g_factor_ti(p_f[i], d_f[i], 60.0, 1.0, 1.0)
 
         k()
         np.testing.assert_allclose(out.to_numpy(), disk_g_factor(self.pos, self.dirs, 60.0), rtol=1e-4)

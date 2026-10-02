@@ -196,6 +196,30 @@ class TestOptLevel1Exact(unittest.TestCase):
         self.assertLessEqual(int(np.abs(a - b).max()), 1)
 
 
+class TestSpinReversal(unittest.TestCase):
+    """反转旋转方向（disk_spin = −1）：多普勒亮侧随平流结构一起翻到另一侧。"""
+
+    def test_bright_side_flips_with_spin(self):
+        def render(spin):
+            r = DiskV2Renderer(
+                width=48, height=27, params=DiskV2Params(r_in=R_IN, r_out=R_OUT, disk_spin=spin),
+                skybox=np.zeros((8, 16, 3), np.float32), volume_params=DiskV2VolumeParams(),
+                r_max=90.0, ss=2,
+            )
+            r.jitter_seed[None] = 800
+            r.render(cam_pos=CAM, fov=38.0)
+            lum = r.last_hdr.astype(np.float64) @ np.array([0.2126, 0.7152, 0.0722])
+            return lum
+
+        cw, ccw = render(-1.0), render(1.0)
+        half = cw.shape[1] // 2
+        ratio_cw = float(ccw[:, :half].sum() / ccw[:, half:].sum())
+        ratio_ccw = float(cw[:, :half].sum() / cw[:, half:].sum())
+        # 默认（逆时针）亮侧在左；反转后亮侧在右
+        self.assertGreater(ratio_cw, 1.0)
+        self.assertLess(ratio_ccw, 1.0)
+
+
 class TestTiltEquivalence(unittest.TestCase):
     """倾角等价：盘绕 x 轴倾 θ、相机仰角 e  ≡  盘不倾、相机仰角 e + θ（相机在 y-z 平面内）。
 

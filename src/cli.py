@@ -88,6 +88,10 @@ def parse_args() -> argparse.Namespace:
                         help="V2 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿。默认：单帧 2，视频 1")
     parser.add_argument("--v2_sky_rot_deg_per_sec", type=float, default=0.0,
                         help="V2 视频模式：天空方位自转速度（度/视频秒），正值使星空向画面右方漂移；0 关闭 (default: 0)")
+    parser.add_argument("--v2_disk_roll", type=float, default=0.0,
+                        help="V2 盘滚转角（度），绕世界 y 轴；相机在 -y 方向时正值使盘面画面上左低右高 (default: 0)")
+    parser.add_argument("--v2_reverse_rotation", action="store_true",
+                        help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
                         help="V2 天空亮度系数（线性光，曝光之后叠加，不影响盘曝光；0 = 黑天空）(default: 0.5)")
     parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,
@@ -202,11 +206,13 @@ def main():
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         return DiskV2Renderer(
             width=width, height=height,
-            params=DiskV2Params(r_in=args.disk_inner_radius, r_out=args.disk_outer_radius),
+            params=DiskV2Params(r_in=args.disk_inner_radius, r_out=args.disk_outer_radius,
+                                 disk_spin=-1.0 if args.v2_reverse_rotation else 1.0),
             skybox=skybox,
             volume_params=DiskV2VolumeParams(),
             r_max=max(args.r_max, 50.0),
             disk_tilt_deg=args.disk_tilt,
+            disk_roll_deg=args.v2_disk_roll,
             sky_gain=args.v2_sky_gain,
             ss=ss,
             opt_level=opt,

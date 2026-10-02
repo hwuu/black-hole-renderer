@@ -84,14 +84,15 @@ def local_photon_direction_ti(pos, k_coord, rs):
 
 
 @ti.func
-def disk_g_factor_ti(pos, trace_dir, r_obs, rs):
-    """盘面圆轨道发射体的频移 g（与 `relativity.disk_g_factor` 一致）。
+def disk_g_factor_ti(pos, trace_dir, r_obs, rs, spin):
+    """盘面圆轨道发射体的频移 g（`relativity.disk_g_factor` 在 spin = +1 时逐值一致）。
 
     Args:
-        pos: 盘局部坐标发射点（盘面 z = 0，逆时针旋转）。
+        pos: 盘局部坐标发射点（盘面 z = 0）。
         trace_dir: 反向追踪光线方向（光子真实方向为其反向）。
         r_obs: 静止观察者半径。
         rs: Schwarzschild 半径。
+        spin: 旋转方向符号（+1 逆时针 / −1 顺时针，从盘法向 +z 看）。
 
     Returns:
         `g = g_grav / (γ (1 − β cosθ_local))`。
@@ -99,7 +100,7 @@ def disk_g_factor_ti(pos, trace_dir, r_obs, rs):
     big_r = ti.max(ti.sqrt(pos[0] * pos[0] + pos[1] * pos[1]), 1e-6)
     r3 = ti.max(pos.norm(), rs + 1e-6)
     beta = schwarzschild_orbital_beta_ti(ti.max(big_r, 3.0 * rs), rs, 1e-6, 0.99)
-    v_hat = ti.Vector([-pos[1], pos[0], 0.0]) / big_r
+    v_hat = spin * ti.Vector([-pos[1], pos[0], 0.0]) / big_r
     cos_th = v_hat.dot(local_photon_direction_ti(pos, -trace_dir, rs))
     gamma = 1.0 / ti.sqrt(1.0 - beta * beta)
     g_grav = ti.sqrt(ti.max(1.0 - rs / r3, 1e-12)) / ti.sqrt(ti.max(1.0 - rs / r_obs, 1e-12))
@@ -200,6 +201,7 @@ class DiskV2Taichi:
         # Taichi 不接受 dataclass 作为 runtime 常量，必须用 Python float。
         self._r_in = float(params.r_in)
         self._r_out = float(params.r_out)
+        self._spin = float(params.disk_spin)
         # 优化级别（编译期常量）：≥ 1 时噪声改用逐位一致的快速实现，并共享每采样点的带信息
         self._opt = int(opt_level)
         self._init_luts()
@@ -280,17 +282,18 @@ class DiskV2Taichi:
         self._lnr0_r = math.log(self._r_in) - 2 * self._dln_r
 
         # 刚体环平流表（核心 / 尘埃 / 低频各一套；尘埃与低频用不同哈希流）
-        self._adv_core = RigidRingBands(self._r_in, self._r_out, self._dln_r, self._k_rigid_vol)
+        self._adv_core = RigidRingBands(self._r_in, self._r_out, self._dln_r, self._k_rigid_vol,
+                                        spin=self._spin)
         self._adv_core_f = make_fields(self._adv_core)
         self._adv_dust = RigidRingBands(
             self._r_in, self._r_out, self._dln_r, self._k_rigid_vol,
-            phi_b_hash=(23, 7), ph0_hash=(19, 3),
+            spin=self._spin, phi_b_hash=(23, 7), ph0_hash=(19, 3),
         )
         self._adv_dust_f = make_fields(self._adv_dust)
         # 低频层用宽带
         self._adv_low = RigidRingBands(
             self._r_in, self._r_out, self._dln_l, self._k_rigid_l,
-            phi_b_hash=(23, 1), ph0_hash=(29, 5),
+            spin=self._spin, phi_b_hash=(23, 1), ph0_hash=(29, 5),
             lnr0_bands=0.0, center_frac=0.5,
         )
         self._adv_low_f = make_fields(self._adv_low)

@@ -27,8 +27,12 @@ class DiskV2Params:
             传入更小的值时 `__post_init__` 发出 warning 并钳制为 `SCHWARZSCHILD_ISCO_R_S`。
         r_out: 盘外半径（r_s），必须大于钳制后的 `r_in`。默认 30 与参考实现预设 M 一致。
 
+    Args:
+        disk_spin: 盘旋转方向，`+1` 为从盘法向 (+z) 看逆时针，`-1` 为顺时针；
+            平流结构与多普勒频移使用同一符号，保证二者一致。
+
     Physical Meaning:
-        只描述盘的径向范围；Page–Thorne 温度表、SS 结构与噪声带网格都在
+        只描述盘的径向范围与旋转方向；Page–Thorne 温度表、SS 结构与噪声带网格都在
         `[r_in, r_out]` 上构造。
 
     Simplifications:
@@ -37,6 +41,7 @@ class DiskV2Params:
 
     r_in: float = SCHWARZSCHILD_ISCO_R_S
     r_out: float = 30.0
+    disk_spin: float = 1.0
 
     def __post_init__(self) -> None:
         """校验半径并对 `r_in` 做 ISCO 钳制。
@@ -54,6 +59,8 @@ class DiskV2Params:
             object.__setattr__(self, "r_in", SCHWARZSCHILD_ISCO_R_S)
         if self.r_out <= self.r_in:
             raise ValueError("r_out must be greater than r_in")
+        if self.disk_spin not in (1.0, -1.0):
+            raise ValueError("disk_spin must be +1.0 or -1.0")
 
 
 @dataclass(frozen=True)

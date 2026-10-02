@@ -102,6 +102,8 @@ class RigidRingBands:
             `[ln r_in − 2·dln, ln r_out + dln]`。
         dln: 带宽（ln r）。
         k_rigid: 结构种子寿命（本地轨道周期数）。
+        spin: 旋转方向符号，`+1` 逆时针、`-1` 顺时针（从盘法向 +z 看）；只作用于带角速度
+            `om_b`，种子寿命恒为正。
 
     Physical Meaning:
         "结构有有限寿命、被湍流不断重建"的平流骨架：带内刚体（形状保持），
@@ -112,6 +114,7 @@ class RigidRingBands:
     r_out: float
     dln: float
     k_rigid: float
+    spin: float = 1.0
     phi_b_hash: tuple = (17, 1)
     """φ_b 随机偏移的哈希流 `(b, c)`（区分使用同一带网格的不同结构层）。"""
     ph0_hash: tuple = (13, 5)
@@ -135,9 +138,9 @@ class RigidRingBands:
         object.__setattr__(self, "b_hi", b_hi)
         r_b = np.exp(lnr0 + (bs + self.center_frac) * self.dln)
         object.__setattr__(self, "r_b", r_b)
-        om_b = np.sqrt(0.5 / r_b ** 3)
-        object.__setattr__(self, "om_b", om_b)
-        object.__setattr__(self, "t_life", self.k_rigid * 2.0 * math.pi / om_b)
+        om_abs = np.sqrt(0.5 / r_b ** 3)
+        object.__setattr__(self, "om_b", float(self.spin) * om_abs)
+        object.__setattr__(self, "t_life", self.k_rigid * 2.0 * math.pi / om_abs)
         object.__setattr__(self, "phi_b", np.array(
             [_hashf_py(int(b), *self.phi_b_hash) * 2.0 * math.pi for b in bs]))
         object.__setattr__(self, "ph0", np.array(

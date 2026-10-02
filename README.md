@@ -114,6 +114,8 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--disk_model` | 吸积盘模型: `v1` / `v2` | v1 |
 | `--v2_opt` | 优化级别：0 参考实现；1 精确优化（输出与 0 一致）；2 盘内步长 ×2（视觉等价）；3 盘内步长 ×3（近似预览）。见 `docs/plans/v2_performance_plan.md` | 单帧 1，视频 2 |
 | `--v2_supersample` | 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿 | 单帧 2，视频 1 |
+| `--v2_disk_roll` | 盘滚转角（度），绕世界 y 轴；相机在 -y 方向时正值使盘面在画面上左低右高 | 0 |
+| `--v2_reverse_rotation` | 反转吸积盘旋转方向（平流结构与多普勒频移整体反向） | 关闭 |
 | `--v2_orbit_seconds` | 视频模式：内缘开普勒轨道一圈对应的视频秒数 | 16.0 |
 | `--v2_sky_gain` | 天空亮度系数（sRGB 解码为线性光后，曝光之后叠加；不影响盘曝光；0 = 黑天空） | 0.5 |
 
