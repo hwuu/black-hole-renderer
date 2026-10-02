@@ -144,6 +144,7 @@ def apply_bloom(
     threshold: float = 0.3,
     gain: float = 4.0,
     axial_scale: tuple[float, float, float] = (1.0, 1.0, 1.15),
+    luma_threshold: bool = True,
 ) -> np.ndarray:
     """高光 bloom：只散射超过阈值的亮度（HDR 域）。
 
@@ -151,16 +152,36 @@ def apply_bloom(
 
     Args:
         hdr: `(H, W, 3)` 线性 HDR RGB。
-        threshold: 高光阈值（越低光晕越多）。
-        gain: bloom 增益。
+        threshold: 高光阈值（线性 HDR，越低光晕越多）。
+        gain: bloom 增益（散射光叠回原图的倍率）。
         axial_scale: R/G/B 通道模糊半径倍率。R、B 同时外扩会形成品红光晕，
             因此默认只让蓝光稍外扩 (1, 1, 1.15)。
+        luma_threshold: 高光提取方式。True（默认）= 按亮度扣阈值并保持像素色度；
+            False = 逐通道扣阈值（参考实现旧行为）。
 
     Returns:
-        加了 bloom 的 HDR。
+        加了 bloom 的 HDR，`(H, W, 3)`，非负，≥ 输入。
+
+    Formula:
+        luma_threshold=True：  src = hdr · max(L − th, 0) / L，L = 0.2126R + 0.7152G + 0.0722B
+        luma_threshold=False： src_c = max(hdr_c − th, 0)
+        bloom_c = Σ_k w_k · Blur(src_c, r_k · axial_scale_c)，w = (0.25, 0.35, 0.40)
+        out = hdr + gain · bloom
+
+    Physical Meaning:
+        镜头内散射只把超出阈值的那部分光扩散开；散射光与源像素同色。
+
+    Simplifications:
+        逐通道扣阈值会让 G/B 偏低的金色像素在散射光里只剩 R，把金色区染成橙红，
+        因此默认改为按亮度扣阈值；三级盒式模糊近似镜头点扩散函数。
     """
     h = hdr.shape[0]
-    src = np.maximum(hdr - threshold, 0.0)
+    if luma_threshold:
+        # 按亮度扣阈值：超出部分按原色度散射，不改变色相
+        lum = hdr @ np.array([0.2126, 0.7152, 0.0722], dtype=hdr.dtype)
+        src = hdr * (np.maximum(lum - threshold, 0.0) / np.maximum(lum, 1e-12))[..., None]
+    else:
+        src = np.maximum(hdr - threshold, 0.0)
     bloom = np.zeros_like(hdr)
     for c in range(3):
         sc = axial_scale[c]
@@ -344,6 +365,8 @@ def postfx_params_defaults() -> dict:
         "white_balance_K": 5000.0,
         "bloom_threshold": 0.3,
         "bloom_gain": 4.0,
+        # True = 按亮度扣阈值（保色度，默认）；False = 逐通道扣阈值（参考实现旧行为，光晕偏红）
+        "bloom_luma_threshold": True,
         "axial_scale": (1.0, 1.0, 1.15),
         "fringe_strength": 0.4,
         "fringe_threshold": 0.7,
@@ -380,7 +403,8 @@ def postfx(
         x = x * gain[None, None, :]
     else:
         x = apply_white_balance(x, p["white_balance_K"])
-    x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"])
+    x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"],
+                    p["bloom_luma_threshold"])
     x = apply_fringe(x, p["fringe_strength"], p["fringe_threshold"], p["fringe_color"])
     x = apply_lateral_ca(x, p["lateral_ca"])
     x = tonemap_chroma_aces(x, p["white_blend"])

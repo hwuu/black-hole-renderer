@@ -186,6 +186,8 @@ python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
 python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
                  --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
 
+# V2 视频中断后续传：同一条命令加 --resume（每 240 帧一个分段，最多重渲 1 段）
+
 # V2 单测全部
 python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
 
@@ -237,3 +239,9 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
     - 根因：每构造一个 `DiskV2Renderer`，体积 kernel 首帧编译约 60–70 s；该文件内构造了 6 个
     - 做法：迭代期只跑改动相关的轻量单测（`test_disk_v2_volume_fields` / `noise_ti` / `advection` / `v2_cli` 等）；
       提交前再跑一次全量；小样渲染用 360p（`640×360`）
+
+34. **画面"发红"先查后处理再查物理颜色**（2026-10-03）
+    - 现象：调低多普勒指数、给颜色温度加下限后，金色区仍偏橙红
+    - 根因：bloom 逐通道扣阈值 `max(hdr_c − th, 0)`，G/B 偏低的像素散射光只剩 R
+    - 修复：按亮度扣阈值保持色度（`postfx.apply_bloom(luma_threshold=True)`）
+    - 做法：颜色问题先逐级打印后处理各阶段 R:G:B 比例，定位是哪一步改了色相

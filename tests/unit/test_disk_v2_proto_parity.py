@@ -262,7 +262,7 @@ class TestLumTempScale(unittest.TestCase):
         s = DiskV2VolumeParams().lum_temp_scale
         self.assertAlmostEqual(s, 1.25)
         self.assertAlmostEqual(d._ln_y_peak, math.log(_blackbody_luminance_exact(s * d._t_peak_vol)), places=9)
-        self.assertAlmostEqual(r._doppler_lum_eff, 0.5 * doppler_lum_compensation(d._t_peak_vol, s), places=9)
+        self.assertAlmostEqual(r._doppler_lum_eff, 0.25 * doppler_lum_compensation(d._t_peak_vol, s), places=9)
 
     def test_outer_disk_brighter_with_same_asymmetry(self):
         w = np.array([0.2126, 0.7152, 0.0722])

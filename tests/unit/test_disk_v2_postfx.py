@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 import numpy as np
 
 from src.v2.postfx import (
+    _box_blur,
     apply_bloom,
     apply_fringe,
     apply_lateral_ca,
@@ -106,6 +107,40 @@ class BloomTest(unittest.TestCase):
         b_out = out[..., 2][ring].mean()
         g_out = out[..., 1][ring].mean()
         self.assertGreater(b_out, g_out * 0.5, msg=f"B={b_out:.3f} G={g_out:.3f}")
+
+    def test_luma_threshold_preserves_chroma(self):
+        """按亮度扣阈值：金色亮块的光晕保持源色比例（不偏橙红）。"""
+        gold = np.array([1.0, 0.61, 0.245])  # 3000 K 白平衡后的金色
+        img = np.zeros((64, 64, 3))
+        img[28:36, 28:36] = 1.5 * gold
+        out = apply_bloom(img, threshold=0.3, gain=4.0, axial_scale=(1.0, 1.0, 1.0))
+        halo = out[10, 32]  # 亮块外的纯光晕像素
+        np.testing.assert_allclose(halo / halo[0], gold, rtol=1e-6)
+
+    def test_per_channel_threshold_reddens_halo(self):
+        """逐通道扣阈值（旧行为）：同一金色亮块的光晕 G/R、B/R 低于源色（偏橙红）。"""
+        gold = np.array([1.0, 0.61, 0.245])
+        img = np.zeros((64, 64, 3))
+        img[28:36, 28:36] = 1.5 * gold
+        out = apply_bloom(img, threshold=0.3, gain=4.0, axial_scale=(1.0, 1.0, 1.0),
+                          luma_threshold=False)
+        halo = out[10, 32]
+        self.assertLess(halo[1] / halo[0], gold[1])
+        self.assertLess(halo[2] / halo[0], gold[2])
+
+    def test_per_channel_threshold_matches_old_formula(self):
+        """luma_threshold=False 时与旧公式 max(hdr − th, 0) 逐位一致。"""
+        th, gain = 0.3, 4.0
+        out = apply_bloom(self.img, threshold=th, gain=gain, luma_threshold=False)
+        src = np.maximum(self.img - th, 0.0)
+        h = self.img.shape[0]
+        ref = np.zeros_like(self.img)
+        for c, sc in enumerate((1.0, 1.0, 1.15)):
+            ch = src[..., c:c + 1]
+            ref[..., c:c + 1] = (0.25 * _box_blur(ch, max(1, int(h / 120 * sc)))
+                                 + 0.35 * _box_blur(ch, max(2, int(h / 25 * sc)))
+                                 + 0.40 * _box_blur(ch, max(4, int(h / 7 * sc))))
+        np.testing.assert_array_equal(out, self.img + gain * ref)
 
 
 class ACESChromaTest(unittest.TestCase):

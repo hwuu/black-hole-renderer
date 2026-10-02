@@ -69,7 +69,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=int, default=36,
                         help="视频帧率 (default: 36, 仅 --video 有效)")
     parser.add_argument("--resume", action="store_true",
-                        help="视频模式：尝试从断点恢复（默认从头开始）")
+                        help="视频模式：从断点恢复（默认从头开始）。V1 逐帧存 PNG；V2 每 240 帧存一个 mp4 分段，"
+                             "中断后用同样参数加 --resume 重跑，最多重渲一段，参数变化时自动从头开始")
     parser.add_argument("--disk_rotation_algorithm", type=str, default="baseline",
                         choices=["baseline", "parametric", "keyframes"],
                         help="[已废弃] 统一使用生命周期系统，此参数被忽略")
@@ -109,7 +110,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--v2_doppler_lum", type=float, default=None,
                         help="V2 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算"
                              "（g 为频移因子）。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗；"
-                             "默认 0.5（预设 M 定稿为 0.55，本版略减弱）")
+                             "默认 0.25（预设 M 定稿为 0.55；本版减弱，视频构图下左右通量比约 3.7 → 1.7）")
+    parser.add_argument("--v2_doppler_color", type=float, default=None,
+                        help="V2 多普勒颜色强度 q（≥ 0）：逼近侧偏白、远离侧偏红的程度，色度按 χ(T·g^q) 计算，"
+                             "且色度温度封顶到白平衡色温 5000 K（最亮处止于白色，不偏蓝）。1 = 物理；0 = 无多普勒变色；"
+                             "默认 0.75（预设 M 定稿为 1.5；应与 --v2_doppler_lum 同步调，否则远离侧会又亮又红）")
+    parser.add_argument("--v2_color_floor", type=float, default=0.0,
+                        help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
+                             "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
+                             "建议 2500–3000；0 = 不设下限 (default: 0)")
     parser.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
@@ -221,8 +230,8 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--device`；`--v2_doppler_lum`
-                未传入时用渲染器默认值）。
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--device`；
+                两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
                 （单帧 2、视频 1）未显式传入时的默认值。
@@ -252,24 +261,37 @@ def main():
             sky_gain=args.v2_sky_gain,
             ss=ss,
             **({} if args.v2_doppler_lum is None else {"doppler_lum": args.v2_doppler_lum}),
+            **({} if args.v2_doppler_color is None else {"doppler_color": args.v2_doppler_color}),
+            color_temp_floor_K=args.v2_color_floor,
             opt_level=opt,
             device=args.device,
         )
 
     def _render_video_v2(args, width, height, fov):
-        """V2 视频渲染：逐帧推进物理时间，相机可环绕，曝光首帧锁定。
+        """V2 视频渲染：逐帧推进物理时间，相机可环绕，曝光首帧锁定；分段写出、可断点续传。
 
         Args:
-            args: CLI 参数（另读取 `--video/--orbit/--orbit_degrees/--n_frames/--fps/--v2_orbit_seconds`）。
+            args: CLI 参数（另读取 `--video/--orbit/--orbit_degrees/--n_frames/--fps/--v2_orbit_seconds/
+                --resume`）。
             width, height: 输出分辨率（像素）。
             fov: 竖直视野角（度）。
 
         Formula:
             `dt = P_in / (v2_orbit_seconds · fps)`，`P_in = 2π / Ω(r_in)`，`Ω = sqrt(0.5 / r³)`：
-            内缘转一圈对应 `v2_orbit_seconds` 秒视频。
+            内缘转一圈对应 `v2_orbit_seconds` 秒视频。第 f 帧：`t = 2000 + f·dt`，相机方位
+            `azim = azim_0 + orbit_degrees·f/(n_frames − 1)`，抖动种子 `f + 1`。
+
+        Notes:
+            每 240 帧写一个分段（`src/v2/video_segments.py`）。中断后用同样参数加 `--resume` 重跑，
+            跳过已完成分段，最多重渲一段；输出与一次跑完逐帧一致（每帧只由 t、相机、种子、
+            锁定曝光决定）。参数有变化时自动从头开始。代码版本变化不在校验范围内，换代码后
+            续传请自行确认。
         """
+        import json as _json
         import math as _math
         import time as _time
+
+        from src.v2.video_segments import render_segmented
 
         renderer = _make_v2_renderer(args, width, height, video=True)
 
@@ -288,37 +310,48 @@ def main():
               f"内缘周期 {args.v2_orbit_seconds}s，dt={dt_per_frame:.4f}")
 
         t0 = 2000.0  # 物理起始时间（参考实现同款）
-        writer = iio.imopen(args.output, "w", plugin="pyav")
-        writer.init_video_stream("libx264", fps=args.fps)
         start = _time.time()
         pool = ThreadPoolExecutor(max_workers=1)
-        pending = None
 
-        def _write(frame):
-            writer.write_frame((np.clip(frame, 0, 1) * 255).astype(np.uint8))
+        def _to_u8(frame):
+            return (np.clip(frame, 0, 1) * 255).astype(np.uint8)
 
-        for f in range(args.n_frames):
-            t = t0 + f * dt_per_frame
+        def _gpu_frame(f):
+            """GPU 阶段：积分第 f 帧，返回 `(hdr, sky)`。"""
             azim = base_azim + _math.radians(orbit_deg) * f / max(args.n_frames - 1, 1)
-            cam_x = base_dist * _math.cos(base_elev) * _math.cos(azim)
-            cam_y = base_dist * _math.cos(base_elev) * _math.sin(azim)
-            cam_z = base_dist * _math.sin(base_elev)
-            hdr, sky = renderer.render_hdr(cam_pos=[cam_x, cam_y, cam_z], fov=fov, t=t)
-            if renderer.fixed_exposure is None:
-                # 首帧同步处理并锁定曝光，避免逐帧曝光闪烁（参考实现 cmd_video 同款）
-                _write(renderer.finish(hdr, sky))
-                renderer.fixed_exposure = 1.0 / renderer.last_white_point
-            else:
-                # 后处理与写帧交给单线程池（保持帧序），与下一帧的 GPU 积分并行
-                if pending is not None:
-                    pending.result()
-                pending = pool.submit(lambda h=hdr, s=sky: _write(renderer.finish(h, s)))
-            if f % 24 == 0:
-                print(f"  frame {f}/{args.n_frames}  {_time.time() - start:.1f}s", flush=True)
-        if pending is not None:
-            pending.result()
+            cam = [base_dist * _math.cos(base_elev) * _math.cos(azim),
+                   base_dist * _math.cos(base_elev) * _math.sin(azim),
+                   base_dist * _math.sin(base_elev)]
+            # render_hdr 内部先 +1：第 f 帧种子 = f + 1，与是否续传无关
+            renderer.jitter_seed[None] = f
+            return renderer.render_hdr(cam_pos=cam, fov=fov, t=t0 + f * dt_per_frame)
+
+        def _render_frames(f0, f1, exposure):
+            """按帧序产出 `(uint8 帧, 锁定曝光)`；后处理交给单线程池，与下一帧 GPU 积分并行。"""
+            renderer.fixed_exposure = exposure
+            pending = None
+            for f in range(f0, f1):
+                hdr, sky = _gpu_frame(f)
+                if renderer.fixed_exposure is None:
+                    # 首帧同步处理并锁定曝光，避免逐帧曝光闪烁（参考实现 cmd_video 同款）
+                    img = _to_u8(renderer.finish(hdr, sky))
+                    renderer.fixed_exposure = 1.0 / renderer.last_white_point
+                    yield img, renderer.fixed_exposure
+                else:
+                    fut = pool.submit(lambda h=hdr, s=sky: _to_u8(renderer.finish(h, s)))
+                    if pending is not None:
+                        yield pending.result(), renderer.fixed_exposure
+                    pending = fut
+                if f % 24 == 0:
+                    print(f"  frame {f}/{args.n_frames}  {_time.time() - start:.1f}s", flush=True)
+            if pending is not None:
+                yield pending.result(), renderer.fixed_exposure
+
+        # 续传校验：除输出路径与 --resume 外的全部参数（含分辨率、视野）
+        params = {k: v for k, v in vars(args).items() if k not in ("output", "resume")}
+        params = _json.loads(_json.dumps({**params, "width": width, "height": height, "fov": fov}, default=str))
+        render_segmented(args.n_frames, args.fps, args.output, params, args.resume, _render_frames)
         pool.shutdown()
-        writer.close()
         print(f"[V2 video] 完成: {args.output} ({_time.time() - start:.1f}s)")
 
     if args.disk_model == "v2":

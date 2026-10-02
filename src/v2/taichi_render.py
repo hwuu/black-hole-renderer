@@ -28,7 +28,7 @@ from .camera import build_camera_v1_compatible
 from .noise_ti import hashf as _hashf
 from .palette import doppler_lum_compensation
 from .params import DiskV2Params, DiskV2VolumeParams
-from .postfx import hdr_luminance, postfx, srgb_decode
+from .postfx import hdr_luminance, postfx, postfx_params_defaults, srgb_decode
 from .taichi_impl import DiskV2Taichi, disk_g_factor_ti
 
 
@@ -53,10 +53,20 @@ class DiskV2Renderer:
         disk_roll_deg: 盘滚转角（度），盘面绕世界 y 轴旋转；相机位于 y 轴负方向时，
             正值使盘面在画面上左低右高。
         doppler_lum: 多普勒亮度强度 p（≥ 0）：亮度用 `Y(s·g^{p·k}·T)`；1 = 物理，0 = 无多普勒明暗；
-            默认 0.5（预设 M 定稿 0.55，略减弱左右明暗不对称）。s 为
+            默认 0.25（预设 M 定稿 0.55；减弱左右明暗不对称，视频构图下左右通量比约 3.7 → 1.7）。s 为
             `volume_params.lum_temp_scale`，k = `palette.doppler_lum_compensation(T_peak, s)`
             （s = 1 时 k = 1）。
-        doppler_color: 多普勒颜色强度 s：色度用 `χ(T·g^s)`；1 = 物理。
+        doppler_color: 多普勒颜色强度 q（≥ 0）：色度用 `χ(min(T·g^q, T_cap))`；1 = 物理，0 = 无多普勒变色。
+            默认 0.75（预设 M 定稿 1.5；随亮度指数同步减弱，避免远离侧"又亮又红"）。
+        color_temp_cap_K: 颜色温度上限 T_cap（K）：色度温度超过它时取 T_cap，使最亮处止于白色、不越过
+            白点变蓝（颜色序列 黑 → 暗红 → 金 → 白）。默认 None = 后处理白平衡色温
+            （`postfx_params_defaults()["white_balance_K"]`，5000 K，即白平衡下显示为白色的温度）；
+            0 = 不封顶（参考实现）。只影响色度，不影响亮度。
+        color_temp_floor_K: 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），
+            使冷区不再显示为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。
+            0 = 不设下限（参考实现）。只影响色度，不影响亮度。
+        bloom_luma_threshold: bloom 高光提取方式（传给 `postfx.apply_bloom`）：True（默认）= 按亮度扣阈值、
+            散射光保持像素色度；False = 逐通道扣阈值（参考实现旧行为，金色区的光晕偏橙红）。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
         ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
@@ -76,8 +86,11 @@ class DiskV2Renderer:
         r_max: float = 10.0,
         disk_tilt_deg: float = 0.0,
         disk_roll_deg: float = 0.0,
-        doppler_lum: float = 0.5,
-        doppler_color: float = 1.5,
+        doppler_lum: float = 0.25,
+        doppler_color: float = 0.75,
+        color_temp_cap_K: Optional[float] = None,
+        color_temp_floor_K: float = 0.0,
+        bloom_luma_threshold: bool = True,
         sky_gain: float = 0.5,
         ss: int = 1,
         opt_level: int = 0,
@@ -96,6 +109,19 @@ class DiskV2Renderer:
         self.disk_roll_rad = math.radians(disk_roll_deg)
         self.doppler_lum = float(doppler_lum)
         self.doppler_color = float(doppler_color)
+        # 颜色温度上限（K）；0 = 不封顶。kernel 内 T_col = min(T·g^q, cap)
+        if color_temp_cap_K is None:
+            color_temp_cap_K = float(postfx_params_defaults()["white_balance_K"])
+        if color_temp_cap_K < 0.0:
+            raise ValueError("color_temp_cap_K must be >= 0 (0 = no cap)")
+        self.color_temp_cap_K = float(color_temp_cap_K)
+        # 颜色温度下限（K）；0 = 不设下限。kernel 内 T_col = max(T_col, floor)
+        if color_temp_floor_K < 0.0:
+            raise ValueError("color_temp_floor_K must be >= 0 (0 = no floor)")
+        if self.color_temp_cap_K > 0.0 and color_temp_floor_K > self.color_temp_cap_K:
+            raise ValueError("color_temp_floor_K must be <= color_temp_cap_K")
+        self.color_temp_floor_K = float(color_temp_floor_K)
+        self.bloom_luma_threshold = bool(bloom_luma_threshold)
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
@@ -346,19 +372,20 @@ class DiskV2Renderer:
                             if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
                                 g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
                                 g_col = ti.pow(g_phys, self.doppler_color)
+                                # 颜色温度截断：χ(clamp(T·g_col, T_floor, T_cap))，暗金 → 白（_col_t 内实现）
                                 # 亮度温度 = s·g^{doppler_lum_eff}·T（s 为亮度温度倍率；色度不乘 s）
                                 g_lum = ti.pow(g_phys, self._doppler_lum_eff) * disk._lum_ts
                                 T_K = disk._page_thorne_temperature(r_local)
                                 # 核心：Y(s·g·T·tf_c)/Y(s·T_peak)·χ(g·T·tf_c)
                                 Tc = T_K * tf_c
-                                src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Tc * g_col)
+                                src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Tc * g_col))
                                 # 其他（尘埃）：Y(s·g·T)/Y(s·T_peak)·χ(g·T)
-                                src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(T_K * g_col)
+                                src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(T_K * g_col))
                                 # 烟雾：T_smoke = SMOKE_TR·T
                                 src_s = src_o
                                 if disk._smoke_tr > 0:
                                     Ts = T_K * disk._smoke_tr
-                                    src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(Ts * g_col)
+                                    src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Ts * g_col))
                                 # CORE_OPAC 同时乘核心发射与核心吸收：物质更多 → j、α 同比增加，
                                 # 源函数 S = j/α 不变（与参考实现一致）。κ 已按 TAU_I 标定。
                                 j_total = disk._core_opac * em_c * src_c + em_o * src_o + em_s * src_s
@@ -432,6 +459,33 @@ class DiskV2Renderer:
             arr = arr.reshape(self.height, self.ss, self.width, self.ss, 3).mean(axis=(1, 3))
         return arr
 
+    @ti.func
+    def _col_t(self, t_col):
+        """颜色温度截断：返回 `clamp(t_col, T_floor, T_cap)`；对应参数为 0 时该侧不截断。
+
+        Args:
+            t_col: 色度温度 `T·g^q`（K，标量）。
+
+        Returns:
+            标量色度温度（K），落在 `[T_floor, T_cap]` 内（未启用的一侧不限制）。
+
+        Formula:
+            T_col' = min(max(T_col, T_floor), T_cap)
+
+        Physical Meaning:
+            白平衡色温 T_cap 处的黑体显示为白色，更高温度偏蓝；低于 T_floor 的黑体显示为橙红。
+            两侧截断后颜色只在黑体轨迹的 暗金 → 金 → 白 段内变化，暗处靠亮度变暗到黑。
+
+        Simplifications:
+            纯视觉处理（物理上高温偏蓝白、低温偏红）；亮度仍按真实温度计算。
+        """
+        out = t_col
+        if ti.static(self.color_temp_floor_K > 0.0):
+            out = ti.max(out, self.color_temp_floor_K)
+        if ti.static(self.color_temp_cap_K > 0.0):
+            out = ti.min(out, self.color_temp_cap_K)
+        return out
+
     def render_hdr(self, cam_pos: List[float], fov: float, t: float = 2000.0):
         """GPU 阶段：积分一帧，返回 `(disk_hdr, sky)`（均为 `(H, W, 3)` 线性光；无天空时 sky 为 None）。
 
@@ -477,7 +531,7 @@ class DiskV2Renderer:
         x = hdr * exposure
         if sky is not None:
             x = x + self.sky_gain * sky
-        img = postfx(x, exposure=1.0)
+        img = postfx(x, exposure=1.0, bloom_luma_threshold=self.bloom_luma_threshold)
         self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
         return img.astype(np.float32) / 255.0
 
