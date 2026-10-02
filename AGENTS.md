@@ -80,16 +80,19 @@
 
 ### 代码结构速记
 
-- `render.py`
-  - 相机、天空盒、吸积盘程序纹理、Taichi 渲染器、视频渲染 CLI 都在这个文件
-  - `TaichiRenderer` 是核心渲染类
-  - `render_video()` 支持视频模式
-- `docs/design.md`
-  - 项目目标、物理模型、渲染管线、实现取舍的主文档
-- `tests/unit`
-  - 放轻量、定向、快速运行的单元测试
-- `tests/e2e_render.py`
-  - 放固定参数渲染 + hash 校验的端到端测试
+- 代码按层放在 `src/` 下，`render.py` 只是兼容门面与命令行入口（`python render.py ...` 用法不变）
+- `src/core/`
+  - `constants.py` 全部公共常量；`camera.py` 相机；`skybox.py` 天空盒生成/加载；`imaging.py` 存图
+- `src/v1/`
+  - `texture.py` V1 程序纹理生成与缓存（约 1450 行）；`lifecycle.py` 实体生命周期
+  - `renderer.py` `TaichiRenderer`（V1 光追核）；`pipeline.py` 单帧/交互/视频管线
+- `src/v2/`
+  - 体积吸积盘（V2），见 `docs/design_ad_v2.md`
+- `src/cli.py`
+  - 参数解析与模式分发（V1 / V2、单帧 / 视频）
+- `scripts/`
+  - `proto_disk_reference.py` V2 验收基准（参考实现）；`compare_v2_proto.py` V2 对比工具
+- `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
 
 ### 视频旋转算法速记
 

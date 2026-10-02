@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-import render
+from src.v1 import pipeline as v1_pipeline
+from src import cli
 
 
 class _FakeWriter:
@@ -44,7 +45,7 @@ class OrbitDegreesTest(unittest.TestCase):
             "-90",
         ]
         with patch.object(sys, "argv", argv):
-            args = render.parse_args()
+            args = cli.parse_args()
 
         self.assertEqual(args.orbit_degrees, -90.0)
 
@@ -56,10 +57,10 @@ class OrbitDegreesTest(unittest.TestCase):
             "disk.png",
         ]
         with patch.object(sys, "argv", argv):
-            args = render.parse_args()
+            args = cli.parse_args()
 
         with self.assertRaisesRegex(ValueError, "disk_texture"):
-            render.validate_args(args)
+            cli.validate_args(args)
 
     def test_validate_args_rejects_disk_texture_in_interactive_mode(self):
         argv = [
@@ -69,23 +70,23 @@ class OrbitDegreesTest(unittest.TestCase):
             "disk.png",
         ]
         with patch.object(sys, "argv", argv):
-            args = render.parse_args()
+            args = cli.parse_args()
 
         with self.assertRaisesRegex(ValueError, "disk_texture"):
-            render.validate_args(args)
+            cli.validate_args(args)
 
     def test_render_video_uses_configured_orbit_degrees(self):
         renderer = _FakeRenderer()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                patch.object(render.iio, "imopen", return_value=_FakeWriter()),
-                patch.object(render.iio, "imread", return_value=np.zeros((2, 2, 3), dtype=np.uint8)),
-                patch.object(render, "_init_lifecycle_system", return_value={}),
-                patch.object(render, "_advance_lifecycle_frame"),
+                patch.object(v1_pipeline.iio, "imopen", return_value=_FakeWriter()),
+                patch.object(v1_pipeline.iio, "imread", return_value=np.zeros((2, 2, 3), dtype=np.uint8)),
+                patch.object(v1_pipeline, "_init_lifecycle_system", return_value={}),
+                patch.object(v1_pipeline, "_advance_lifecycle_frame"),
             ):
                 output_path = os.path.join(tmpdir, "orbit.mp4")
-                render.render_video(
+                v1_pipeline.render_video(
                     renderer=renderer,
                     width=2,
                     height=2,
@@ -117,12 +118,12 @@ class OrbitDegreesTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             output_path = os.path.join(tmpdir, "resume.mp4")
-            temp_dir_name = ".frames_" + render.hashlib.md5(output_path.encode()).hexdigest()[:16]
+            temp_dir_name = ".frames_" + v1_pipeline.hashlib.md5(output_path.encode()).hexdigest()[:16]
             temp_dir = os.path.join(tmpdir, temp_dir_name)
             os.makedirs(temp_dir, exist_ok=True)
             progress_file = os.path.join(temp_dir, "progress.json")
             with open(progress_file, "w", encoding="utf-8") as f:
-                render.json.dump({
+                v1_pipeline.json.dump({
                     "params": {
                         "n_frames": 3,
                         "fov": 60.0,
@@ -134,12 +135,12 @@ class OrbitDegreesTest(unittest.TestCase):
                 }, f)
 
             with (
-                patch.object(render.iio, "imopen", return_value=_FakeWriter()),
-                patch.object(render.iio, "imread", return_value=np.zeros((2, 2, 3), dtype=np.uint8)),
-                patch.object(render, "_init_lifecycle_system", return_value={}),
-                patch.object(render, "_advance_lifecycle_frame") as advance_mock,
+                patch.object(v1_pipeline.iio, "imopen", return_value=_FakeWriter()),
+                patch.object(v1_pipeline.iio, "imread", return_value=np.zeros((2, 2, 3), dtype=np.uint8)),
+                patch.object(v1_pipeline, "_init_lifecycle_system", return_value={}),
+                patch.object(v1_pipeline, "_advance_lifecycle_frame") as advance_mock,
             ):
-                render.render_video(
+                v1_pipeline.render_video(
                     renderer=renderer,
                     width=2,
                     height=2,

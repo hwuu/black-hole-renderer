@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-import render
+from src.v1 import texture as render_tex
+from src import cli as render
 
 
 class DiskTextureRotationStateTest(unittest.TestCase):
@@ -68,16 +69,16 @@ class DiskTextureRotationStateTest(unittest.TestCase):
             return make_field(0.9)
 
         with (
-            patch.object(render, "_generate_temperature_base", side_effect=fake_temp_base),
-            patch.object(render, "_generate_spiral_arms", side_effect=fake_spiral),
-            patch.object(render, "_generate_turbulence", side_effect=fake_turbulence),
-            patch.object(render, "_generate_filaments", side_effect=fake_filaments),
-            patch.object(render, "_generate_rt_spikes", side_effect=fake_rt),
-            patch.object(render, "_generate_hotspots", side_effect=fake_hotspots),
-            patch.object(render, "_generate_azimuthal_hotspot", side_effect=fake_az_hotspot),
-            patch.object(render, "_generate_disturbance_mod", side_effect=fake_disturbance_mod),
+            patch.object(render_tex, "_generate_temperature_base", side_effect=fake_temp_base),
+            patch.object(render_tex, "_generate_spiral_arms", side_effect=fake_spiral),
+            patch.object(render_tex, "_generate_turbulence", side_effect=fake_turbulence),
+            patch.object(render_tex, "_generate_filaments", side_effect=fake_filaments),
+            patch.object(render_tex, "_generate_rt_spikes", side_effect=fake_rt),
+            patch.object(render_tex, "_generate_hotspots", side_effect=fake_hotspots),
+            patch.object(render_tex, "_generate_azimuthal_hotspot", side_effect=fake_az_hotspot),
+            patch.object(render_tex, "_generate_disturbance_mod", side_effect=fake_disturbance_mod),
         ):
-            state = render.build_disk_texture_rotating_state(n_phi=n_phi, n_r=n_r, enable_rt=True)
+            state = render_tex.build_disk_texture_rotating_state(n_phi=n_phi, n_r=n_r, enable_rt=True)
 
         self.assertEqual(
             call_counts,
@@ -94,16 +95,16 @@ class DiskTextureRotationStateTest(unittest.TestCase):
         )
 
         with (
-            patch.object(render, "_generate_temperature_base", side_effect=AssertionError("temp_base should be cached")),
-            patch.object(render, "_generate_spiral_arms", side_effect=AssertionError("spiral should be cached")),
-            patch.object(render, "_generate_turbulence", side_effect=AssertionError("turbulence should be cached")),
-            patch.object(render, "_generate_filaments", side_effect=AssertionError("filaments should be cached")),
-            patch.object(render, "_generate_rt_spikes", side_effect=AssertionError("rt should be cached")),
-            patch.object(render, "_generate_hotspots", side_effect=AssertionError("hotspots should be cached")),
-            patch.object(render, "_generate_azimuthal_hotspot", side_effect=AssertionError("az_hotspot should be cached")),
-            patch.object(render, "_generate_disturbance_mod", side_effect=AssertionError("disturbance should be cached")),
+            patch.object(render_tex, "_generate_temperature_base", side_effect=AssertionError("temp_base should be cached")),
+            patch.object(render_tex, "_generate_spiral_arms", side_effect=AssertionError("spiral should be cached")),
+            patch.object(render_tex, "_generate_turbulence", side_effect=AssertionError("turbulence should be cached")),
+            patch.object(render_tex, "_generate_filaments", side_effect=AssertionError("filaments should be cached")),
+            patch.object(render_tex, "_generate_rt_spikes", side_effect=AssertionError("rt should be cached")),
+            patch.object(render_tex, "_generate_hotspots", side_effect=AssertionError("hotspots should be cached")),
+            patch.object(render_tex, "_generate_azimuthal_hotspot", side_effect=AssertionError("az_hotspot should be cached")),
+            patch.object(render_tex, "_generate_disturbance_mod", side_effect=AssertionError("disturbance should be cached")),
         ):
-            tex = render.generate_disk_texture_rotating(
+            tex = render_tex.generate_disk_texture_rotating(
                 n_phi=n_phi,
                 n_r=n_r,
                 enable_rt=True,

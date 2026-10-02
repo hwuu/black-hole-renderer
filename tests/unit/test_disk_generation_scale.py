@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-import render
+from src.v1 import texture as render_tex
+from src import cli as render
 
 
 class DiskGenerationScaleTest(unittest.TestCase):
@@ -23,15 +24,15 @@ class DiskGenerationScaleTest(unittest.TestCase):
     def test_load_cached_disk_texture_forwards_generation_scale(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             with (
-                patch.object(render.os, "makedirs"),
-                patch.object(render.np, "save") as save_mock,
-                patch.object(render.os.path, "exists", return_value=False),
-                patch.object(render, "generate_disk_texture", return_value=np.zeros((8, 16, 4), dtype=np.float32)) as gen_mock,
+                patch.object(render_tex.os, "makedirs"),
+                patch.object(render_tex.np, "save") as save_mock,
+                patch.object(render_tex.os.path, "exists", return_value=False),
+                patch.object(render_tex, "generate_disk_texture", return_value=np.zeros((8, 16, 4), dtype=np.float32)) as gen_mock,
             ):
                 cwd = os.getcwd()
                 try:
                     os.chdir(tmpdir)
-                    tex = render.load_cached_disk_texture(
+                    tex = render_tex.load_cached_disk_texture(
                         width=640,
                         height=360,
                         cam_pos=[6.0, 0.0, 0.5],
@@ -70,16 +71,16 @@ class DiskGenerationScaleTest(unittest.TestCase):
             return make_field(0.9)
 
         with (
-            patch.object(render, "_generate_temperature_base", return_value=make_field(0.2)),
-            patch.object(render, "_generate_spiral_arms", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_turbulence", side_effect=fake_turbulence),
-            patch.object(render, "_generate_filaments", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_rt_spikes", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_hotspots", return_value=(make_field(0.12), make_field(0.04))),
-            patch.object(render, "_generate_azimuthal_hotspot", side_effect=fake_az),
-            patch.object(render, "_generate_disturbance_mod", side_effect=fake_disturbance),
+            patch.object(render_tex, "_generate_temperature_base", return_value=make_field(0.2)),
+            patch.object(render_tex, "_generate_spiral_arms", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_turbulence", side_effect=fake_turbulence),
+            patch.object(render_tex, "_generate_filaments", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_rt_spikes", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_hotspots", return_value=(make_field(0.12), make_field(0.04))),
+            patch.object(render_tex, "_generate_azimuthal_hotspot", side_effect=fake_az),
+            patch.object(render_tex, "_generate_disturbance_mod", side_effect=fake_disturbance),
         ):
-            state = render.build_disk_texture_rotating_state(
+            state = render_tex.build_disk_texture_rotating_state(
                 n_phi=n_phi,
                 n_r=n_r,
                 generation_scale=4,

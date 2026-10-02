@@ -6,7 +6,8 @@ from unittest.mock import patch
 
 import numpy as np
 
-import render
+from src.v1 import texture as render_tex
+from src import cli as render
 
 
 class _FakeRng:
@@ -61,18 +62,18 @@ class ParametricRotationDirectionTest(unittest.TestCase):
             return original_np_roll(array, shift, axis=axis)
 
         with (
-            patch.object(render, "_generate_spiral_arms", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_turbulence", side_effect=fake_zero_triple),
-            patch.object(render, "_generate_filaments", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_rt_spikes", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_hotspots", side_effect=fake_zero_pair),
-            patch.object(render, "_generate_azimuthal_hotspot", side_effect=fake_zero_hotspot),
-            patch.object(render, "_apply_disturbance", side_effect=fake_identity_disturbance),
-            patch.object(render.np, "roll", side_effect=tracking_roll),
+            patch.object(render_tex, "_generate_spiral_arms", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_turbulence", side_effect=fake_zero_triple),
+            patch.object(render_tex, "_generate_filaments", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_rt_spikes", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_hotspots", side_effect=fake_zero_pair),
+            patch.object(render_tex, "_generate_azimuthal_hotspot", side_effect=fake_zero_hotspot),
+            patch.object(render_tex, "_apply_disturbance", side_effect=fake_identity_disturbance),
+            patch.object(render_tex.np, "roll", side_effect=tracking_roll),
         ):
             n_r, n_phi = 4, 16
             t_offset = np.pi / 2.0
-            render.generate_disk_texture_rotating(n_phi=n_phi, n_r=n_r, t_offset=t_offset)
+            render_tex.generate_disk_texture_rotating(n_phi=n_phi, n_r=n_r, t_offset=t_offset)
 
             r_norm = np.linspace(0.0, 1.0, n_r)
             r_vals = 2.0 + (3.5 - 2.0) * r_norm
@@ -104,18 +105,18 @@ class ParametricRotationDirectionTest(unittest.TestCase):
             return noise
 
         with (
-            patch.object(render, "_tileable_noise", side_effect=fake_tileable_noise),
-            patch.object(render, "_periodic_pixel_noise", side_effect=fake_periodic_pixel_noise),
+            patch.object(render_tex, "_tileable_noise", side_effect=fake_tileable_noise),
+            patch.object(render_tex, "_periodic_pixel_noise", side_effect=fake_periodic_pixel_noise),
         ):
             n_r, n_phi = 4, 16
             t_offset = np.pi / 2.0
             r_norm_grid = np.full((n_r, n_phi), 10.0, dtype=np.float32)
             omega_grid = np.ones((n_r, n_phi), dtype=np.float32)
 
-            turbulence_t0, _, _ = render._generate_turbulence(
+            turbulence_t0, _, _ = render_tex._generate_turbulence(
                 _FakeRng(), n_r, n_phi, r_norm_grid, 0.0, omega_grid
             )
-            turbulence_t1, _, _ = render._generate_turbulence(
+            turbulence_t1, _, _ = render_tex._generate_turbulence(
                 _FakeRng(), n_r, n_phi, r_norm_grid, t_offset, omega_grid
             )
 
@@ -133,14 +134,14 @@ class ParametricRotationDirectionTest(unittest.TestCase):
             )
 
     def test_azimuthal_hotspot_noise_rotates_same_direction_as_phi_grid(self):
-        original_fbm_noise = render._fbm_noise
+        original_fbm_noise = render_tex._fbm_noise
 
         def fake_fbm_noise(shape, rng, octaves=4, persistence=0.5, base_scale=1, wrap_u=False):
             noise = np.zeros(shape, dtype=np.float32)
             noise[:, 0] = 1.0
             return noise
 
-        render._fbm_noise = fake_fbm_noise
+        render_tex._fbm_noise = fake_fbm_noise
         try:
             n_r, n_phi = 4, 8
             phi = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
@@ -149,10 +150,10 @@ class ParametricRotationDirectionTest(unittest.TestCase):
             omega_grid = np.ones((n_r, n_phi), dtype=np.float32)
             t_offset = np.pi / 2.0
 
-            hotspot_t0 = render._generate_azimuthal_hotspot(
+            hotspot_t0 = render_tex._generate_azimuthal_hotspot(
                 _FakeRng(), n_r, n_phi, phi_grid_base, r_norm_grid, 0.0, omega_grid
             )
-            hotspot_t1 = render._generate_azimuthal_hotspot(
+            hotspot_t1 = render_tex._generate_azimuthal_hotspot(
                 _FakeRng(),
                 n_r,
                 n_phi,
@@ -177,7 +178,7 @@ class ParametricRotationDirectionTest(unittest.TestCase):
                 ),
             )
         finally:
-            render._fbm_noise = original_fbm_noise
+            render_tex._fbm_noise = original_fbm_noise
 
 
 if __name__ == "__main__":
