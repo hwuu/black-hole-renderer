@@ -1,3 +1,14 @@
+> **已归档（2026-10-02）**
+>
+> 归档原因：本方案针对旧 atlas 模型的视觉恢复（V1 云雾预烘焙 atlas、弱团块自遮挡、
+> `scripts/v2_visual_acceptance.sh` 验收）。旧模型已被体积密度场取代，相关代码、脚本与
+> CLI 参数已于 2026-10-02 删除；视觉验收改用 `scripts/compare_v2_proto.py`。
+>
+> 现行方案见 [`docs/plans/v2_volumetric_video_plan.md`](../plans/v2_volumetric_video_plan.md)。
+> 本文仅保留作历史记录，内容不再维护。
+
+---
+
 # V2 视觉恢复方案
 
 > **状态**：已实施（2026-06-14）。Step 0~5 完成；最终人工验收以用户参考图为准。

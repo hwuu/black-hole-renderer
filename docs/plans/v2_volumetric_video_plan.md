@@ -10,7 +10,7 @@
 >
 > **验收基准**：参考实现 `scripts/proto_disk_reference.py` 默认输出（预设 M + mode 3，用户已看图确认，见 §2）。本方案的目标是把原型**等价地**移植进 V2，而不是重新调参。
 >
-> **真源关系**：盘体几何/物理场/调制的数学定义仍以 [`docs/design_ad_v2.md`](../design_ad_v2.md) 为准；本方案落地后需同步更新其对应章节（§9）。本方案替代 [`v2_visual_recovery_plan.md`](v2_visual_recovery_plan.md) 中"预烘焙 visual atlas 作为主结构"的决定。
+> **真源关系**：模型、分层与概念边界以 [`docs/design_ad_v2.md`](../design_ad_v2.md)（v2.3）为准。本方案替代已归档的 [`v2_visual_recovery_plan.md`](../archived/v2_visual_recovery_plan.md) 中"预烘焙 visual atlas 作为主结构"的决定；旧 atlas 模型已于 2026-10-02 删除（§11）。
 >
 > **非目标**：Kerr 度规；MHD/真实流体模拟；交互模式（`--interactive`）接入 V2；V1 路径的任何行为改变（V1 e2e 基线 `df4ccd8f…` 必须保持）。
 
@@ -136,24 +136,10 @@ conda run -n black-hole python scripts/proto_disk_reference.py params         # 
 
 数据流：视频驱动给出物理时间 `t` → `advection.py` 在 CPU 上用 float64 算出每条带的相位/种子/权重表并上传 → 体积核在每个采样点求 3D 密度 → 光追累积 HDR → 后处理输出 LDR。
 
-### 3.1 概念边界与命名（遵循 AGENTS.md Disk V2 规则）
+### 3.1 概念边界与命名
 
-| 新概念 | 归属层 | 命名 | 返回值 |
-|--------|--------|------|--------|
-| SS 外区标高 `H(r)` | `geometry` | `disk_half_thickness`（改写） | 半厚度（r_s） |
-| 噪声调制表面高度 `H_s` | `geometry` | `perturbed_half_thickness` | 半厚度（r_s） |
-| 核心竖直剖面 `exp(−z²/2H_s²)` | `geometry` | `core_vertical_weight` | `[0, 1]` |
-| 烟雾层 k 的竖直包络 `exp(−dz_k²/2)` | `geometry` | `cloud_layer_weight(r, z, k)` | `[0, 1]` |
-| SS 柱密度 Σ(r)、核心 / 烟雾密度 | `physical_fields` | `surface_density_field` / `core_density_field` / `cloud_density_field` | 物理密度 |
-| Page–Thorne 温度、灰大气竖直温度 | `physical_fields` | `temperature_field` / `grey_atmosphere_temperature_factor` | K / 倍率 `[1, GREY_CAP]` |
-| 可见光亮度 Y(T) | `palette` | `blackbody_luminance` | ≥ 0 |
-| 乘性级联主云（密度 FLOOR 下限、温度起伏） | `structure_modulations` | `core_structure_modulation` / `temperature_turbulence_modulation` | 围绕 1 波动 |
-| 云层 lognormal × sigmoid 覆盖率 | `structure_modulations` | `cloud_structure_modulation` | 围绕 1 波动，≥ 0 |
-| 内区尘埃 | `structure_modulations` | `dust_modulation` | ≥ 0 |
-| 大尺度低频明暗 | `structure_modulations` | `large_scale_modulation` | 围绕 1 波动（lognormal 均值 1） |
-| 烟雾温度比 | `physical_fields` | `cloud_temperature_ratio` 参数 | 标量 `(0, 1]` |
-
-注意：覆盖率会产生接近 0 的空洞，`*_modulation` 的"围绕 1 波动"指均值约为 1（lognormal 已做 `−σ²/2` 均值校正），不是逐点。docstring 中需写明。
+实施初期规划的 `geometry` / `structure_modulations` 三层划分已随旧模块删除而废止（2026-10-02）。
+现行分层（结构场 / 辐射转移 / 后处理）与命名见 [`docs/design_ad_v2.md`](../design_ad_v2.md) §3.5。
 
 ---
 
@@ -286,7 +272,7 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 - `docs/design.md`：V2 后处理与视频管线。
 - `README.md`：新增/废弃的 `--v2_*` 参数与视频用法。
 - `AGENTS.md` 踩坑记录：亮度不能用 (T/T_peak)^p；灰大气侧壁热点；掠射增亮重复计算；NPGS 式 S ∝ 1/ρ 导致越密越暗；Taichi kernel 内不能用 `math.exp`；`ti.static` 展开多层噪声导致编译爆炸；`from __future__ import annotations` 与 `ti.template()` 冲突；Tanner Helland 为 sRGB 编码值。
-- `docs/plans/realism_uplift_plan.md` 变更记录追加本方案引用。
+- `docs/archived/realism_uplift_plan.md`：已归档（2026-10-02）。
 
 ---
 
@@ -315,9 +301,56 @@ proto   rel    color  noise  advec  field  march  postfx video  docs
 光子环下半部通量占比 0.021 / 0.022，逐像素 |ln(V2/Proto)| 中位数 0.062（修复前 0.202）。
 保护单测：`tests/unit/test_disk_v2_proto_parity.py`。
 
+## 11. 旧模型清理（2026-10-02）
+
+V2 只保留体积模型这一条路径：
+
+- 删除模块：`visual_atlas.py`、`structure_modulations.py`、`preview.py`、`imaging.py`、`geometry.py`、`stats.py`
+  （`hdr_luminance` 迁入 `postfx.py`）；`physical_fields.py` / `palette.py` / `relativity.py` 只保留体积模型用到的参考函数。
+- 删除参数类 `DiskV2StructureParams`、`DiskV2PaletteParams`；`DiskV2Params` 只保留 `r_in`、`r_out`（默认 30）。
+- `DiskV2Renderer` 只保留体积积分 kernel，构造参数精简为分辨率、`params`、`skybox`、`volume_params`、
+  `r_max`、倾角、多普勒强度、`ss`。
+- `render.py` 删除 24 个失效的 `--v2_*` 参数（含 `--v2_disable_g_factor`），单帧与视频共用 `_make_v2_renderer`；
+  保留 `--disk_model`、`--v2_ss`、`--v2_orbit_seconds`。
+- 删除 `scripts/v2_visual_acceptance.sh` 与 13 个只测旧代码的单测文件；有效用例迁入现存测试。
+- 旧文档归档到 `docs/archived/`。
+- 验证：清理前后 V2 HDR（960×540）逐位相同；V2 单测与 V1 e2e 全部通过。
+
+## 12. 天空、倾角与视频验收（2026-10-02）
+
+- **天空**：渲染核把盘发射与透过的天空分成两个缓冲；天空 sRGB 解码为线性光、双线性采样（V1 同约定），
+  以 `--v2_sky_gain`（默认 0.5）在曝光之后叠加，星点参与 bloom。修复前程序星空使自动曝光按星点计算，
+  盘被压成黑色剪影。黑天空下盘 HDR 与清理前逐位相同；亮天空下曝光不变（单测）。
+- **倾角**：盘倾 θ、相机仰角 e ≡ 盘不倾、仰角 e + θ。960×540 实测 θ = 10° / 20°：逐像素
+  `|ln|` 中位数 1e-4、总通量差 < 1e-5（f32 舍入）；亮侧 = 蓝移侧（左右通量比 4.1，B/R 0.49 vs 0.10）。无需修改，固化为单测。
+- **多时刻对齐 Proto**（960×540，ss = 1；内缘周期 P = 2π/√(0.5/27) ≈ 46.2 r_s/c）：
+
+  | t | 0 | P/4 | P | 5P |
+  |---|---|---|---|---|
+  | `|ln(V2/Proto)|` 中位数 | 0.064 | 0.052 | 0.066 | 0.068 |
+
+- **卷绕**（结构场 log c 平均螺旋倾角，参考实现 `pitch_deg` 同式；内 / 中 / 外三段）：
+
+  | 内缘圈数 | 0 | 1 | 3 | 10 | 20 |
+  |---|---|---|---|---|---|
+  | 刚体环（V2） | 19.4 / 11.4 / 6.6 | 19.6 / 11.6 / 6.5 | 19.1 / 12.0 / 6.4 | 19.5 / 11.9 / 7.0 | 19.4 / 11.9 / 6.8 |
+  | naive `φ − Ω(r)t` | 19.3 / 11.8 / 6.5 | 10.6 / 10.9 / 6.5 | 6.5 / 8.0 / 6.3 | 5.3 / 5.2 / 5.1 | 5.1 / 4.3 / 3.9 |
+
+- **延时视频**（`output/v2_longrun.mp4`，960×540，240 帧覆盖 20 圈）：近侧纹理 98% 的帧向右移动；
+  逐像素相邻帧差 max/median = 1.35；盘总亮度逐帧相对变化中位数 0.9%、峰值 4.4%（孤立、不成簇，
+  为大尺度明暗与种子更替在延时下的演化，不是曝光跳变）。
+- **实时视频**（`output/v2_realtime.mp4`，1080p、ss = 2、240 帧 = 10 s、程序星空，经 CLI 渲染，耗时 3.2 h）：
+  画面平均亮度逐帧相对变化中位数 0.13%、max 0.42%；逐像素相邻帧差中位数 0.06/255、max/median 1.64，无可见闪烁。
+  10 s 内整体亮度缓慢下降 5.8%（曝光锁定 + 大尺度明暗演化）。
+- **速度**（稳态每帧）：960×540 4.8 s；1080p 15.8 s；1080p ss = 2 52 s。
+
 ---
 
 ## 变更记录
+
+- **v0.8 (2026-10-02)**：§12 天空（分缓冲 + 线性化 + 双线性 + `--v2_sky_gain`）、倾角验证、视频验收与测速。
+
+- **v0.7 (2026-10-02)**：§11 旧模型清理；§3.1 概念边界改为指向 `design_ad_v2.md` §3.5。
 
 - **v0.6 (2026-10-01)**：§10 移植一致性修复，V2 与 Proto 同参数逐像素对齐。
 - **v0.5 (2026-10-01)**：全面物理 review 后定稿 M，参数分三层（基本参数 / 物理模型 / 视觉调节，§2）。新增：可见光亮度 Y(g·T)、Page–Thorne 温度（M、Ṁ 推 T_peak）、灰大气竖直温度、核心 τ≈3 温和起伏 + 温度起伏、SS 外区 H/Σ + 竖直高斯、开普勒尘埃（去重复掠射增亮）、烟雾温度比、静止观者相机；去掉 `EMIT_POW`、表面增亮、透镜状截面。S2/S5/S6/S9 与性能预算更新。

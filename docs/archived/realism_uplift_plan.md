@@ -1,3 +1,12 @@
+> **已归档（2026-10-02）**
+>
+> 归档原因：本方案是旧 atlas 模型的真实感提升计划（cinematic palette、visual preset、
+> reference exposure、HDR bloom 等），已被 [`docs/plans/v2_volumetric_video_plan.md`](../plans/v2_volumetric_video_plan.md)
+> （体积密度场 + 刚体环平流 + 物理后处理）取代。所述代码与 CLI 参数已于 2026-10-02 删除。
+> 本文仅保留作历史记录，内容不再维护。
+
+---
+
 # 黑洞渲染真实感提升计划
 
 > **状态**：草稿（v0.3），尚未冻结，正在与既有设计真源对齐。

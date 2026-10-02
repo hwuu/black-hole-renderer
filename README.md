@@ -11,7 +11,7 @@
 - **抗锯齿**：Ray differentials + Mipmap LOD，减少摩尔纹
 - **高性能**：Taichi 并行框架，1080p 渲染 < 2s
 - **视频生成**：支持环绕视频、断点续传
-- **Disk V2（v2.1 + 视觉恢复 experimental）**：有限厚度发射-吸收积分、预烘焙 visual atlas（V1 云雾 + spiral warp）、弱 clump 自遮挡、温度量纲化、palette + HDR 链路、g-factor 相对论修正。详见 [`docs/design_ad_v2.md`](docs/design_ad_v2.md)、[`docs/plans/v2_visual_recovery_plan.md`](docs/plans/v2_visual_recovery_plan.md) 与 [`docs/plans/realism_uplift_plan.md`](docs/plans/realism_uplift_plan.md)。
+- **Disk V2（体积吸积盘）**：3D 体积密度场 + 发射-吸收积分、刚体环平流（视频不卷绕）、Page–Thorne 温度、严格频移、物理后处理链。详见 [`docs/design_ad_v2.md`](docs/design_ad_v2.md) 与 [`docs/plans/v2_volumetric_video_plan.md`](docs/plans/v2_volumetric_video_plan.md)。
 
 ## 安装
 
@@ -40,15 +40,27 @@ python render.py -r 4k -o output/4k.png
 python render.py --device gpu -o output/gpu.png
 ```
 
-### Disk V2 模式（v2.3，体积密度场 + 物理后处理）
+### Disk V2 模式（体积吸积盘）
 
 V2 用 3D 体积密度场（SS 外区结构 + Page–Thorne 温度 + 灰大气 + 刚体环平流 +
 乘性级联噪声 + 烟雾 + 尘埃）+ 体积发射-吸收积分 + 物理后处理链
-（CIE 黑体 + Y(g·T) 亮度 + von Kries 白平衡 + 高光 bloom + 双色散 + 保色度 ACES）。
-参数分三层（基本参数 / 物理模型 / 视觉调节），详见
+（CIE 黑体 + Y(g·T) 亮度 + von Kries 白平衡 + 高光 bloom + 色散 + 保色度 ACES）。
+设计见 [`docs/design_ad_v2.md`](docs/design_ad_v2.md)，参数三层定稿值见
 [`docs/plans/v2_volumetric_video_plan.md`](docs/plans/v2_volumetric_video_plan.md) §2。
 
-bash
+```bash
+# 单帧（预设 M 构图；1080p 建议 --v2_ss 2）
+python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
+                 --ar1 3 --ar2 30 -r fhd --v2_ss 2 --device gpu -o output/v2.png
+
+# 视频（内缘一圈 16 s，可加 --orbit 环绕）
+python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
+                 --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
+```
+
+### 视频生成
+
+```bash
 # 环绕视频（默认 3600 帧，36 fps）
 python render.py --video --orbit -o output/demo.mp4
 
@@ -95,44 +107,27 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--fps` | 视频帧率 | 36 |
 | `--resume` | 从断点恢复 | - |
 
-### Disk V2 参数（v2.1，仅 `--disk_model v2`）
+### Disk V2 参数（仅 `--disk_model v2`）
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
 | `--disk_model` | 吸积盘模型: `v1` / `v2` | v1 |
-| `--v2_T_peak_K` | 中面温度峰值（K），决定颜色基调 | 1e7 |
-| `--v2_clump_count` | 显式团块数量 | 400 |
-| `--v2_volume_samples` | 盘内体积积分步数 | 16 |
 | `--v2_ss` | 体积模型超采样倍率（每轴），2 = 每像素 4 条光线 | 1 |
-| `--v2_opacity_scale` | 盘体不透明度缩放 | 0.5 |
-| `--v2_lum_power` | g-factor 亮度指数（Phase 5 严格物理 = 4） | 4.0 |
-| `--v2_g_cap` | g-factor 上限 | 6.0 |
-| `--v2_disable_g_factor` | 关闭相对论 g-factor 修正 | False |
-| `--v2_r_max` | V2 路径的逃逸半径下限，None 表示沿用 `--r_max` | None |
-| `--v2_bloom_intensity` | HDR 域 Bloom 强度，0 关闭 | 0.0 |
-| `--v2_bloom_threshold` | Bloom 亮度阈值（HDR） | 1.0 |
-| `--v2_bloom_radius` | Bloom 高斯模糊半径（像素） | 4.0 |
-| `--v2_emission_scale` | HDR 发射率整体缩放（高级参数） | 1.0 |
-| `--v2_auto_exposure` | 按 HDR 亮度分位数自动设置 white point | 关闭 |
-| `--v2_white_point_percentile` | auto exposure 使用的 HDR 亮度分位数 | 99.0 |
-| `--v2_print_stats` | 渲染后打印 HDR/LDR 诊断统计 | 关闭 |
-| `--v2_seed` | 团块/atlas 随机种子 | 42 |
-| `--v2_turbulence_strength` | visual atlas 云雾强度 | 0.35 |
-| `--v2_spiral_warp_strength` | 径向 spiral warp 强度 | 1.8 |
-| `--v2_alpha_clip_threshold` | atlas Alpha Clip 阈值 | 0.01 |
-| `--v2_atlas_n_r` / `--v2_atlas_n_phi` | atlas 分辨率 | 512 / 1024 |
-| `--v2_shear_strength` | 傅里叶剪切强度（默认 0，关闭） | 0 |
-| `--v2_disable_visual_atlas` | 关闭 visual atlas，回退 F_shear 路径 | False |
+| `--v2_orbit_seconds` | 视频模式：内缘开普勒轨道一圈对应的视频秒数 | 16.0 |
+| `--v2_sky_gain` | 天空亮度系数（sRGB 解码为线性光后，曝光之后叠加；不影响盘曝光；0 = 黑天空） | 0.5 |
+
+V2 同时使用通用参数 `--pov`、`--fov`、`--ar1`、`--ar2`、`--disk_tilt`、`--r_max`（V2 下限 50）、
+`--texture`、`--video`、`--orbit`、`--orbit_degrees`、`--n_frames`、`--fps`。
+物理模型与视觉参数取预设 M（`disk_v2.params.DiskV2VolumeParams` 默认值），暂不开放 CLI。
 
 **V2 使用注意**：
 
-- **视觉验收**以用户参考图为准，须人工看图；`white_ratio` 仅作诊断。
-- 验收构图使用 `--ar1 2 --ar2 15`；大半径 demo 推荐 `--ar2 50`。
-- V2 强制 `--ar1 ≥ 3 r_s`（Schwarzschild ISCO），小于该值会自动钳制并 warning。
-- V2 当前仅支持 `--device gpu`。CPU 路径在小图下也可能耗时数分钟，CLI 会直接拒绝。
-- 推荐默认加 `--v2_auto_exposure`；`--v2_print_stats` 可查看 `white_ratio` / `hdr_p99` 等诊断。
-- `--v2_emission_scale` 保留为高级手动曝光；常规用户优先用 auto exposure。
-- V2 当前不支持 `--video` / `--interactive`，仅单帧 PNG 输出。
+- 必须显式传 `--ar1 3 --ar2 30`：`--ar1/--ar2` 的默认值（2 / 15）是 V1 的；V2 会把 `r_in < 3` 钳制到 ISCO 并 warning。
+- 仅支持 `--device gpu`（CPU 单帧也要数分钟）；不支持 `--interactive`。
+- 曝光自动：盘区亮度 p99.9 映射到 0.9（只看盘，天空不参与）；视频首帧计算后锁定。
+- 天空：`--texture` 读等距柱状 PNG，不传则程序生成星空；双线性采样，星点参与 bloom。
+- 速度（M 系列 GPU 实测，稳态每帧）：960×540 ≈ 4.8 s；1080p ≈ 15.8 s；1080p `--v2_ss 2` ≈ 52 s。
+- 与参考实现对比验收：`python scripts/compare_v2_proto.py`。
 
 ## 物理模型
 

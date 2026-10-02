@@ -35,21 +35,24 @@
 - `Args:` 不能只写参数名，要写清楚输入代表什么坐标/物理量、是否允许标量和数组、关键取值范围或边界语义
 - `Physical Meaning:` 说明“这个函数在模型里表示什么”，不能只重复代码行为；`Simplifications:` 说明当前采用了哪些简化假设
 - 私有辅助函数也要写 docstring；简单工具函数至少要有一句话摘要、`Args:`、`Returns:`，若是非平凡数学变换则补 `Formula:` 或 `Notes:`
-- 同一层级的函数说明风格要一致：`*_mask`、`*_weight`、`*_field`、`*_modulation` 的措辞、值域描述、盘内/盘外语义要统一
+- 同一层级的函数说明风格要一致：同一后缀（如 `*_half_thickness`、`*_temperature`、`*_g_factor`、`*_ti`）的措辞、值域描述、盘内/盘外语义要统一
 - 测试名称、设计文档、源码 docstring 对同一概念的叫法必须一致，避免一处叫“结构场”、另一处叫“结构调制”
 
 ### Disk V2 概念边界
 
-- `geometry`：盘的空间几何脚手架，包含“多厚”“是否在盘内”“边界如何平滑过渡”
-- `physical_fields`：基础物理量分布，表示盘“本来是什么”
-- `structure_modulations`：对基础物理场的无量纲调制，表示盘“被扰动成什么样”
+详见 `docs/design_ad_v2.md` §3.5。
+
+- 结构场：盘的几何与物质分布（标高、柱密度、噪声结构、刚体环平流），表示盘"长什么样"
+- 辐射转移：温度、源函数、频移与发射-吸收积分，表示盘"发出什么光"
+- 后处理：曝光、相机效应（bloom / 色散）与显示编码，表示"相机怎么拍"
 
 ### Disk V2 命名规则
 
-- `*_mask`：硬判定，返回布尔值
-- `*_weight`：软判定，返回 `[0, 1]` 权重
-- `*_field`：基础物理场，返回物理量分布
-- `*_modulation`：结构调制，返回围绕 `1` 波动的乘性因子
+- `*_half_thickness` / `*_surface_density`：结构场的标高（r_s）/ 柱密度（无量纲形状）
+- `density_*`：体积密度场，返回非负发射 / 吸收系数
+- `*_temperature`：温度（K）或温度倍率（标量，围绕 1）
+- `*_g_factor`：频移 `ν_obs/ν_em`（> 0，> 1 为蓝移）
+- `*_ti`：与同名 NumPy 参考函数逐值一致的 Taichi 实现（由单测做 parity）
 
 ### 提交规范
 
@@ -71,7 +74,7 @@
 
 - 核心光线方程：`d²x/dλ² = -1.5 * L² * x / r⁵`
 - 单帧/视频主入口：`render.py`
-- 设计与背景说明：`docs/design.md`
+- 设计与背景说明：`docs/design.md`；Disk V2：`docs/design_ad_v2.md`；旧文档：`docs/archived/`
 - 端到端渲染测试：`tests/e2e_render.py`
 - 方向相关单测：`tests/unit/test_parametric_rotation_direction.py`
 
@@ -156,8 +159,9 @@ python -m unittest tests/e2e_render.py
     - 根因：CLI `--ar1` / `--ar2` 的默认值是 V1 全局常量 `R_DISK_INNER_DEFAULT=2`、`R_DISK_OUTER_DEFAULT=15`
     - 当前修复：V2 路径检测 `--ar2 < 20` 时打印 warning，提示用户加上 `--ar2 50`
     - 文件位置：`render.py` 的 `if args.disk_model == "v2"` 分支
+    - **现状（2026-10-02）**：warning 随旧参数清理删除；V2 必须显式传 `--ar1 3 --ar2 30`（预设 M）
 
-27. **V2 团块 / 纯 Fourier shear 不适合做主发射纹理** (视觉恢复 2026-06-14)
+27. **V2 团块 / 纯 Fourier shear 不适合做主发射纹理** (视觉恢复 2026-06-14；**已过时**：atlas / 团块 / shear 已于 2026-10-02 删除，仅作历史经验)
     - 现象：`F_clump` 全强度进发射 → 鬣狗斑；高频 `F_shear` 试验 → 斑马纹；二者叠加易全白/灰脏
     - 修复：主结构改预烘焙 `visual_atlas`（V1 云雾 + spiral warp + alpha clip）；`F_clump` 仅弱密度自遮挡（`clump_strength≈0.12`, `clump_emission_weight=0`）；`shear_strength` 默认 0
  - 验收：`bash scripts/v2_visual_acceptance.sh`；固定相机 `pov=24 0 8, ar1=2, ar2=15`
@@ -171,24 +175,19 @@ python -m unittest tests/e2e_render.py
 # V1 默认渲染
 python render.py --pov 20 0 2 --fov 60 --ar1 2 --ar2 10 --disk_tilt 20 --resolution hd -o output/*.png
 
-# V2 推荐渲染（HD GPU ~1.5s）
-python render.py --disk_model v2 --pov 30 0 10 --fov 90 \
-                 --ar1 3 --ar2 50 --disk_tilt 20 \
-                 -r hd --device gpu \
-                 -o output/v2.png
+# V2 渲染（预设 M 构图；1080p 加 --v2_ss 2 去噪）
+python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
+                 --ar1 3 --ar2 30 -r fhd --v2_ss 2 --device gpu -o output/v2.png
+
+# V2 视频（内缘一圈 16 s）
+python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
+                 --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
 
 # V2 单测全部
-python -m unittest tests/unit/test_disk_v2_array_utils tests/unit/test_disk_v2_clump \
-  tests/unit/test_disk_v2_g_factor tests/unit/test_disk_v2_numpy_taichi_parity \
-  tests/unit/test_disk_v2_palette tests/unit/test_disk_v2_physical_fields \
-  tests/unit/test_disk_v2_structure_modulations tests/unit/test_disk_v2_visual_atlas \
-  tests/unit/test_disk_v2_stats tests/unit/test_disk_v2_proto_parity
+python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
 
-# V2 vs Proto 同参数对比（1080p 上下拼图 + 数值指标）
+# V2 vs Proto 同参数对比（1080p 上下拼图 + 数值指标；改 V2 体积路径后必跑）
 python scripts/compare_v2_proto.py
-
-# V2 视觉验收（GPU）
-bash scripts/v2_visual_acceptance.sh
 ```
 
 
