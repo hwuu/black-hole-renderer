@@ -94,7 +94,7 @@ class GreyAtmosphereTest(unittest.TestCase):
 
 class VolumeParamsTest(unittest.TestCase):
     def test_defaults_match_reference_preset_M(self):
-        """DiskV2VolumeParams 默认值 = 参考实现预设 M。"""
+        """DiskV2VolumeParams 默认值 = 参考实现预设 M（盘厚缩放除外，默认 1/9 物理厚度）。"""
         from src.v2.params import DiskV2VolumeParams
         vp = DiskV2VolumeParams()
         self.assertEqual(vp.bh_mass_msun, 1.0e8)
@@ -110,6 +110,8 @@ class VolumeParamsTest(unittest.TestCase):
         self.assertAlmostEqual(vp.lowf_sigma, 0.9)
         self.assertAlmostEqual(vp.surf_lo, 1.0)
         self.assertAlmostEqual(vp.surf_k, 0.0)
+        self.assertAlmostEqual(vp.hr_ref, 0.027)
+        self.assertAlmostEqual(vp.thickness_scale, 1.0 / 9.0)
         self.assertTrue(vp.dust_kepler)
         self.assertTrue(vp.static_cam)
         self.assertTrue(vp.light_delay)

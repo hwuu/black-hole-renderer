@@ -72,6 +72,10 @@ class DiskV2VolumeParams:
         mdot_edd: 吸积率（爱丁顿倍数，eta = 1 - sqrt(8/9)）。
         t_peak_override_K: 非 0 时直接覆盖峰值温度（K），跳过推导。
         hr_ref: r = r_ref 处 H/r（SS 理论对本场景 << 0.01；0.027 为视觉取值）。
+        thickness_scale: 盘厚缩放：`hr_ref`、`cl_spacing`、`cl_width` 的有效值为定稿值乘以该系数，盘内步长
+            同步缩放；柱密度与光学深度不变。1 = 预设 M 的视觉厚度（与参考实现对齐）；默认 1/9 使
+            H/r ≈ 0.003（接近 Shakura–Sunyaev 物理量级），消除贴盘面视角的遮挡黑墙
+            （见 docs/plans/v2_edge_on_plan.md）。
         r_ref: SS 剖面归一参考半径（r_s）。
         surf_noise: 表面起伏幅度：H_s = H·(1 - SURF_NOISE + SURF_NOISE·softsat(tn))。
         grey_mix: 灰大气强度：温度倍率 = 1 + GREY_MIX·(T_grey/T_eff - 1)；0 = 竖直均匀，1 = 完整灰大气。
@@ -104,6 +108,7 @@ class DiskV2VolumeParams:
     t_peak_override_K: float = 0.0
     hr_ref: float = 0.027
     r_ref: float = 10.0
+    thickness_scale: float = 1.0 / 9.0
     surf_noise: float = 0.6
     grey_mix: float = 0.5
     grey_cap: float = 1.19
@@ -156,6 +161,8 @@ class DiskV2VolumeParams:
             raise ValueError("core_opac must be positive")
         if not 0.0 <= self.core_floor <= 1.0:
             raise ValueError("core_floor must be in [0, 1]")
+        if self.thickness_scale <= 0.0:
+            raise ValueError("thickness_scale must be positive")
         if self.tau_i <= 0.0:
             raise ValueError("tau_i must be positive")
         if self.smoke_i < 0.0:

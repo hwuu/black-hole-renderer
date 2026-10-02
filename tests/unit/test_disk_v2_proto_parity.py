@@ -220,6 +220,34 @@ class TestSpinReversal(unittest.TestCase):
         self.assertLess(ratio_ccw, 1.0)
 
 
+class TestThicknessScale(unittest.TestCase):
+    """盘厚缩放：有效标高与烟雾层厚度同乘 thickness_scale，薄盘关于中面保持对称。"""
+
+    def test_effective_thickness_and_validation(self):
+        d = _shared_renderer().disk_ti
+        s = DiskV2VolumeParams().thickness_scale
+        self.assertAlmostEqual(s, 1.0 / 9.0)
+        self.assertAlmostEqual(d._hr_ref, 0.027 * s, places=7)
+        self.assertAlmostEqual(d._cl_spacing, 0.014 * s, places=7)
+        self.assertAlmostEqual(d._cl_width, 0.011 * s, places=7)
+        with self.assertRaises(ValueError):
+            DiskV2VolumeParams(thickness_scale=0.0)
+
+    def test_thin_disk_mirror_symmetric(self):
+        r = _shared_renderer()
+
+        def flux(elev_deg):
+            e = math.radians(elev_deg)
+            r.jitter_seed[None] = 600
+            r.render(cam_pos=[0.0, -40.0 * math.cos(e), 40.0 * math.sin(e)], fov=38.0)
+            return float(r.last_hdr.astype(np.float64).sum())
+
+        # 盘关于中面对称：盘面上方与下方同仰角观察，盘总通量一致。
+        # 24×14 像素下上下两侧噪声实现不同带来约 5% 起伏，容差取 10%；底面渲染错误会使比值偏离数倍。
+        # 正式门槛（720p，±2%）在验收中实测，见 docs/plans/v2_edge_on_plan.md §8。
+        self.assertAlmostEqual(flux(-7.0) / flux(7.0), 1.0, delta=0.10)
+
+
 class TestTiltEquivalence(unittest.TestCase):
     """倾角等价：盘绕 x 轴倾 θ、相机仰角 e  ≡  盘不倾、相机仰角 e + θ（相机在 y-z 平面内）。
 

@@ -222,7 +222,9 @@ class DiskV2Taichi:
         import taichi as ti
 
         # SS 结构
-        self._hr_ref = float(vp.hr_ref)
+        # 盘厚缩放：标高与烟雾层厚度同乘 thickness_scale（柱密度不变，见 DiskV2VolumeParams）
+        self._thick = float(vp.thickness_scale)
+        self._hr_ref = float(vp.hr_ref) * self._thick
         self._r_ref_vol = float(vp.r_ref)
         self._f_ref_ss = 1.0 - math.sqrt(self._r_in / self._r_ref_vol)
         self._surf_noise = float(vp.surf_noise)
@@ -239,8 +241,8 @@ class DiskV2Taichi:
         self._smoke_tr = float(vp.smoke_tr)
         self._smoke_s = float(vp.smoke_s)
         self._n_cl_half = int(vp.n_cl_half)
-        self._cl_spacing = float(vp.cl_spacing)
-        self._cl_width = float(vp.cl_width)
+        self._cl_spacing = float(vp.cl_spacing) * self._thick
+        self._cl_width = float(vp.cl_width) * self._thick
         self._cl_decay = float(vp.cl_decay)
         self._cl_amp_norm = 1.0 / sum(
             math.exp(-self._cl_decay * abs(k)) for k in range(-self._n_cl_half, self._n_cl_half + 1)

@@ -154,6 +154,8 @@ class DiskV2Renderer:
         static_cam = bool(disk._static_cam)
         light_delay = bool(disk._light_delay)
         step_c = float(self._step_c)
+        # 盘内基础步长随盘厚缩放（固定 0.03 r_s 在薄盘中会比盘本身还厚）
+        thick = float(disk._thick)
 
         @ti.func
         def _compute_acceleration(pos, L2):
@@ -273,8 +275,9 @@ class DiskV2Renderer:
                     r_cur = pos.norm()
                     # 参考实现（模型 I）步长：位置的连续函数，避免条纹。
                     #   远场 h = min(0.06·r, 2)；近视界 h ≤ 0.02 + 0.06·(r − 1)；
-                    #   核心盘包络 zb = 3H(r_c) + 0.02 内 h → 0.03，离开后按距离 0.3·d 放大；
-                    #   烟雾包络 CL_EXTENT·r_c + 0.02 内 h → max(0.4·CL_WIDTH·r_c, 0.03)。
+                    #   核心盘包络 zb = 3H(r_c) + 0.02 内 h → 0.03·s，离开后按距离 0.3·d 放大；
+                    #   烟雾包络 CL_EXTENT·r_c + 0.02 内 h → max(0.4·CL_WIDTH·r_c, 0.03·s)；
+                    #   s = thickness_scale（盘厚缩放），H 与 CL_WIDTH 已含 s。
                     # 盘相关距离在盘局部坐标下计算（支持倾角）。
                     h = ti.min(0.06 * r_cur, 2.0)
                     h = ti.min(h, 0.02 + 0.06 * ti.max(r_cur - 1.0, 0.0))
@@ -283,10 +286,10 @@ class DiskV2Renderer:
                     zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.02
                     rad_out = ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
                     d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
-                    h = ti.min(h, sc * 0.03 + 0.3 * d_slab)
+                    h = ti.min(h, sc * 0.03 * thick + 0.3 * d_slab)
                     if ti.static(disk._smoke_on):
                         d_smoke = ti.max(ti.abs(pl[2]) - (disk._cl_extent * rc_h + 0.02), 0.0) + rad_out
-                        h = ti.min(h, sc * ti.max(0.4 * disk._cl_width * rc_h, 0.03) + 0.3 * d_smoke)
+                        h = ti.min(h, sc * ti.max(0.4 * disk._cl_width * rc_h, 0.03 * thick) + 0.3 * d_smoke)
 
                     # 首步抖动：起点沿光线随机偏移 [0, h)，与超采样一起构成蒙特卡洛体积积分
                     if step_idx == 0:
