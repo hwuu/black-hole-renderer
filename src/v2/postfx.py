@@ -3,14 +3,18 @@
 替代 `taichi_render.py` 中的 `_disk_tonemap_kernel` + `_bloom_kernel` + `_compose_kernel`。
 全部 NumPy 实现（1080p 约 0.3 s），视频性能不足时再移到 Taichi。
 
-链路顺序（与参考实现一致）：
+链路顺序（成像原理见 `docs/imaging_model.md`）：
 
 1. 白平衡（von Kries 增益，`palette.white_balance_gain`）
-2. 高光 bloom（HDR 域，只散射超过阈值的亮度；轴向色散 = 逐通道模糊半径缩放）
-3. 镶边（饱和高光外缘的蓝紫失焦环）
-4. 横向色散（R 通道放大、B 通道缩小的径向错位）
-5. 保色度 ACES 色调映射（只对亮度做 ACES，RGB 等比缩放）
-6. sRGB 编码
+2. 镜头 PSF（默认 `lens_model="psf"`）：能量守恒的长尾散射（眩光）+ 逐通道核宽
+   （轴向色差，自然产生高光蓝边），作用于全部场景光、无阈值。
+   `lens_model="legacy"` 时为参考实现的"高光 bloom + 镶边"两步（会额外加光，仅作对照）。
+3. 横向色散（R 通道放大、B 通道缩小的径向错位）
+4. 保色度 ACES 色调映射（只对亮度做 ACES，RGB 等比缩放）
+5. sRGB 编码
+
+白平衡是逐通道增益、镜头 PSF 是逐通道线性卷积，两者可交换，因此 PSF 放在白平衡之后
+与"先镜头、后传感器/ISP"的物理顺序等价。
 
 所有函数接受 `(H, W, 3)` 线性 HDR RGB，返回同形状。
 """
@@ -66,6 +70,42 @@ def _box_blur(x: np.ndarray, rad: int) -> np.ndarray:
     return y
 
 
+def _box_blur_zero(x: np.ndarray, rad: int) -> np.ndarray:
+    """三次盒式模糊（近似高斯），边界补 0。
+
+    Args:
+        x: `(H, W, C)` 数组。
+        rad: 模糊半径（像素），< 1 时原样返回。
+
+    Returns:
+        与 `x` 同形状的模糊结果；总和 ≤ 输入总和（散射出画面的部分丢弃）。
+
+    Notes:
+        与 `_box_blur`（复制边缘像素补边）不同：复制边缘会把画面边缘的亮内容
+        重复计入，测试图上能量放大到 1.41×；镜头散射到画面外的光应当丢失，
+        因此镜头 PSF 用补 0 版本，保证能量只减不增。
+    """
+    if rad < 1:
+        return x
+    y = x
+    for _ in range(3):
+        for ax in (0, 1):
+            pad_spec = [(rad + 1, rad) if a == ax else (0, 0) for a in range(x.ndim)]
+            c = np.cumsum(np.pad(y, pad_spec, mode="constant"), axis=ax)
+            n = y.shape[ax]
+            hi = [slice(None)] * x.ndim
+            lo = [slice(None)] * x.ndim
+            hi[ax] = slice(2 * rad + 1, 2 * rad + 1 + n)
+            lo[ax] = slice(0, n)
+            y = (c[tuple(hi)] - c[tuple(lo)]) / (2 * rad + 1)
+    return y
+
+
+# 镜头眩光长尾核：(半径 = 画面高度 / d, 能量权重)。多尺度高斯叠加，权重随尺度递减，
+# 近似真实镜头 PSF 尾部 ~1/r^n 的衰减；权重和为 1（核归一化）。
+LENS_TAIL = ((60.0, 0.40), (20.0, 0.30), (7.0, 0.20), (3.0, 0.10))
+
+
 # ---------------------------------------------------------------------------
 # 1. 白平衡
 # ---------------------------------------------------------------------------
@@ -77,63 +117,16 @@ def apply_white_balance(
 
     Args:
         hdr: `(H, W, 3)` 线性 HDR RGB。
-        white_balance_K: 白平衡色温（K）。6600 K ≈ 中性白点，增益 ≈ 1。
+        white_balance_K: 白平衡色温（K，1000–40000，黑体色度表范围）。色温为该值的黑体显示为白色；
+            约 6600 K 时增益 ≈ 1；更低 → 画面更冷（中和暖光），更高 → 画面更暖。
 
     Returns:
-        白平衡后的 HDR（亮度量级不变）。
+        白平衡后的 HDR，`(H, W, 3)`（亮度量级基本不变）。
+
+    Formula:
+        `out_c = hdr_c · gain_c`，`gain_c = 1 / rgb_c(T_wb)`（`palette.white_balance_gain`）
     """
-    if white_balance_K >= 6599.0:
-        return hdr
     return hdr * white_balance_gain(white_balance_K)[None, None, :]
-
-
-def compute_auto_wb_gain(
-    hdr: np.ndarray,
-    alpha: np.ndarray | None = None,
-    percentile: float = 99.0,
-    warm_bias: float = 0.0,
-) -> np.ndarray:
-    """从 HDR 自动估计 von Kries 白平衡增益。
-
-    取盘区（或全图）亮度前 `percentile`% 的像素，计算平均色度，
-    返回使该色度呈精确中性的增益（BT.709 亮度不变）。
-
-    Args:
-        hdr: `(H, W, 3)` 线性 HDR RGB。
-        alpha: 可选 `(H, W)` 盘区不透明度 mask（> 0.1 视为盘区）。
-        percentile: 亮度分位数（只取最亮的前 x% 像素做色度参考）。
-        warm_bias: 暖色偏移 `[0, 1]`。0 = 完全中性；> 0 让白点偏暖
-            （R 增益 × (1+bias)、B 增益 × (1−bias)，模拟"Interstellar 金色"）。
-
-    Returns:
-        `(3,)` von Kries 增益（BT.709 亮度不变）。
-    """
-    w = np.array([0.2126, 0.7152, 0.0722])
-    lum = hdr @ w
-    mask = lum > 1e-10
-    if alpha is not None:
-        mask &= alpha > 0.1
-    if not mask.any():
-        return np.ones(3)
-    v = lum[mask]
-    if v.size < 10:
-        return np.ones(3)
-    bright = lum >= np.percentile(v, percentile)
-    m = mask & bright
-    if not m.any():
-        m = mask
-    mean_rgb = hdr[m].mean(0)
-    lum_mean = float(mean_rgb @ w)
-    if lum_mean < 1e-10:
-        return np.ones(3)
-    # 归一化到亮度=1（与 blackbody_color 同约定）
-    c = mean_rgb / lum_mean
-    gain = 1.0 / np.maximum(c, 1e-3)
-    # 暖色偏移：R 增益提高、B 增益降低（保持亮度不变的重归一）
-    if warm_bias > 0:
-        gain = gain * np.array([1.0 + warm_bias, 1.0, 1.0 - warm_bias])
-    # BT.709 亮度不变归一
-    return gain * lum_mean / float(gain @ mean_rgb)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +185,56 @@ def apply_bloom(
             + 0.40 * _box_blur(ch, max(4, int(h / 7 * sc)))
         )
     return hdr + gain * bloom
+
+
+# ---------------------------------------------------------------------------
+# 2'. 镜头 PSF（默认镜头模型：能量守恒眩光 + 轴向色差）
+# ---------------------------------------------------------------------------
+def apply_lens_psf(
+    hdr: np.ndarray,
+    glare: float = 0.4,
+    axial_scale: tuple[float, float, float] = (1.0, 1.0, 1.15),
+    tail: tuple[tuple[float, float], ...] = LENS_TAIL,
+) -> np.ndarray:
+    """镜头点扩散函数（PSF）：把每个点的光按"尖锐核心 + 长尾"摊开。
+
+    Args:
+        hdr: `(H, W, 3)` 线性 HDR RGB（场景光，已曝光）。允许任意非负值，不设阈值。
+        glare: 眩光强度 ε ∈ [0, 1]：每个点散射到长尾里的能量比例。0 = 理想镜头
+            （原样返回）；好镜头约 0.02，柔光镜（Pro-Mist 类）约 0.2~0.4；默认 0.4。
+        axial_scale: R/G/B 通道长尾核的半径倍率（轴向色差）：蓝光核略宽，高反差边缘
+            外侧自然出现淡蓝边。默认 (1, 1, 1.15)。
+        tail: 长尾核 `((d_k, w_k), ...)`：第 k 个高斯分量半径 = 画面高度 / d_k，
+            能量权重 w_k（Σ w_k = 1）。
+
+    Returns:
+        `(H, W, 3)` 线性 HDR，非负；总能量 ≤ 输入（差额为散射到画面外的光，
+        默认参数下 720p 约 1.6%）。成片大亮区内部基本不变，亮区外侧的暗处被摊入光晕。
+
+    Formula:
+        out_c = (1 − ε) · x_c + ε · (K_c ∗ x_c)
+        K_c = Σ_k w_k · G(r_k · s_c)，r_k = H / d_k，s_c = axial_scale[c]，
+        G(r) 为半径 r 的三次盒式模糊（≈ 高斯），边界补 0。
+
+    Physical Meaning:
+        真实镜头的成像是场景光与 PSF 的卷积：绝大部分能量落在中心一点，约 ε 的能量
+        因镜片散射、灰尘、滤镜形成平滑长尾（眩光 / 辉光）。线性、能量守恒、作用于所有
+        光——辉光只在背景足够暗处（天空、黑洞阴影）显著，这是对比度的结果，不需要阈值。
+        蓝光核略宽对应轴向色差，替代参考实现中单独叠加的"镶边"。
+
+    Simplifications:
+        PSF 视为空间不变（横向色差另由 `apply_lateral_ca` 处理）；长尾用 4 个高斯近似；
+        不模拟衍射星芒与鬼影。
+    """
+    if glare <= 0:
+        return hdr
+    h = hdr.shape[0]
+    out = np.empty_like(hdr)
+    for c, sc in enumerate(axial_scale):
+        ch = hdr[..., c : c + 1]
+        k = sum(w * _box_blur_zero(ch, max(1, int(h / d * sc))) for d, w in tail)
+        out[..., c : c + 1] = (1.0 - glare) * ch + glare * k
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -360,9 +403,18 @@ def srgb_encode(x: np.ndarray) -> np.ndarray:
 # 统一入口
 # ---------------------------------------------------------------------------
 def postfx_params_defaults() -> dict:
-    """S7 后处理默认参数（与参考实现预设 M 一致）。"""
+    """后处理默认参数。
+
+    `lens_model="psf"`（默认）只用 `lens_glare` / `axial_scale`；`bloom_*` / `fringe_*` 仅在
+    `lens_model="legacy"`（参考实现预设 M 的 bloom + 镶边）时生效。
+    """
     return {
-        "white_balance_K": 5000.0,
+        # 白平衡色温（ISP 层）：4000 K 的黑体显示为白色；参考实现为 5000 K（盘面整体偏暖黄）
+        "white_balance_K": 4000.0,
+        # 镜头模型："psf" = 能量守恒镜头 PSF（默认）；"legacy" = 阈值 bloom + 镶边（额外加光）
+        "lens_model": "psf",
+        # 眩光强度 ε：每个点散射到长尾的能量比例（柔光镜量级）
+        "lens_glare": 0.4,
         "bloom_threshold": 0.3,
         "bloom_gain": 4.0,
         # True = 按亮度扣阈值（保色度，默认）；False = 逐通道扣阈值（参考实现旧行为，光晕偏红）
@@ -380,17 +432,13 @@ def postfx_params_defaults() -> dict:
 def postfx(
     hdr: np.ndarray,
     exposure: float = 1.0,
-    auto_wb: bool = False,
-    auto_wb_warm_bias: float = 0.0,
     **params,
 ) -> np.ndarray:
-    """完整后处理链：曝光 → WB → bloom → 镶边 → 色散 → ACES → sRGB。
+    """完整后处理链：曝光 → WB → 镜头 PSF（或 legacy：bloom + 镶边）→ 横向色散 → ACES → sRGB。
 
     Args:
         hdr: `(H, W, 3)` 线性 HDR RGB。
         exposure: 曝光缩放。
-        auto_wb: True 时从 HDR 自动估计白平衡（忽略 `white_balance_K`）。
-        auto_wb_warm_bias: 自动 WB 的暖色偏移 `[0, 1]`（0 = 中性；0.1 ≈ Interstellar 金）。
         **params: 覆盖 `postfx_params_defaults` 中的参数。
 
     Returns:
@@ -398,14 +446,15 @@ def postfx(
     """
     p = {**postfx_params_defaults(), **params}
     x = hdr * exposure
-    if auto_wb:
-        gain = compute_auto_wb_gain(x, percentile=99.0, warm_bias=auto_wb_warm_bias)
-        x = x * gain[None, None, :]
+    x = apply_white_balance(x, p["white_balance_K"])
+    if p["lens_model"] == "psf":
+        x = apply_lens_psf(x, p["lens_glare"], p["axial_scale"])
+    elif p["lens_model"] == "legacy":
+        x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"],
+                        p["bloom_luma_threshold"])
+        x = apply_fringe(x, p["fringe_strength"], p["fringe_threshold"], p["fringe_color"])
     else:
-        x = apply_white_balance(x, p["white_balance_K"])
-    x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"],
-                    p["bloom_luma_threshold"])
-    x = apply_fringe(x, p["fringe_strength"], p["fringe_threshold"], p["fringe_color"])
+        raise ValueError(f"lens_model must be 'psf' or 'legacy', got {p['lens_model']!r}")
     x = apply_lateral_ca(x, p["lateral_ca"])
     x = tonemap_chroma_aces(x, p["white_blend"])
     x = adjust_saturation(x, p["saturation"])

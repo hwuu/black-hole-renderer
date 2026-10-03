@@ -45,15 +45,15 @@ v2.0–v2.2 曾用预烘焙贴图缓解 P1，但贴图只有极坐标两个维�
 ```
 +--------------------+     +----------------------+     +----------------------+
 | advection.py       |---->| taichi_impl.py       |---->| taichi_render.py     |
-| 刚体环相位表        |     | 体积密度场            |     | 测地线积分            |
-| (CPU float64)      |     | density_I            |     | 体积发射-吸收积分      |
+| rigid-ring phases  |     | volume density field |     | geodesic march       |
+| (CPU float64)      |     | density_I            |     | emission-absorption  |
 +--------------------+     +----------------------+     +----------------------+
           ^                           ^                            |
           |                           |                            v
 +--------------------+     +----------------------+     +----------------------+
 | render.py          |     | noise_ti.py          |     | postfx.py            |
-| 帧时间 / 相机       |     | 梯度噪声 / 级联噪声    |     | 白平衡 / bloom / 色散  |
-| 曝光锁定           |     | physical_fields.py   |     | ACES / sRGB 编码      |
+| frame time, camera |     | gradient / cascade   |     | lens PSF, WB,        |
+| exposure lock      |     | physical_fields.py   |     | ACES, sRGB encode    |
 +--------------------+     +----------------------+     +----------------------+
 ```
 
@@ -72,7 +72,7 @@ float64 计算每条带的转角、种子进度与周期索引并上传（GPU �
 | `advection.py` | 刚体环带常量表与每帧相位表 |
 | `taichi_impl.py` | 体积密度场、Taichi 端频移、光行时间相位换算、噪声与吸收系数标定 |
 | `taichi_render.py` | 渲染器：主光追核、超采样、曝光 |
-| `postfx.py` | 后处理链 |
+| `postfx.py` | 成像链：镜头 PSF、白平衡、色调映射、编码（见 [`imaging_model.md`](imaging_model.md)） |
 
 ### 3.2 结构场：盘"长什么样"
 
@@ -143,14 +143,11 @@ float64 计算每条带的转角、种子进度与周期索引并上传（GPU �
 - **曝光**：把盘区亮度（`L > 1e-4`）的 99.9 百分位映射到 0.9；天空以独立参数控制
   亮度，只有盘参与曝光计算。视频首帧计算后锁定曝光，避免逐帧亮度跳变。
 - **天空**：天空盒图像从 sRGB 编码解码为线性光、双线性采样；合成时
-  `x = 曝光·盘 + sky_gain·天空`，随后整体进入后处理（星点参与 bloom）。
-- **后处理链**：白平衡（von Kries 增益）→ 高光 bloom（HDR 域，只散射超过阈值的
-  亮度）→ 高光镶边 → 横向色散 → 保色度 ACES 色调映射 → sRGB 编码。参数与参考
-  实现一致，bloom 高光提取方式除外：
-  - 默认按亮度扣阈值并保持色度：`src = hdr·max(L − th, 0)/L`（`bloom_luma_threshold=True`）；
-  - 参考实现逐通道扣阈值 `src_c = max(hdr_c − th, 0)`（`False`）会让 G/B 偏低的金色像素在
-    散射光里只剩 R，叠回（×4 增益）后把金色区染成橙红。实测左侧金色像素 R:G:B 从
-    1 : 0.61 : 0.25 被 bloom 拉到 1 : 0.43 : 0.17；改为按亮度扣阈值后保持原色比例。
+  `x = 曝光·盘 + sky_gain·天空`，随后整体进入后处理（星点同样经过镜头 PSF）。
+- **后处理链**（按真实相机建模，原理、公式与实测见 [`imaging_model.md`](imaging_model.md)）：白平衡（von Kries，
+  默认 4000 K）→ 镜头 PSF（能量守恒长尾眩光 ε = 0.4 + 轴向色差）→ 横向色差 → 保色度 ACES → sRGB。
+  参考实现的"阈值 bloom + 镶边"会额外加光（散射光为提取光的 4 倍）并把盘面纹理复制叠加，导致辉光后面的
+  盘面被点亮，已替换；保留为 `lens_model="legacy"` 供对照（见 `imaging_model.md` §9）。
 - **视频**：帧时间 `t = 2000 + frame·dt`，`dt = P(r_in)/(v2_orbit_seconds·fps)`
   （`P` 为内缘轨道周期）；相机支持环绕模式。
 - **超采样**：以超采样倍率 N 的 `N×N` 倍内部分辨率积分后盒式下采样，配合首步随机偏移
@@ -172,7 +169,12 @@ float64 计算每条带的转角、种子进度与周期索引并上传（GPU �
 |----|------|----------|
 | 结构场 | 盘的几何与物质分布：标高、柱密度、噪声结构、平流 | `physical_fields.py`、`noise_ti.py`、`advection.py`、`taichi_impl.py` |
 | 辐射转移 | 温度、源函数、频移与发射-吸收积分 | `physical_fields.py`、`palette.py`、`relativity.py`、`taichi_render.py` |
-| 后处理 | 曝光、相机效应与显示编码 | `postfx.py`、`taichi_render.py` |
+| 镜头 | 点扩散函数：眩光长尾、轴向 / 横向色差（线性、能量守恒、作用于全部光） | `postfx.py` |
+| 传感器 | 曝光（盘区 p99.9 → 0.9，视频锁定） | `taichi_render.py` |
+| ISP | 白平衡、色调映射、饱和度、sRGB 编码 | `postfx.py` |
+
+结构场与辐射转移合称"场景光"；镜头、传感器、ISP 合称"成像链"（旧称"后处理"）。完整分层与参数归属见
+[`imaging_model.md`](imaging_model.md) §7。
 
 命名约定：同一概念在测试名、文档与代码注释中叫法一致；NumPy 参考函数与对应的
 Taichi 实现以 `_ti` 后缀区分，两者的一致性由单元测试逐值验证。

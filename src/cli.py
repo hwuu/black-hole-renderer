@@ -14,120 +14,140 @@ from src.v1.texture import compute_disk_texture_resolution
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Schwarzschild 黑洞光线追踪渲染器")
-    parser.add_argument("--pov", type=float, nargs=3, default=[6, 0, 0.5],
+    # 参数按成像模型分组（只影响 --help 显示，参数名与默认值不变；原理见 docs/imaging_model.md）
+    g_mode = parser.add_argument_group("通用：模式与设备")
+    g_struct = parser.add_argument_group("① 场景·结构：盘长什么样、怎么动（见 docs/imaging_model.md §2.2）")
+    g_rad = parser.add_argument_group("② 场景·辐射：盘发什么光（温度、频移、颜色；§2.3）")
+    g_sky = parser.add_argument_group("③ 场景·背景：星空（§2.4）")
+    g_cam = parser.add_argument_group("④ 相机：位置、视野、姿态、运动（§3）")
+    g_lens = parser.add_argument_group("⑤ 镜头：眩光与色差（§4）")
+    g_isp = parser.add_argument_group("⑥ 传感器与 ISP：曝光、白平衡、色调映射（§5、§6）")
+    g_solver = parser.add_argument_group("求解精度（非成像参数）")
+    g_out = parser.add_argument_group("输出与视频（非成像参数）")
+    g_v1 = parser.add_argument_group("V1 专用：程序纹理与旋转算法")
+    g_cam.add_argument("--pov", type=float, nargs=3, default=[6, 0, 0.5],
                         metavar=("X", "Y", "Z"),
                         help="相机位置 (default: 6 0 0.5)")
-    parser.add_argument("--fov", type=float, default=90,
+    g_cam.add_argument("--fov", type=float, default=90,
                         help="视野角度 0-180° (default: 90)")
-    parser.add_argument("--resolution", "-r", type=str, default="fhd",
+    g_cam.add_argument("--resolution", "-r", type=str, default="fhd",
                         choices=["4k", "fhd", "hd", "sd"],
                         help="分辨率: 4k/fhd/hd/sd (default: fhd)")
-    parser.add_argument("--texture", "-t", type=str, default=None,
+    g_sky.add_argument("--texture", "-t", type=str, default=None,
                         help="天空盒纹理路径")
-    parser.add_argument("--output", "-o", type=str, default="output/blackhole.png",
+    g_out.add_argument("--output", "-o", type=str, default="output/blackhole.png",
                         help="输出路径 (default: output/blackhole.png)")
-    parser.add_argument("--step_size", "-s", type=float, default=0.1,
+    g_solver.add_argument("--step_size", "-s", type=float, default=0.1,
                         help="积分步长 (default: 0.1)")
-    parser.add_argument("--r_max", type=float, default=10,
+    g_solver.add_argument("--r_max", type=float, default=10,
                         help="逃逸半径 (default: 10)")
-    parser.add_argument("--n_stars", type=int, default=6000,
+    g_sky.add_argument("--n_stars", type=int, default=6000,
                         help="程序天空盒恒星数 (default: 6000)")
-    parser.add_argument("--disk_texture", type=str, default=None,
+    g_v1.add_argument("--disk_texture", type=str, default=None,
                         help="吸积盘纹理路径 (default: 程序生成，仅静态单帧模式支持)")
-    parser.add_argument("--disk_generation_scale", type=int, default=2, choices=DISK_GENERATION_SCALE_CHOICES,
+    g_v1.add_argument("--disk_generation_scale", type=int, default=2, choices=DISK_GENERATION_SCALE_CHOICES,
                         help="[已废弃] 生命周期系统不使用此参数 (default: 2)")
-    parser.add_argument("--force_regenerate_disk_texture", action="store_true",
+    g_v1.add_argument("--force_regenerate_disk_texture", action="store_true",
                         help="[已废弃] 生命周期系统每次实时生成 (default: 关闭)")
-    parser.add_argument("--disk_inner_radius", "--ar1", dest="disk_inner_radius", type=float, default=R_DISK_INNER_DEFAULT,
+    g_struct.add_argument("--disk_inner_radius", "--ar1", dest="disk_inner_radius", type=float, default=R_DISK_INNER_DEFAULT,
                         help=f"吸积盘内半径 (default: {R_DISK_INNER_DEFAULT})")
-    parser.add_argument("--disk_outer_radius", "--ar2", dest="disk_outer_radius", type=float, default=R_DISK_OUTER_DEFAULT,
+    g_struct.add_argument("--disk_outer_radius", "--ar2", dest="disk_outer_radius", type=float, default=R_DISK_OUTER_DEFAULT,
                         help=f"吸积盘外半径 (default: {R_DISK_OUTER_DEFAULT})")
-    parser.add_argument("--disk_tilt", type=float, default=0.0,
+    g_struct.add_argument("--disk_tilt", type=float, default=0.0,
                         help="吸积盘倾角 (度, default: 0)")
-    parser.add_argument("--lens_flare", action="store_true",
+    g_lens.add_argument("--lens_flare", action="store_true",
                         help="启用 lens flare 效果 (default: 关闭)")
-    parser.add_argument("--anti_alias", type=str, default="disabled",
+    g_solver.add_argument("--anti_alias", type=str, default="disabled",
                         choices=["disabled", "lod_radius"],
                         help="抗锯齿算法: disabled(关闭), lod_radius(基于半径的启发式LOD) (default: disabled)")
-    parser.add_argument("--aa_strength", type=float, default=1.0,
+    g_solver.add_argument("--aa_strength", type=float, default=1.0,
                         help="抗锯齿强度，乘以 LOD 值。>1 更模糊(更强抗锯齿)，<1 更清晰。范围 0.5-2.0 (default: 1.0)")
-    parser.add_argument("--device", "-d", type=str, default="cpu",
+    g_mode.add_argument("--device", "-d", type=str, default="cpu",
                         choices=["cpu", "gpu"],
                         help="Taichi 设备: cpu 或 gpu (default: cpu)")
-    parser.add_argument("--ignore_taichi_cache", action="store_true",
+    g_mode.add_argument("--ignore_taichi_cache", action="store_true",
                         help="忽略 Taichi 离线缓存，强制重新编译 kernel (default: 关闭)")
-    parser.add_argument("--video", action="store_true",
+    g_out.add_argument("--video", action="store_true",
                         help="视频模式：渲染多帧并合成视频")
-    parser.add_argument("--interactive", action="store_true",
+    g_mode.add_argument("--interactive", action="store_true",
                         help="交互模式：实时预览，鼠标拖拽旋转，按键切换渲染开关")
-    parser.add_argument("--orbit", action="store_true",
+    g_cam.add_argument("--orbit", action="store_true",
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
-    parser.add_argument("--orbit_degrees", type=float, default=360.0,
+    g_cam.add_argument("--orbit_degrees", type=float, default=360.0,
                         help="轨道模式下整段视频的总旋转角度，支持负数反向旋转 (default: 360.0)")
-    parser.add_argument("--n_frames", type=int, default=3600,
+    g_out.add_argument("--n_frames", type=int, default=3600,
                         help="视频帧数 (default: 3600, 仅 --video 有效)")
-    parser.add_argument("--fps", type=int, default=36,
+    g_out.add_argument("--fps", type=int, default=36,
                         help="视频帧率 (default: 36, 仅 --video 有效)")
-    parser.add_argument("--resume", action="store_true",
+    g_out.add_argument("--resume", action="store_true",
                         help="视频模式：从断点恢复（默认从头开始）。V1 逐帧存 PNG；V2 每 240 帧存一个 mp4 分段，"
                              "中断后用同样参数加 --resume 重跑，最多重渲一段，参数变化时自动从头开始")
-    parser.add_argument("--disk_rotation_algorithm", type=str, default="baseline",
+    g_v1.add_argument("--disk_rotation_algorithm", type=str, default="baseline",
                         choices=["baseline", "parametric", "keyframes"],
                         help="[已废弃] 统一使用生命周期系统，此参数被忽略")
-    parser.add_argument("--disk_rotation_speed", type=float, default=0.1,
+    g_v1.add_argument("--disk_rotation_speed", type=float, default=0.1,
                         help="吸积盘旋转速度系数 (default: 0.1)")
-    parser.add_argument("--keyframes_count", type=int, default=10,
+    g_v1.add_argument("--keyframes_count", type=int, default=10,
                         help="[已废弃] 统一使用生命周期系统，此参数被忽略")
     # --- Disk V2 路径开关与参数（Phase 4 接入） ---
-    parser.add_argument("--disk_model", type=str, default="v1",
+    g_mode.add_argument("--disk_model", type=str, default="v1",
                         choices=["v1", "v2"],
                         help="吸积盘模型: v1（默认，零厚度倾斜平面 + 程序纹理）或 v2（有限厚度发射-吸收积分）")
-    parser.add_argument("--v2_opt", type=int, default=None, choices=[0, 1, 2, 3],
+    g_solver.add_argument("--v2_opt", type=int, default=None, choices=[0, 1, 2, 3],
                         help="V2 优化级别：0 参考实现；1 精确优化（输出与 0 一致）；2 盘内步长 ×2；"
                              "3 盘内步长 ×3（近似预览）。默认：单帧 1，视频 2")
-    parser.add_argument("--v2_supersample", type=int, default=None,
+    g_solver.add_argument("--v2_supersample", type=int, default=None,
                         help="V2 超采样倍率 N：每像素 N² 条光线取平均，用于抗锯齿。默认：单帧 2，视频 1")
-    parser.add_argument("--v2_sky_rot_deg_per_sec", type=float, default=0.0,
+    g_sky.add_argument("--v2_sky_rot_deg_per_sec", type=float, default=0.0,
                         help="V2 视频模式：天空方位自转速度（度/视频秒），正值使星空向画面右方漂移；0 关闭 (default: 0)")
-    parser.add_argument("--v2_disk_roll", type=float, default=0.0,
+    g_struct.add_argument("--v2_disk_roll", type=float, default=0.0,
                         help="V2 盘滚转角（度），绕世界 y 轴；相机在 -y 方向时正值使盘面画面上左低右高 (default: 0)")
-    parser.add_argument("--v2_thickness_scale", type=float, default=None,
+    g_struct.add_argument("--v2_thickness_scale", type=float, default=None,
                         help="V2 盘厚缩放：盘与烟雾层厚度同乘该值，柱密度不变；1 = 预设 M 视觉厚度"
                              "（与参考实现对齐），默认 1/9（H/r ≈ 0.003，接近物理量级）")
-    parser.add_argument("--v2_lum_temp_scale", type=float, default=None,
+    g_rad.add_argument("--v2_lum_temp_scale", type=float, default=None,
                         help="V2 亮度温度倍率 s：亮度按 Y(s·T)/Y(s·T_peak) 计算，色度不变；1 = 物理"
                              "（与参考实现对齐），默认 1.25（外盘更亮，贴盘面视角外盘不全黑）")
-    parser.add_argument("--v2_az_stretch", type=float, default=None,
+    g_struct.add_argument("--v2_az_stretch", type=float, default=None,
                         help="V2 主云方位拉长系数 s（≥ 0）：吸积盘絮状结构沿旋转方向的拉长程度。"
                              "s > 0 时方位周期随半径增长，使各半径的结构长宽比保持一致：1 = 长宽比约 4–5"
                              "（各半径一致，开普勒剪切下的物理形状）；>1 = 更拉长、流动感更强"
                              "（长宽比约与 s 成正比，1.5 时约 6–9）；0 = 方位周期固定（旧版，外圈结构被拉成长条、细节少）。"
                              "默认 1.5")
-    parser.add_argument("--v2_core_contrast", type=float, default=None,
+    g_struct.add_argument("--v2_core_contrast", type=float, default=None,
                         help="V2 主云明暗起伏系数 α（> 0）：缩放絮状结构的明暗对比，不改变结构形状。"
                              "1 = 原始起伏（颗粒感强）；越小越柔和，过小时外圈结构会被烟雾层的条纹盖过。"
                              "默认 0.4")
-    parser.add_argument("--v2_doppler_lum", type=float, default=None,
+    g_rad.add_argument("--v2_doppler_lum", type=float, default=None,
                         help="V2 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算"
                              "（g 为频移因子）。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗；"
                              "默认 0.25（预设 M 定稿为 0.55；本版减弱，视频构图下左右通量比约 3.7 → 1.7）")
-    parser.add_argument("--v2_doppler_color", type=float, default=None,
+    g_rad.add_argument("--v2_doppler_color", type=float, default=None,
                         help="V2 多普勒颜色强度 q（≥ 0）：逼近侧偏白、远离侧偏红的程度，色度按 χ(T·g^q) 计算，"
                              "且色度温度封顶到白平衡色温 5000 K（最亮处止于白色，不偏蓝）。1 = 物理；0 = 无多普勒变色；"
                              "默认 0.75（预设 M 定稿为 1.5；应与 --v2_doppler_lum 同步调，否则远离侧会又亮又红）")
-    parser.add_argument("--v2_color_floor", type=float, default=0.0,
+    g_lens.add_argument("--v2_lens_glare", type=float, default=None,
+                        help="V2 镜头眩光强度 ε（0–1）：镜头把每个点约 ε 的能量散射成平滑长尾（辉光），"
+                             "能量守恒、作用于全部光、无阈值；辉光只在暗处（天空、黑洞阴影）显著，盘面不会被点亮。"
+                             "0 = 理想镜头（无辉光）；好镜头约 0.02，柔光镜约 0.2–0.4；越大辉光越明显，"
+                             "全画面对比度按 (1 − ε) 下降。原理见 docs/imaging_model.md (default: 0.4)")
+    g_rad.add_argument("--v2_color_floor", type=float, default=0.0,
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
                              "建议 2500–3000；0 = 不设下限 (default: 0)")
-    parser.add_argument("--v2_camera_roll", type=float, default=0.0,
+    g_isp.add_argument("--v2_white_balance", type=float, default=None,
+                       help="V2 相机白平衡色温（K，1000–40000）：色温为该值的黑体显示为白色；盘面主体约 3000–5000 K。"
+                            "调低 → 盘面更白更冷，调高 → 更暖更黄（参考实现 5000 K 偏暖黄）。色温封顶自动跟随，"
+                            "最亮处始终止于白色。曝光自动（盘区亮度 p99.9 → 0.9，视频首帧锁定）(default: 4000)")
+    g_cam.add_argument("--v2_camera_roll", type=float, default=0.0,
                         help="V2 相机滚转角（度）：相机绕自身光轴旋转，整个画面（吸积盘与星空）一起倾斜；"
                              "在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向。"
                              "与 --v2_disk_roll（盘面绕世界 y 轴、星空不随动、环绕时倾角漂移）不同 (default: 0)")
-    parser.add_argument("--v2_reverse_rotation", action="store_true",
+    g_struct.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
-    parser.add_argument("--v2_sky_gain", type=float, default=0.5,
+    g_sky.add_argument("--v2_sky_gain", type=float, default=0.5,
                         help="V2 天空亮度系数（线性光，曝光之后叠加，不影响盘曝光；0 = 黑天空）(default: 0.5)")
-    parser.add_argument("--v2_orbit_seconds", type=float, default=16.0,
+    g_struct.add_argument("--v2_orbit_seconds", type=float, default=16.0,
                         help="V2 视频模式：内缘开普勒轨道对应视频秒数 (default: 16.0)")
     return parser.parse_args()
 
@@ -234,7 +254,7 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--device`；
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--device`；
                 两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
@@ -268,6 +288,8 @@ def main():
             **({} if args.v2_doppler_lum is None else {"doppler_lum": args.v2_doppler_lum}),
             **({} if args.v2_doppler_color is None else {"doppler_color": args.v2_doppler_color}),
             color_temp_floor_K=args.v2_color_floor,
+            **({} if args.v2_lens_glare is None else {"lens_glare": args.v2_lens_glare}),
+            **({} if args.v2_white_balance is None else {"white_balance_K": args.v2_white_balance}),
             opt_level=opt,
             device=args.device,
         )

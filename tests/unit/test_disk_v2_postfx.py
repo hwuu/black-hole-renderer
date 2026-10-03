@@ -10,6 +10,8 @@
 - 保色度 ACES：色度保持、超色域向白混合
 - sRGB 编码正确性
 - postfx 全链路可运行
+- 镜头 PSF（默认镜头模型）：ε=0 恒等、线性无阈值、能量守恒、成片亮区内部不变、
+  点光源核心变暗且外围出现光晕、蓝光晕更宽（轴向色差）、legacy 链与旧公式逐位一致
 """
 
 import os
@@ -22,9 +24,11 @@ import numpy as np
 
 from src.v2.postfx import (
     _box_blur,
+    adjust_saturation,
     apply_bloom,
     apply_fringe,
     apply_lateral_ca,
+    apply_lens_psf,
     apply_white_balance,
     postfx,
     postfx_params_defaults,
@@ -192,9 +196,11 @@ class PostfxPipelineTest(unittest.TestCase):
         self.assertEqual(out.shape, (32, 48, 3))
 
     def test_default_params_match_reference(self):
-        """默认参数与参考实现预设 M 一致。"""
+        """默认镜头模型为能量守恒 PSF（ε = 0.4）；legacy 参数仍与参考实现预设 M 一致。"""
         p = postfx_params_defaults()
-        self.assertAlmostEqual(p["white_balance_K"], 5000.0)
+        self.assertEqual(p["lens_model"], "psf")
+        self.assertAlmostEqual(p["lens_glare"], 0.4)
+        self.assertAlmostEqual(p["white_balance_K"], 4000.0)
         self.assertAlmostEqual(p["bloom_threshold"], 0.3)
         self.assertAlmostEqual(p["bloom_gain"], 4.0)
         self.assertAlmostEqual(p["axial_scale"][2], 1.15)
@@ -208,6 +214,73 @@ class PostfxPipelineTest(unittest.TestCase):
         out_lo = postfx(hdr, exposure=0.5).mean()
         out_hi = postfx(hdr, exposure=2.0).mean()
         self.assertGreater(out_hi, out_lo)
+
+
+class LensPSFTest(unittest.TestCase):
+    """镜头 PSF：out = (1 − ε)·x + ε·(K ∗ x)，能量守恒、线性、无阈值。"""
+
+    # 单一小半径长尾（半径 = H/40），便于在画面内部精确检验能量守恒
+    SMALL_TAIL = ((40.0, 1.0),)
+
+    def test_zero_glare_identity(self):
+        """ε = 0 = 理想镜头，原样返回。"""
+        x = np.random.default_rng(1).uniform(0, 3, (32, 32, 3))
+        self.assertIs(apply_lens_psf(x, glare=0.0), x)
+
+    def test_linear_no_threshold(self):
+        """线性：lens(a·x) = a·lens(x)；暗光与亮光按同一比例散射（无阈值）。"""
+        x = np.random.default_rng(2).uniform(0, 1, (64, 64, 3))
+        np.testing.assert_allclose(apply_lens_psf(3.0 * x, 0.4), 3.0 * apply_lens_psf(x, 0.4), rtol=1e-12)
+
+    def test_energy_never_increases(self):
+        """能量只减不增（补 0：散射到画面外的光丢失），且至少保留 (1 − ε)。"""
+        x = np.random.default_rng(3).uniform(0, 2, (90, 120, 3))
+        out = apply_lens_psf(x, 0.4)
+        for c in range(3):
+            self.assertLessEqual(out[..., c].sum(), x[..., c].sum() * (1 + 1e-12))
+            self.assertGreaterEqual(out[..., c].sum(), 0.6 * x[..., c].sum())
+
+    def test_energy_conserved_away_from_edges(self):
+        """光源远离画面边缘时总能量严格守恒（光只被搬运）。"""
+        x = np.zeros((400, 400, 3)); x[195:205, 195:205] = 2.0
+        out = apply_lens_psf(x, 0.4, axial_scale=(1.0, 1.0, 1.0), tail=self.SMALL_TAIL)
+        np.testing.assert_allclose(out.sum(), x.sum(), rtol=1e-9)
+
+    def test_uniform_region_interior_unchanged(self):
+        """成片均匀亮区内部不变：散射出去的光与散射进来的光抵消（不会被"点亮"）。"""
+        x = np.full((400, 400, 3), 0.5)
+        out = apply_lens_psf(x, 0.4, axial_scale=(1.0, 1.0, 1.0), tail=self.SMALL_TAIL)
+        np.testing.assert_allclose(out[150:250, 150:250], 0.5, rtol=1e-9)
+
+    def test_point_source_core_dims_and_halo_appears(self):
+        """点光源：核心按 (1 − ε) 量级变暗，周围暗处出现光晕。"""
+        x = np.zeros((400, 400, 3)); x[200, 200] = 100.0
+        out = apply_lens_psf(x, 0.4, axial_scale=(1.0, 1.0, 1.0), tail=self.SMALL_TAIL)
+        self.assertLess(out[200, 200, 1], 100.0 * 0.61)
+        self.assertGreater(out[200, 210, 1], 0.0)
+
+    def test_blue_halo_wider(self):
+        """轴向色差：白色点光源外围蓝光晕比绿光晕延伸更远。"""
+        x = np.zeros((400, 400, 3)); x[200, 200] = 100.0
+        out = apply_lens_psf(x, 0.4, axial_scale=(1.0, 1.0, 1.15), tail=self.SMALL_TAIL)
+        far = out[200, 200 + 33]   # 绿核外沿之外、蓝核之内
+        self.assertGreater(far[2], far[1])
+
+    def test_postfx_legacy_matches_old_chain(self):
+        """lens_model="legacy" 与旧链（WB → bloom → 镶边 → CA → ACES → sRGB）逐位一致。"""
+        hdr = np.random.default_rng(4).uniform(0, 2, (48, 64, 3))
+        p = postfx_params_defaults()
+        x = apply_white_balance(hdr * 0.7, p["white_balance_K"])
+        x = apply_bloom(x, p["bloom_threshold"], p["bloom_gain"], p["axial_scale"], p["bloom_luma_threshold"])
+        x = apply_fringe(x, p["fringe_strength"], p["fringe_threshold"], p["fringe_color"])
+        x = apply_lateral_ca(x, p["lateral_ca"])
+        x = adjust_saturation(tonemap_chroma_aces(x, p["white_blend"]), p["saturation"])
+        ref = (np.clip(srgb_encode(x), 0, 1) * 255 + 0.5).astype(np.uint8)
+        np.testing.assert_array_equal(postfx(hdr, exposure=0.7, lens_model="legacy"), ref)
+
+    def test_invalid_lens_model_raises(self):
+        with self.assertRaises(ValueError):
+            postfx(np.zeros((8, 8, 3)), lens_model="foo")
 
 
 if __name__ == "__main__":

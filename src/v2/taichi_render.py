@@ -62,14 +62,22 @@ class DiskV2Renderer:
         doppler_color: 多普勒颜色强度 q（≥ 0）：色度用 `χ(min(T·g^q, T_cap))`；1 = 物理，0 = 无多普勒变色。
             默认 0.75（预设 M 定稿 1.5；随亮度指数同步减弱，避免远离侧"又亮又红"）。
         color_temp_cap_K: 颜色温度上限 T_cap（K）：色度温度超过它时取 T_cap，使最亮处止于白色、不越过
-            白点变蓝（颜色序列 黑 → 暗红 → 金 → 白）。默认 None = 后处理白平衡色温
-            （`postfx_params_defaults()["white_balance_K"]`，5000 K，即白平衡下显示为白色的温度）；
-            0 = 不封顶（参考实现）。只影响色度，不影响亮度。
+            白点变蓝（颜色序列 黑 → 暗红 → 金 → 白）。默认 None = 跟随白平衡色温 `white_balance_K`
+            （白平衡下显示为白色的温度）；0 = 不封顶（参考实现）。只影响色度，不影响亮度。
+        white_balance_K: 相机白平衡色温（K，1000–40000，ISP 层）：色温为该值的黑体显示为白色。None = `postfx`
+            默认 4000 K（盘面主体 3000–5000 K 呈浅金、最热处为白）；参考实现为 5000 K（整体偏暖黄）。
+            调低 → 盘面更白、更冷；调高 → 更暖、更黄。
         color_temp_floor_K: 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），
             使冷区不再显示为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。
             0 = 不设下限（参考实现）。只影响色度，不影响亮度。
-        bloom_luma_threshold: bloom 高光提取方式（传给 `postfx.apply_bloom`）：True（默认）= 按亮度扣阈值、
+        bloom_luma_threshold: bloom 高光提取方式（仅 `lens_model="legacy"` 时生效，传给 `postfx.apply_bloom`）：True（默认）= 按亮度扣阈值、
             散射光保持像素色度；False = 逐通道扣阈值（参考实现旧行为，金色区的光晕偏橙红）。
+        lens_model: 镜头模型：`"psf"`（默认）= 能量守恒镜头 PSF（眩光长尾 + 轴向色差，作用于全部
+            场景光、无阈值，见 `docs/imaging_model.md`）；`"legacy"` = 参考实现的阈值 bloom + 镶边
+            （会额外加光、点亮辉光后面的盘面，仅作对照）。
+        lens_glare: 镜头眩光强度 ε ∈ [0, 1]（`lens_model="psf"` 时生效）：每个点散射到长尾的能量比例。
+            None = `postfx` 默认 0.4（柔光镜量级）；0 = 理想镜头（无辉光）。越大辉光越明显，同时
+            全画面对比度按 (1 − ε) 下降。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
         ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
@@ -93,8 +101,11 @@ class DiskV2Renderer:
         doppler_lum: float = 0.25,
         doppler_color: float = 0.75,
         color_temp_cap_K: Optional[float] = None,
+        white_balance_K: Optional[float] = None,
         color_temp_floor_K: float = 0.0,
         bloom_luma_threshold: bool = True,
+        lens_model: str = "psf",
+        lens_glare: Optional[float] = None,
         sky_gain: float = 0.5,
         ss: int = 1,
         opt_level: int = 0,
@@ -115,8 +126,14 @@ class DiskV2Renderer:
         self.doppler_lum = float(doppler_lum)
         self.doppler_color = float(doppler_color)
         # 颜色温度上限（K）；0 = 不封顶。kernel 内 T_col = min(T·g^q, cap)
+        # 白平衡（ISP 层）；None = postfx 默认。色温封顶默认跟随白平衡，保证最亮处止于白色
+        if white_balance_K is None:
+            white_balance_K = float(postfx_params_defaults()["white_balance_K"])
+        if not 1000.0 <= white_balance_K <= 40000.0:
+            raise ValueError("white_balance_K must be in [1000, 40000] (blackbody LUT range)")
+        self.white_balance_K = float(white_balance_K)
         if color_temp_cap_K is None:
-            color_temp_cap_K = float(postfx_params_defaults()["white_balance_K"])
+            color_temp_cap_K = self.white_balance_K
         if color_temp_cap_K < 0.0:
             raise ValueError("color_temp_cap_K must be >= 0 (0 = no cap)")
         self.color_temp_cap_K = float(color_temp_cap_K)
@@ -127,6 +144,13 @@ class DiskV2Renderer:
             raise ValueError("color_temp_floor_K must be <= color_temp_cap_K")
         self.color_temp_floor_K = float(color_temp_floor_K)
         self.bloom_luma_threshold = bool(bloom_luma_threshold)
+        if lens_model not in ("psf", "legacy"):
+            raise ValueError("lens_model must be 'psf' or 'legacy'")
+        if lens_glare is not None and not 0.0 <= lens_glare <= 1.0:
+            raise ValueError("lens_glare must be in [0, 1]")
+        self.lens_model = lens_model
+        # None = 用 postfx 默认值
+        self.lens_glare = None if lens_glare is None else float(lens_glare)
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
@@ -536,7 +560,11 @@ class DiskV2Renderer:
         x = hdr * exposure
         if sky is not None:
             x = x + self.sky_gain * sky
-        img = postfx(x, exposure=1.0, bloom_luma_threshold=self.bloom_luma_threshold)
+        fx = {"bloom_luma_threshold": self.bloom_luma_threshold, "lens_model": self.lens_model,
+              "white_balance_K": self.white_balance_K}
+        if self.lens_glare is not None:
+            fx["lens_glare"] = self.lens_glare
+        img = postfx(x, exposure=1.0, **fx)
         self.last_white_point = 1.0 / exposure if exposure > 0 else 1.0
         return img.astype(np.float32) / 255.0
 

@@ -85,7 +85,7 @@ def run_v2(w: int, h: int, ss: int, t: float = T_FRAME) -> tuple[np.ndarray, np.
         volume_params=DiskV2VolumeParams(thickness_scale=1.0, lum_temp_scale=1.0, core_az_stretch=0.0,
                                          core_oct_gain=1.0, band_seam_fix=False, core_contrast=1.0,
                                          outer_detail_fade=1.0),
-        doppler_lum=0.55, doppler_color=1.5, color_temp_cap_K=0.0, bloom_luma_threshold=False,
+        doppler_lum=0.55, doppler_color=1.5, color_temp_cap_K=0.0, bloom_luma_threshold=False, lens_model="legacy", white_balance_K=5000.0,
         r_max=90.0, sky_gain=0.0, ss=ss,
     )
     e = math.radians(CAM_ELEV_DEG)
