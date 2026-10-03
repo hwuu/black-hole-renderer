@@ -12,18 +12,28 @@ def build_camera_v1_compatible(
     fov_deg: float,
     width: int,
     height: int,
+    camera_roll_deg: float = 0.0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, np.ndarray]:
-    """构建与 V1 `render.build_camera` 相同的相机基向量与像素步长。
+    """构建与 V1 `render.build_camera` 相同的相机基向量与像素步长，可选绕光轴滚转。
 
     Args:
         cam_pos: 相机位置 `[x, y, z]`（Schwarzschild 几何单位 `r_s`）。
         fov_deg: 垂直方向 FOV（度），与 V1 CLI `--fov` 一致。
         width: 图像宽度（像素）。
         height: 图像高度（像素）。
+        camera_roll_deg: 相机滚转角 ρ（度）：相机绕自身光轴（forward）旋转。
+            在画面坐标系中生效，环绕（orbit）过程中倾斜恒定；+12.5° 为画面左低右高，
+            负值反向。0 = 与 V1 `build_camera` 完全一致。
 
     Returns:
         `(cam_pos, cam_right, cam_up, cam_forward, pixel_width, pixel_height, top_left)`
         其中 `top_left` 为 V1 光追内核使用的图像平面左上角世界坐标。
+
+    Formula:
+        r' = cos ρ · r − sin ρ · u
+        u' = sin ρ · r + cos ρ · u
+        （右手系绕 forward 轴旋转 ρ；世界点在画面中随基向量反向转动，
+        +ρ 使画面右侧内容上移 → 左低右高）
     """
     cam_pos_arr = np.asarray(cam_pos, dtype=np.float64)
     cam_forward = -cam_pos_arr / np.linalg.norm(cam_pos_arr)
@@ -37,6 +47,14 @@ def build_camera_v1_compatible(
         cam_right /= rn
     cam_up = np.cross(cam_right, cam_forward)
     cam_up /= np.linalg.norm(cam_up)
+
+    # 相机滚转：基向量 (right, up) 绕 forward 轴旋转（画面系固定，orbit 时倾斜恒定）
+    roll = np.radians(camera_roll_deg)
+    if roll != 0.0:
+        cam_right, cam_up = (
+            np.cos(roll) * cam_right - np.sin(roll) * cam_up,
+            np.sin(roll) * cam_right + np.cos(roll) * cam_up,
+        )
 
     fov_rad = np.radians(fov_deg)
     aspect = width / height

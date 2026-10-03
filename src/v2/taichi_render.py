@@ -51,7 +51,10 @@ class DiskV2Renderer:
         r_max: 逃逸半径下限；实际 `r_escape = max(r_max, 2·cam_distance, 1.6·r_out)`。
         disk_tilt_deg: 盘倾角（度），盘面绕世界 x 轴旋转（俯仰）。
         disk_roll_deg: 盘滚转角（度），盘面绕世界 y 轴旋转；相机位于 y 轴负方向时，
-            正值使盘面在画面上左低右高。
+            正值使盘面在画面上左低右高。注意：滚转固定在世界系，环绕过程中画面倾角
+            会漂移（起始 ρ° → 环绕 90° 时变为开口角变化 → 180° 时反向）。
+        camera_roll_deg: 相机滚转角 ρ（度）：相机绕自身光轴旋转，整个画面（盘与星空）
+            一起倾斜；在画面系中生效，环绕过程中倾角恒定。+12.5° 为画面左低右高；0 = 不滚转。
         doppler_lum: 多普勒亮度强度 p（≥ 0）：亮度用 `Y(s·g^{p·k}·T)`；1 = 物理，0 = 无多普勒明暗；
             默认 0.25（预设 M 定稿 0.55；减弱左右明暗不对称，视频构图下左右通量比约 3.7 → 1.7）。s 为
             `volume_params.lum_temp_scale`，k = `palette.doppler_lum_compensation(T_peak, s)`
@@ -86,6 +89,7 @@ class DiskV2Renderer:
         r_max: float = 10.0,
         disk_tilt_deg: float = 0.0,
         disk_roll_deg: float = 0.0,
+        camera_roll_deg: float = 0.0,
         doppler_lum: float = 0.25,
         doppler_color: float = 0.75,
         color_temp_cap_K: Optional[float] = None,
@@ -107,6 +111,7 @@ class DiskV2Renderer:
         self.r_max = float(r_max)
         self.disk_tilt_rad = math.radians(disk_tilt_deg)
         self.disk_roll_rad = math.radians(disk_roll_deg)
+        self.camera_roll_deg = float(camera_roll_deg)
         self.doppler_lum = float(doppler_lum)
         self.doppler_color = float(doppler_color)
         # 颜色温度上限（K）；0 = 不封顶。kernel 内 T_col = min(T·g^q, cap)
@@ -432,7 +437,7 @@ class DiskV2Renderer:
             fov: 竖直视野角（度）。
         """
         cam_pos_arr, right, up, forward, pixel_width, pixel_height, _top_left = (
-            build_camera_v1_compatible(cam_pos, fov, self._iw, self._ih)
+            build_camera_v1_compatible(cam_pos, fov, self._iw, self._ih, self.camera_roll_deg)
         )
         self.cam_pos_field[None] = cam_pos_arr.astype(np.float32).tolist()
         self.cam_right_field[None] = right.astype(np.float32).tolist()

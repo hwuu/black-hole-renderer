@@ -119,6 +119,10 @@ def parse_args() -> argparse.Namespace:
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
                              "建议 2500–3000；0 = 不设下限 (default: 0)")
+    parser.add_argument("--v2_camera_roll", type=float, default=0.0,
+                        help="V2 相机滚转角（度）：相机绕自身光轴旋转，整个画面（吸积盘与星空）一起倾斜；"
+                             "在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向。"
+                             "与 --v2_disk_roll（盘面绕世界 y 轴、星空不随动、环绕时倾角漂移）不同 (default: 0)")
     parser.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     parser.add_argument("--v2_sky_gain", type=float, default=0.5,
@@ -230,7 +234,7 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--device`；
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--device`；
                 两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
@@ -258,6 +262,7 @@ def main():
             r_max=max(args.r_max, 50.0),
             disk_tilt_deg=args.disk_tilt,
             disk_roll_deg=args.v2_disk_roll,
+            camera_roll_deg=args.v2_camera_roll,
             sky_gain=args.v2_sky_gain,
             ss=ss,
             **({} if args.v2_doppler_lum is None else {"doppler_lum": args.v2_doppler_lum}),
