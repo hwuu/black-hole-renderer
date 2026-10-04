@@ -40,9 +40,30 @@ class V2VolumeOverridesTest(unittest.TestCase):
         self.assertIsNone(_args().v2_doppler_lum)
 
     def test_explicit_flags_collected(self):
-        a = _args("--v2_az_stretch", "1.0", "--v2_core_contrast", "0.6", "--v2_doppler_lum", "0.45")
-        self.assertEqual(cli.v2_volume_overrides(a), {"core_az_stretch": 1.0, "core_contrast": 0.6})
+        a = _args("--v2_thickness_scale", "1.0", "--v2_core_contrast", "0.6", "--v2_doppler_lum", "0.45")
+        self.assertEqual(cli.v2_volume_overrides(a), {"thickness_scale": 1.0, "core_contrast": 0.6})
         self.assertEqual(a.v2_doppler_lum, 0.45)
+
+    def test_atmosphere_flags_collected(self):
+        a = _args("--v2_atm_frac", "0.2", "--v2_atm_height", "0.015", "--v2_atm_fine", "0")
+        self.assertEqual(cli.v2_volume_overrides(a),
+                         {"atm_frac": 0.2, "atm_height": 0.015, "atm_fine_sigma": 0.0})
+
+    def test_atmosphere_overrides_build_params(self):
+        """覆盖项可直接构造 DiskV2VolumeParams（字段名有效、取值通过校验）。"""
+        from src.v2.params import DiskV2VolumeParams
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(
+            _args("--v2_atm_frac", "0.3", "--v2_atm_height", "0.02", "--v2_atm_fine", "0.7")))
+        self.assertEqual((vp.atm_frac, vp.atm_height, vp.atm_fine_sigma), (0.3, 0.02, 0.7))
+
+    def test_exposure_ev_flag(self):
+        self.assertIsNone(_args().v2_exposure_ev)
+        self.assertEqual(_args("--v2_exposure_ev", "0.5").v2_exposure_ev, 0.5)
+
+    def test_az_stretch_flag_removed(self):
+        """旧主云级联已删除，`--v2_az_stretch` 不再接受。"""
+        with self.assertRaises(SystemExit):
+            _args("--v2_az_stretch", "1.0")
 
 
 if __name__ == "__main__":

@@ -103,42 +103,52 @@ def parse_args() -> argparse.Namespace:
     g_struct.add_argument("--v2_disk_roll", type=float, default=0.0,
                         help="V2 盘滚转角（度），绕世界 y 轴；相机在 -y 方向时正值使盘面画面上左低右高 (default: 0)")
     g_struct.add_argument("--v2_thickness_scale", type=float, default=None,
-                        help="V2 盘厚缩放：盘与烟雾层厚度同乘该值，柱密度不变；1 = 预设 M 视觉厚度"
-                             "（与参考实现对齐），默认 1/9（H/r ≈ 0.003，接近物理量级）")
+                        help="V2 盘厚缩放：盘面（高斯核心）标高乘该值，柱密度不变，不影响大气标高；"
+                             "1 = 预设 M 视觉厚度（与参考实现对齐），默认 1/9（H/r ≈ 0.003，接近物理量级）")
     g_rad.add_argument("--v2_lum_temp_scale", type=float, default=None,
                         help="V2 亮度温度倍率 s：亮度按 Y(s·T)/Y(s·T_peak) 计算，色度不变；1 = 物理"
                              "（与参考实现对齐），默认 1.25（外盘更亮，贴盘面视角外盘不全黑）")
-    g_struct.add_argument("--v2_az_stretch", type=float, default=None,
-                        help="V2 主云方位拉长系数 s（≥ 0）：吸积盘絮状结构沿旋转方向的拉长程度。"
-                             "s > 0 时方位周期随半径增长，使各半径的结构长宽比保持一致：1 = 长宽比约 4–5"
-                             "（各半径一致，开普勒剪切下的物理形状）；>1 = 更拉长、流动感更强"
-                             "（长宽比约与 s 成正比，1.5 时约 6–9）；0 = 方位周期固定（旧版，外圈结构被拉成长条、细节少）。"
-                             "默认 1.5")
     g_struct.add_argument("--v2_core_contrast", type=float, default=None,
                         help="V2 主云明暗起伏系数 α（> 0）：缩放絮状结构的明暗对比，不改变结构形状。"
-                             "1 = 原始起伏（颗粒感强）；越小越柔和，过小时外圈结构会被烟雾层的条纹盖过。"
-                             "默认 0.4")
+                             "1 = 原始起伏；越小越柔和。默认 0.8")
+    g_struct.add_argument("--v2_atm_frac", type=float, default=None,
+                        help="V2 大气柱密度比 A（≥ 0）：盘面上方大气（指数尾巴）的柱密度 / 盘面核心柱密度。"
+                             "大气与盘面是同一团气体、跟随同一湍流结构，稀处出现空隙；越大大气越浓、盘面越朦胧，"
+                             "贴盘面或盘内视角的金色云雾越明显。0 = 无大气（只剩薄盘面）。默认 0.15"
+                             "（r = 22 处大气竖直光学深度约 0.06，约一半面积是空隙）")
+    g_struct.add_argument("--v2_atm_height", type=float, default=None,
+                        help="V2 大气标高 H_a/r（> 0）：大气密度随高度按 exp(−|z|/H_a) 衰减，越大大气越蓬松、"
+                             "伸得越高（盘的视觉厚度随之增加）。不随 --v2_thickness_scale 缩放。"
+                             "默认 0.01（约为盘面核心标高的 3 倍）")
+    g_struct.add_argument("--v2_atm_fine", type=float, default=None,
+                        help="V2 大气小尺度起伏强度 σ_a（≥ 0）：大气密度乘保均值的对数正态起伏 exp(σ_a·n − σ_a²/2)，"
+                             "使大气随高度与下方盘面逐渐脱离、形成独立的小云团。0 = 大气完全跟随盘面结构；"
+                             "越大云团越碎、反差越强（≥ 0.8 时相机易落入整团浓雾）。默认 0.5")
     g_rad.add_argument("--v2_doppler_lum", type=float, default=None,
                         help="V2 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算"
                              "（g 为频移因子）。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗；"
                              "默认 0.25（预设 M 定稿为 0.55；本版减弱，视频构图下左右通量比约 3.7 → 1.7）")
     g_rad.add_argument("--v2_doppler_color", type=float, default=None,
                         help="V2 多普勒颜色强度 q（≥ 0）：逼近侧偏白、远离侧偏红的程度，色度按 χ(T·g^q) 计算，"
-                             "且色度温度封顶到白平衡色温 5000 K（最亮处止于白色，不偏蓝）。1 = 物理；0 = 无多普勒变色；"
+                             "且色度温度封顶到白平衡色温（最亮处止于白色，不偏蓝）。1 = 物理；0 = 无多普勒变色；"
                              "默认 0.75（预设 M 定稿为 1.5；应与 --v2_doppler_lum 同步调，否则远离侧会又亮又红）")
     g_lens.add_argument("--v2_lens_glare", type=float, default=None,
                         help="V2 镜头眩光强度 ε（0–1）：镜头把每个点约 ε 的能量散射成平滑长尾（辉光），"
                              "能量守恒、作用于全部光、无阈值；辉光只在暗处（天空、黑洞阴影）显著，盘面不会被点亮。"
-                             "0 = 理想镜头（无辉光）；好镜头约 0.02，柔光镜约 0.2–0.4；越大辉光越明显，"
-                             "全画面对比度按 (1 − ε) 下降。原理见 docs/imaging_model.md (default: 0.4)")
+                             "0 = 理想镜头（无辉光）；好镜头约 0.02，柔光镜约 0.2–0.5；越大辉光越明显，"
+                             "全画面对比度按 (1 − ε) 下降。原理见 docs/imaging_model.md (default: 0.5)")
     g_rad.add_argument("--v2_color_floor", type=float, default=0.0,
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
                              "建议 2500–3000；0 = 不设下限 (default: 0)")
     g_isp.add_argument("--v2_white_balance", type=float, default=None,
                        help="V2 相机白平衡色温（K，1000–40000）：色温为该值的黑体显示为白色；盘面主体约 3000–5000 K。"
-                            "调低 → 盘面更白更冷，调高 → 更暖更黄（参考实现 5000 K 偏暖黄）。色温封顶自动跟随，"
-                            "最亮处始终止于白色。曝光自动（盘区亮度 p99.9 → 0.9，视频首帧锁定）(default: 4000)")
+                            "调低 → 盘面更白更冷（4000 K 偏惨白），调高 → 更暖更黄（参考实现 5000 K 偏暖黄）。"
+                            "色温封顶自动跟随，最亮处始终止于白色 (default: 4500)")
+    g_isp.add_argument("--v2_exposure_ev", type=float, default=None,
+                       help="V2 曝光补偿（档）：自动曝光（盘区亮度 p99.9 → 0.9，视频首帧锁定）之后再乘 2^EV。"
+                            "0 = 画面无过曝，最亮处只到浅金、缺少发光感；+1.5 = 内盘约 2%% 的像素烧白、"
+                            "镜头辉光随之增强（类《星际穿越》）；负值更暗 (default: 1.5)")
     g_cam.add_argument("--v2_camera_roll", type=float, default=0.0,
                         help="V2 相机滚转角（度）：相机绕自身光轴旋转，整个画面（吸积盘与星空）一起倾斜；"
                              "在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向。"
@@ -176,14 +186,15 @@ def v2_volume_overrides(args) -> dict:
     """收集 CLI 显式传入的 V2 体积参数覆盖项（未传入的保持 `DiskV2VolumeParams` 默认值）。
 
     Args:
-        args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_az_stretch`、
-            `--v2_core_contrast`，None = 未传入）。
+        args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_core_contrast`、
+            `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`，None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
     """
     fields = {"thickness_scale": args.v2_thickness_scale, "lum_temp_scale": args.v2_lum_temp_scale,
-              "core_az_stretch": args.v2_az_stretch, "core_contrast": args.v2_core_contrast}
+              "core_contrast": args.v2_core_contrast, "atm_frac": args.v2_atm_frac,
+              "atm_height": args.v2_atm_height, "atm_fine_sigma": args.v2_atm_fine}
     return {k: v for k, v in fields.items() if v is not None}
 
 
@@ -254,14 +265,14 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--device`；
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--v2_exposure_ev/--device`；
                 两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
                 （单帧 2、视频 1）未显式传入时的默认值。
 
         Returns:
-            `DiskV2Renderer`，体积模型参数为预设 M（`DiskV2VolumeParams()` 默认值）。
+            `DiskV2Renderer`，体积模型参数为 `DiskV2VolumeParams()` 默认值叠加 CLI 显式覆盖项（`v2_volume_overrides`）。
 
         Notes:
             逃逸半径下限取 `max(--r_max, 50)`；渲染器内部再与 `2·相机距离`、`1.6·r_out` 取大。
@@ -290,6 +301,7 @@ def main():
             color_temp_floor_K=args.v2_color_floor,
             **({} if args.v2_lens_glare is None else {"lens_glare": args.v2_lens_glare}),
             **({} if args.v2_white_balance is None else {"white_balance_K": args.v2_white_balance}),
+            **({} if args.v2_exposure_ev is None else {"exposure_ev": args.v2_exposure_ev}),
             opt_level=opt,
             device=args.device,
         )

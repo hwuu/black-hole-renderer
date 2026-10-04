@@ -1,9 +1,10 @@
 """Disk V2 Taichi 渲染器：Schwarzschild 测地线 + 体积发射-吸收积分 + 物理后处理。
 
-`DiskV2Renderer` 与参考实现 `scripts/proto_disk_reference.py`（预设 M）逐段对齐：
+`DiskV2Renderer`（光线、步长与段内积分沿用参考实现预设 M）：
 
 - 光线：笛卡尔等效势 `d²x/dλ² = −1.5 L² x / r⁵`，RK4，步长为位置的连续函数。
-- 盘：`DiskV2Taichi.density_I` 体积密度场（SS 外区结构 + 刚体环平流噪声 + 烟雾 + 尘埃）。
+- 盘：`DiskV2Taichi.density_I` 统一气体模型（SS 外区结构 + 刚体环平流剪切级联；高斯核心 + 指数大气，
+  大气含热发射与下方盘面的单次散射）。
 - 辐射转移：`I = Σ T·ΔI_disk + T_end·I_sky`，段内精确均匀解 `ΔI = (j/α)(1 − e^{−αΔs})`。
 - 后处理：`postfx`（白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB）。
 
@@ -65,7 +66,8 @@ class DiskV2Renderer:
             白点变蓝（颜色序列 黑 → 暗红 → 金 → 白）。默认 None = 跟随白平衡色温 `white_balance_K`
             （白平衡下显示为白色的温度）；0 = 不封顶（参考实现）。只影响色度，不影响亮度。
         white_balance_K: 相机白平衡色温（K，1000–40000，ISP 层）：色温为该值的黑体显示为白色。None = `postfx`
-            默认 4000 K（盘面主体 3000–5000 K 呈浅金、最热处为白）；参考实现为 5000 K（整体偏暖黄）。
+            默认 4500 K（盘面主体 3000–5000 K 呈浅金、最热处为白；4000 K 偏冷发白）；参考实现为 5000 K
+            （整体偏暖黄）。
             调低 → 盘面更白、更冷；调高 → 更暖、更黄。
         color_temp_floor_K: 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），
             使冷区不再显示为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。
@@ -76,8 +78,12 @@ class DiskV2Renderer:
             场景光、无阈值，见 `docs/imaging_model.md`）；`"legacy"` = 参考实现的阈值 bloom + 镶边
             （会额外加光、点亮辉光后面的盘面，仅作对照）。
         lens_glare: 镜头眩光强度 ε ∈ [0, 1]（`lens_model="psf"` 时生效）：每个点散射到长尾的能量比例。
-            None = `postfx` 默认 0.4（柔光镜量级）；0 = 理想镜头（无辉光）。越大辉光越明显，同时
+            None = `postfx` 默认 0.5（柔光镜量级）；0 = 理想镜头（无辉光）。越大辉光越明显，同时
             全画面对比度按 (1 − ε) 下降。
+        exposure_ev: 曝光补偿（档，传感器层）：自动曝光 `0.9 / p99.9(盘区亮度)` 再乘 `2^EV`。
+            0 = 盘区 p99.9 亮度落在 0.9（画面无过曝，最亮处只到浅金、缺少"发光"感）；默认 1.5
+            （×2.83：视频构图下约 2% 的盘区像素越过白点烧白，阴影内辉光约为 EV = 0 时的 2 倍）。负值更暗。视频首帧锁定的
+            曝光已包含补偿。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
         ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
@@ -106,6 +112,7 @@ class DiskV2Renderer:
         bloom_luma_threshold: bool = True,
         lens_model: str = "psf",
         lens_glare: Optional[float] = None,
+        exposure_ev: float = 1.5,
         sky_gain: float = 0.5,
         ss: int = 1,
         opt_level: int = 0,
@@ -151,6 +158,7 @@ class DiskV2Renderer:
         self.lens_model = lens_model
         # None = 用 postfx 默认值
         self.lens_glare = None if lens_glare is None else float(lens_glare)
+        self.exposure_ev = float(exposure_ev)
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
@@ -338,8 +346,8 @@ class DiskV2Renderer:
                     # 参考实现（模型 I）步长：位置的连续函数，避免条纹。
                     #   远场 h = min(0.06·r, 2)；近视界 h ≤ 0.02 + 0.06·(r − 1)；
                     #   核心盘包络 zb = 3H(r_c) + 0.02 内 h → 0.03·s，离开后按距离 0.3·d 放大；
-                    #   烟雾包络 CL_EXTENT·r_c + 0.02 内 h → max(0.4·CL_WIDTH·r_c, 0.03·s)；
-                    #   s = thickness_scale（盘厚缩放），H 与 CL_WIDTH 已含 s。
+                    #   大气包络 atm_extent·H_a + 0.02 内 h → max(0.3·H_a, 0.03·s)（H_a = atm_height·r_c）；
+                    #   s = thickness_scale（盘厚缩放），H 已含 s，H_a 不含。
                     # 盘相关距离在盘局部坐标下计算（支持倾角）。
                     h = ti.min(0.06 * r_cur, 2.0)
                     h = ti.min(h, 0.02 + 0.06 * ti.max(r_cur - 1.0, 0.0))
@@ -349,9 +357,8 @@ class DiskV2Renderer:
                     rad_out = ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
                     d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
                     h = ti.min(h, sc * 0.03 * thick + 0.3 * d_slab)
-                    if ti.static(disk._smoke_on):
-                        d_smoke = ti.max(ti.abs(pl[2]) - (disk._cl_extent * rc_h + 0.02), 0.0) + rad_out
-                        h = ti.min(h, sc * ti.max(0.4 * disk._cl_width * rc_h, 0.03 * thick) + 0.3 * d_smoke)
+                    d_atm = ti.max(ti.abs(pl[2]) - (disk._atm_ext * disk._atm_h * rc_h + 0.02), 0.0) + rad_out
+                    h = ti.min(h, sc * ti.max(0.3 * disk._atm_h * rc_h, 0.03 * thick) + 0.3 * d_atm)
 
                     # 首步抖动：起点沿光线随机偏移 [0, h)，与超采样一起构成蒙特卡洛体积积分
                     if step_idx == 0:
@@ -386,8 +393,7 @@ class DiskV2Renderer:
                     if r_local > disk._r_in and r_local < disk._r_out:
                         z_local = _sl[2]
                         z_lim = 3.0 * disk._ss_half_thickness(r_local) + 0.01
-                        if ti.static(disk._smoke_on):
-                            z_lim = ti.max(z_lim, disk._cl_extent * r_local)
+                        z_lim = ti.max(z_lim, disk._atm_ext * disk._atm_h * r_local)
                         if ti.abs(z_local) < z_lim:
                             phi_local = ti.atan2(_sl[1], _sl[0])
                             # 光线方向转到盘局部坐标（g 因子与发射点位置同一坐标系）
@@ -396,9 +402,9 @@ class DiskV2Renderer:
                             t_delay = 0.0
                             if ti.static(light_delay):
                                 t_delay = lam - 0.5 * ds
-                            em_c, tf_c, ab_c, em_o, ab_o, em_s = disk.density_I(
-                                r_local, z_local, phi_local, t_delay, dm[2])
-                            if em_c + em_o + em_s + ab_c + ab_o > 1e-9:
+                            em_c, tf_c, ab_c, ab_a, em_a, sc_a = disk.density_I(
+                                r_local, z_local, phi_local, t_delay)
+                            if em_c + em_a + ab_c + ab_a > 1e-9:
                                 g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
                                 g_col = ti.pow(g_phys, self.doppler_color)
                                 # 颜色温度截断：χ(clamp(T·g_col, T_floor, T_cap))，暗金 → 白（_col_t 内实现）
@@ -408,17 +414,13 @@ class DiskV2Renderer:
                                 # 核心：Y(s·g·T·tf_c)/Y(s·T_peak)·χ(g·T·tf_c)
                                 Tc = T_K * tf_c
                                 src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Tc * g_col))
-                                # 其他（尘埃）：Y(s·g·T)/Y(s·T_peak)·χ(g·T)
-                                src_o = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(T_K * g_col))
-                                # 烟雾：T_smoke = SMOKE_TR·T
-                                src_s = src_o
-                                if disk._smoke_tr > 0:
-                                    Ts = T_K * disk._smoke_tr
-                                    src_s = ti.exp(disk.blackbody_luminance_ti(Ts * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Ts * g_col))
-                                # CORE_OPAC 同时乘核心发射与核心吸收：物质更多 → j、α 同比增加，
-                                # 源函数 S = j/α 不变（与参考实现一致）。κ 已按 TAU_I 标定。
-                                j_total = disk._core_opac * em_c * src_c + em_o * src_o + em_s * src_s
-                                alpha_coeff = disk._kappa_vol * (ab_o + disk._core_opac * ab_c)
+                                # 盘面有效温度源：S_disk = Y(s·g·T)/Y(s·T_peak)·χ(g·T)（散射入射场用）
+                                src_d = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(T_K * g_col))
+                                # 发射 j = 核心热发射 + 大气热发射（同为灰大气温度 T·tf）+ 大气散射 ω·ab_a·J，
+                                # J = scatter_j·(1 − e^{−τ_c})·S_disk（下方核心层，sc_a 已含 ω·ab_a·(1 − e^{−τ_c})）；
+                                # 消光 α = κ·(ab_c + ab_a)，κ 已按 tau_i 标定
+                                j_total = em_c * src_c + em_a * src_c + sc_a * disk._scatter_j * src_d
+                                alpha_coeff = disk._kappa_vol * (ab_a + ab_c)
                                 alpha_seg = alpha_coeff * ds
                                 # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
                                 if alpha_coeff > 1e-30:
@@ -546,8 +548,9 @@ class DiskV2Renderer:
             `(H, W, 3)` float32 LDR `[0, 1]`（sRGB 编码）。
 
         Notes:
-            曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则盘区亮度（`L > 1e-4`）
-            p99.9 → 0.9（参考实现预设 M），只看盘。合成 `x = exposure·disk + sky_gain·sky`，
+            曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则
+            `exposure = 0.9 / p99.9(L) · 2^exposure_ev`，L 为盘区亮度（`L > 1e-4`，只看盘；
+            EV = 0 即参考实现预设 M 的 p99.9 → 0.9）。合成 `x = exposure·disk + sky_gain·sky`，
             再经 `postfx`：白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB。
         """
         if self.fixed_exposure is not None:
@@ -556,6 +559,7 @@ class DiskV2Renderer:
             lum = hdr_luminance(hdr)
             lum = lum[lum > 1e-4]
             exposure = 0.9 / max(float(np.percentile(lum, 99.9)), 1e-12) if lum.size else 1.0
+            exposure *= 2.0 ** self.exposure_ev
         # 天空在曝光之后以独立系数叠加，再一起进入 postfx（星点参与 bloom）
         x = hdr * exposure
         if sky is not None:

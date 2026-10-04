@@ -196,11 +196,11 @@ class PostfxPipelineTest(unittest.TestCase):
         self.assertEqual(out.shape, (32, 48, 3))
 
     def test_default_params_match_reference(self):
-        """默认镜头模型为能量守恒 PSF（ε = 0.4）；legacy 参数仍与参考实现预设 M 一致。"""
+        """默认镜头模型为能量守恒 PSF（ε = 0.5）、白平衡 4500 K；legacy 参数仍与参考实现预设 M 一致。"""
         p = postfx_params_defaults()
         self.assertEqual(p["lens_model"], "psf")
-        self.assertAlmostEqual(p["lens_glare"], 0.4)
-        self.assertAlmostEqual(p["white_balance_K"], 4000.0)
+        self.assertAlmostEqual(p["lens_glare"], 0.5)
+        self.assertAlmostEqual(p["white_balance_K"], 4500.0)
         self.assertAlmostEqual(p["bloom_threshold"], 0.3)
         self.assertAlmostEqual(p["bloom_gain"], 4.0)
         self.assertAlmostEqual(p["axial_scale"][2], 1.15)
@@ -281,6 +281,33 @@ class LensPSFTest(unittest.TestCase):
     def test_invalid_lens_model_raises(self):
         with self.assertRaises(ValueError):
             postfx(np.zeros((8, 8, 3)), lens_model="foo")
+
+
+class ExposureCompensationTest(unittest.TestCase):
+    """`DiskV2Renderer.finish` 的自动曝光：exposure = 0.9 / p99.9(盘区亮度) · 2^exposure_ev。"""
+
+    @staticmethod
+    def _finish(ev, fixed=None):
+        from types import SimpleNamespace
+
+        from src.v2.taichi_render import DiskV2Renderer
+        stub = SimpleNamespace(fixed_exposure=fixed, exposure_ev=ev, sky_gain=0.0, bloom_luma_threshold=True,
+                               lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, last_white_point=1.0)
+        rng = np.random.default_rng(3)
+        hdr = rng.uniform(0.01, 1.0, (24, 32, 3)) * rng.uniform(0.0, 2.0, (24, 32, 1))
+        DiskV2Renderer.finish(stub, hdr, None)
+        lum = 0.2126 * hdr[..., 0] + 0.7152 * hdr[..., 1] + 0.0722 * hdr[..., 2]
+        return 1.0 / stub.last_white_point, 0.9 / np.percentile(lum[lum > 1e-4], 99.9)
+
+    def test_ev_scales_auto_exposure(self):
+        for ev in (0.0, 1.5, -1.0):
+            got, base = self._finish(ev)
+            self.assertAlmostEqual(got / base, 2.0 ** ev, places=5)
+
+    def test_fixed_exposure_ignores_ev(self):
+        """视频锁定曝光（首帧已含补偿）直接使用，不再重复乘 2^EV。"""
+        got, _ = self._finish(1.5, fixed=0.37)
+        self.assertAlmostEqual(got, 0.37, places=6)
 
 
 if __name__ == "__main__":

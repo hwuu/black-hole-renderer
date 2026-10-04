@@ -2,8 +2,7 @@
 
 mode 3 动态核心：盘按 ln r 分带，带内结构以带中心角速度 Ω_b **刚体**旋转
 （带内无剪切 → 任意时长不卷绕）；每带两套噪声种子相位差半周期，三角权重
-交叉淡化（种子切换瞬间权重为 0，无跳变）。参考实现：
-`scripts/proto_disk_reference.py`（`turb_pair` mode 3）。
+交叉淡化（种子切换瞬间权重为 0，无跳变）。来自参考实现预设 M 的 `turb_pair` mode 3。
 
 坐标与符号约定：
 
@@ -120,7 +119,7 @@ class RigidRingBands:
     ph0_hash: tuple = (13, 5)
     """种子相位 ph0 的哈希流 `(b, c)`。"""
     lnr0_bands: float = -2.0
-    """带网格原点：`lnr0 = ln r_in + lnr0_bands·dln`（核心 / 烟雾 / 尘埃 = −2；低频层 = 0）。"""
+    """带网格原点：`lnr0 = ln r_in + lnr0_bands·dln`（核心 = −2；低频层 = 0）。"""
     center_frac: float = 0.0
     """带中心在带坐标中的偏移：`r_b = exp(lnr0 + (b + center_frac)·dln)`（低频层 = 0.5）。
 

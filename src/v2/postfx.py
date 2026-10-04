@@ -409,12 +409,13 @@ def postfx_params_defaults() -> dict:
     `lens_model="legacy"`（参考实现预设 M 的 bloom + 镶边）时生效。
     """
     return {
-        # 白平衡色温（ISP 层）：4000 K 的黑体显示为白色；参考实现为 5000 K（盘面整体偏暖黄）
-        "white_balance_K": 4000.0,
+        # 白平衡色温（ISP 层）：4500 K 的黑体显示为白色（盘面浅金、最热处为白）；4000 K 偏冷发白，
+        # 参考实现为 5000 K（整体偏暖黄）
+        "white_balance_K": 4500.0,
         # 镜头模型："psf" = 能量守恒镜头 PSF（默认）；"legacy" = 阈值 bloom + 镶边（额外加光）
         "lens_model": "psf",
         # 眩光强度 ε：每个点散射到长尾的能量比例（柔光镜量级）
-        "lens_glare": 0.4,
+        "lens_glare": 0.5,
         "bloom_threshold": 0.3,
         "bloom_gain": 4.0,
         # True = 按亮度扣阈值（保色度，默认）；False = 逐通道扣阈值（参考实现旧行为，光晕偏红）

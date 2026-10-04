@@ -42,11 +42,12 @@
 
 详见 `docs/design_ad_v2.md` §3.5 与 `docs/imaging_model.md` §7。
 
-- 结构场：盘的几何与物质分布（标高、柱密度、噪声结构、刚体环平流），表示盘"长什么样"
-- 辐射转移：温度、源函数、频移与发射-吸收积分，表示盘"发出什么光"
+- 结构场：盘的几何与物质分布（标高、柱密度、剪切级联湍流、高斯核心 + 指数大气剖面、刚体环平流），表示盘"长什么样"；
+  统一气体模型：盘面与大气是同一团气体、同一湍流场（见 `docs/plans/v2_unified_gas_plan.md`）
+- 辐射转移：温度、源函数、散射反照率、频移与发射-吸收-散射积分，表示盘"发出什么光"
 - 成像链（旧称"后处理"，原理见 `docs/imaging_model.md`）按真实相机分三层：
   - 镜头：点扩散函数（眩光长尾、轴向 / 横向色差），必须线性、能量守恒、作用于全部光，不设阈值
-  - 传感器：曝光（盘区 p99.9 → 0.9，视频锁定）
+  - 传感器：曝光（盘区 p99.9 → 0.9，再乘曝光补偿 2^EV，默认 +1.5 档；视频锁定）
   - ISP：白平衡、色调映射、饱和度、sRGB 编码
 - 参数按"场景·结构 / 场景·辐射 / 场景·背景 / 相机 / 镜头 / 传感器与 ISP / 求解精度 / 输出"分层，
   新参数先确定所属层，CLI 放进对应的参数组
@@ -96,7 +97,7 @@
 - `src/cli.py`
   - 参数解析与模式分发（V1 / V2、单帧 / 视频）
 - `scripts/`
-  - `proto_disk_reference.py` V2 参考实现（历史基准）；`compare_v2_proto.py` V2 对比工具（2026-10-02 起不再作为验收项）
+  - 目前为空：V2 参考实现 `proto_disk_reference.py` 与对比工具 `compare_v2_proto.py` 已随旧烟雾 / 尘埃模型于 2026-10-04 删除
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
 
 ### 视频旋转算法速记
@@ -122,7 +123,7 @@ python -m unittest tests/unit/test_parametric_rotation_direction.py
 - 端到端渲染校验：
 
 ```bash
-python -m unittest tests/e2e_render.py
+python tests/e2e_render.py --verify    # unittest 方式收集不到用例（脚本自带 argparse 入口）
 ```
 
 ### 踩坑记录
@@ -233,16 +234,19 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
     - 规则（已废止，2026-10-02）：当前 V2 视觉已优于 Proto，**不再**与 Proto 对比；新功能改为保证
       "参数取旧值时与改动前逐位一致"（用 `git archive HEAD src` 导出旧版对比渲染）；
       详见 `docs/plans/v2_volumetric_video_plan.md` §10
-    - 保护测试：`tests/unit/test_disk_v2_proto_parity.py`
+    - 保护测试：`tests/unit/test_disk_v2_proto_parity.py`（已随旧模型于 2026-10-04 删除）
+    - 延续（2026-10-04，统一气体模型）：先在原型中定稿观感，再分步移植，每步用"同参数渲染 HDR 逐位一致"验收
+      （360p、多视角、HDR 与天空两路、优化级别 0 与 3），见 `docs/plans/v2_unified_gas_plan.md` §11
 
 32. **Taichi `@ti.func` 内不能把 dataclass 绑定到局部变量**
     - 现象：`f = self._adv_core_f` 抛 `Invalid constant scalar data type: RigidRingFields`
     - 修复：直接写全路径 `self._adv_core_f.rot[idx]`（与 #24 同源）
 
 33. **V2 单测慢的主要原因是 Taichi 编译**（2026-10-02 实测）
-    - 现象：`test_disk_v2_proto_parity.py` 单文件约 12.5 分钟，其余 V2 单测合计仅数秒
+    - 现象：`test_disk_v2_proto_parity.py`（已删除）单文件约 12.5 分钟，其余 V2 单测合计仅数秒
     - 根因：每构造一个 `DiskV2Renderer`，体积 kernel 首帧编译约 60–70 s；该文件内构造了 6 个
     - 做法：迭代期只跑改动相关的轻量单测（`test_disk_v2_volume_fields` / `noise_ti` / `advection` / `v2_cli` 等）；
+      需要 `DiskV2Taichi` 的测试在 `setUpClass` 里只构造一次（如 `test_disk_v2_unified` / `shear_cascade`）；
       提交前再跑一次全量；小样渲染用 360p（`640×360`）
 
 34. **画面"发红"先查后处理再查物理颜色**（2026-10-03）
@@ -256,3 +260,12 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
     - 根因：bloom 不是镜头模型——提取光 ×4 加回（造光）、6 px 窄核复制纹理、阈值落在盘面亮度分布中间、复制边缘补边造光
     - 修复：镜头 = 能量守恒 PSF `(1 − ε)·x + ε·(K ∗ x)`，作用于全部光、无阈值（`postfx.apply_lens_psf`）
     - 做法：在 HDR 域对每一步做"输出 − 输入"，区分"散射进来的光"与"自身散出的光"，并检查总能量比（应 ≤ 1）
+
+36. **盘面"惨白 / 没有发光感 / 像大理石"先查曝光与白平衡，再查结构**（2026-10-04）
+    - 现象：统一气体模型下盘面偏白、远看像大理石在转，光子环与内盘不"发光"
+    - 根因：(1) 曝光 p99.9 → 0.9 使画面没有任何像素越过白点（旧版也如此，被烟雾的柔光掩盖）；
+      (2) 白平衡 4000 K = 色温上限，去掉偏冷的烟雾层后内盘大片纯白，亮区饱和度减半；
+      (3) 次要：剪切级联小尺度条纹满盘同样锐利
+    - 修复：曝光补偿 `--v2_exposure_ev` 默认 +1.5 档、白平衡 4500 K、眩光 0.5、`core_oct_gain` 0.6
+    - 做法：同相机对比量化——曝光后盘区越过白点的比例、亮区饱和度、黑洞阴影内的 LDR 均值（纯镜头散射光），
+      并逐项关闭（散射 / 大气）排除结构层；先定位到层再改参数

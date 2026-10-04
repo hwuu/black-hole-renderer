@@ -93,56 +93,66 @@ class GreyAtmosphereTest(unittest.TestCase):
 
 
 class VolumeParamsTest(unittest.TestCase):
-    def test_defaults_match_reference_preset_M(self):
-        """DiskV2VolumeParams 默认值 = 参考实现预设 M（盘厚缩放 1/9、亮度温度倍率 1.25 除外）。"""
+    def test_defaults(self):
+        """DiskV2VolumeParams 默认值：温度与刚体环沿用预设 M，大气参数取方案 §5.1 定稿值。"""
         from src.v2.params import DiskV2VolumeParams
         vp = DiskV2VolumeParams()
         self.assertEqual(vp.bh_mass_msun, 1.0e8)
         self.assertAlmostEqual(vp.mdot_edd, 1.7e-6)
         self.assertAlmostEqual(vp.grey_mix, 0.5)
         self.assertAlmostEqual(vp.grey_cap, 1.19)
-        self.assertAlmostEqual(vp.core_opac, 2.0)
-        self.assertAlmostEqual(vp.core_floor, 0.35)
         self.assertAlmostEqual(vp.dt_i, 0.05)
-        self.assertAlmostEqual(vp.smoke_i, 0.8)
-        self.assertAlmostEqual(vp.smoke_tr, 0.85)
-        self.assertAlmostEqual(vp.con_i, 50.0)
-        self.assertAlmostEqual(vp.lowf_sigma, 0.9)
+        self.assertAlmostEqual(vp.core_floor, 0.15)
+        self.assertAlmostEqual(vp.lowf_sigma, 1.6)
+        self.assertAlmostEqual(vp.core_contrast, 0.8)
+        self.assertAlmostEqual(vp.tau_i, 1.84)
+        self.assertAlmostEqual(vp.atm_fine_sigma, 0.5)
+        self.assertAlmostEqual(vp.atm_fine_fz, 2.0)
+        self.assertAlmostEqual(vp.con_t, 50.0)
+        self.assertAlmostEqual(vp.az_stretch_t, 1.5)
         self.assertAlmostEqual(vp.surf_lo, 1.0)
         self.assertAlmostEqual(vp.surf_k, 0.0)
         self.assertAlmostEqual(vp.hr_ref, 0.027)
         self.assertAlmostEqual(vp.thickness_scale, 1.0 / 9.0)
         self.assertAlmostEqual(vp.lum_temp_scale, 1.25)
-        self.assertAlmostEqual(vp.core_az_stretch, 1.5)
-        self.assertAlmostEqual(vp.core_oct_gain, 0.69)
+        self.assertAlmostEqual(vp.core_oct_gain, 0.6)
         self.assertTrue(vp.band_seam_fix)
-        self.assertAlmostEqual(vp.core_contrast, 0.4)
-        self.assertAlmostEqual(vp.outer_detail_fade, 0.0)
-        self.assertTrue(vp.dust_kepler)
+        self.assertAlmostEqual(vp.atm_frac, 0.15)
+        self.assertAlmostEqual(vp.atm_height, 0.01)
+        self.assertAlmostEqual(vp.atm_extent, 5.0)
+        self.assertAlmostEqual(vp.atm_cov_c0, 1.0)
+        self.assertAlmostEqual(vp.atm_cov_soft, 0.3)
+        self.assertAlmostEqual(vp.abs_scatter_ratio, 20.0)
+        self.assertAlmostEqual(vp.scatter_j, 0.5)
         self.assertTrue(vp.static_cam)
         self.assertTrue(vp.light_delay)
 
+    def test_removed_fields(self):
+        """旧烟雾 / 尘埃 / core_opac / 旧主云级联字段已删除。"""
+        from src.v2.params import DiskV2VolumeParams
+        for name in ("smoke_i", "core_opac", "dust_on", "kr_i", "con_i", "core_az_stretch",
+                     "outer_detail_fade", "shear_cascade"):
+            with self.assertRaises(TypeError, msg=name):
+                DiskV2VolumeParams(**{name: 1.0})
+
     def test_validation(self):
         from src.v2.params import DiskV2VolumeParams
-        with self.assertRaises(ValueError):
-            DiskV2VolumeParams(grey_mix=-0.1)
-        with self.assertRaises(ValueError):
-            DiskV2VolumeParams(core_opac=0.0)
-        with self.assertRaises(ValueError):
-            DiskV2VolumeParams(dln_r=-1.0)
-        with self.assertRaises(ValueError):
-            DiskV2VolumeParams(lum_temp_scale=0.0)
+        for kw in (dict(grey_mix=-0.1), dict(dln_r=-1.0), dict(lum_temp_scale=0.0), dict(tau_i=0.0), dict(lowf_sigma=-0.1), dict(atm_fine_sigma=-0.1), dict(atm_fine_fz=0.0),
+                   dict(atm_frac=-0.1), dict(atm_height=0.0), dict(atm_extent=0.0), dict(atm_cov_soft=0.0),
+                   dict(abs_scatter_ratio=-1.0), dict(scatter_j=-0.1)):
+            with self.assertRaises(ValueError, msg=str(kw)):
+                DiskV2VolumeParams(**kw)
 
-    def test_outer_detail_validation(self):
-        """外圈细节参数：取值范围，以及 core_contrast ≠ 1 必须配合接缝修复。"""
+    def test_structure_validation(self):
+        """结构参数：取值范围，以及 core_contrast ≠ 1 必须配合接缝修复。"""
         from src.v2.params import DiskV2VolumeParams
-        for kw in (dict(core_az_stretch=-1.0), dict(core_oct_gain=0.0), dict(core_contrast=0.0),
-                   dict(outer_detail_fade=1.5), dict(band_seam_fix=False, core_contrast=0.4)):
+        for kw in (dict(az_stretch_t=-1.0), dict(con_t=0.0), dict(core_oct_gain=0.0), dict(core_contrast=0.0),
+                   dict(band_seam_fix=False, core_contrast=0.4)):
             with self.assertRaises(ValueError, msg=str(kw)):
                 DiskV2VolumeParams(**kw)
         # 参考实现取值组合合法
-        DiskV2VolumeParams(core_az_stretch=0.0, core_oct_gain=1.0, band_seam_fix=False,
-                           core_contrast=1.0, outer_detail_fade=1.0)
+        DiskV2VolumeParams(az_stretch_t=0.0, core_oct_gain=1.0, band_seam_fix=False, core_contrast=1.0,
+                           atm_frac=0.0, abs_scatter_ratio=0.0, scatter_j=0.0)
 
 
 class DiskGeometryParamsTest(unittest.TestCase):

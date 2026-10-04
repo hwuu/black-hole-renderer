@@ -2,6 +2,10 @@
 
 > **状态**：已完成（2026-10-02）。实施结果与偏差见 §7。
 >
+> **后续（2026-10-04）**：烟雾层、尘埃、`core_opac` 与旧主云级联（`core_az_stretch` / `outer_detail_fade` 等）已被统一
+> 气体模型取代并删除；`scripts/proto_disk_reference.py`、`scripts/compare_v2_proto.py` 与 `test_disk_v2_proto_parity.py`
+> 随之删除。本文中的相关内容为历史记录，现行模型见 [`v2_unified_gas_plan.md`](v2_unified_gas_plan.md)。
+>
 > **关联文档**：模型与分层见 [`../design_ad_v2.md`](../design_ad_v2.md)；参数定稿值见
 > [`v2_volumetric_video_plan.md`](v2_volumetric_video_plan.md) §2。
 >

@@ -1,4 +1,4 @@
-"""Disk V2：体积吸积盘（与参考实现 `scripts/proto_disk_reference.py` 预设 M 对齐）。
+"""Disk V2：体积吸积盘（统一气体模型，见 `docs/plans/v2_unified_gas_plan.md`）。
 
 模块分层：
 
@@ -6,7 +6,7 @@
 - `physical_fields.py`：Page–Thorne 温度 / T_peak 推导、SS 外区 H(r)、Σ(r)（NumPy 参考）。
 - `relativity.py`：频移 g 的 NumPy 参考与严格 GR 对照。
 - `palette.py`：CIE 黑体色度 / 亮度查找表、von Kries 白平衡。
-- `noise_ti.py` / `advection.py`：程序化噪声与刚体环平流。
+- `noise_ti.py` / `advection.py` / `shear_cascade.py`：程序化噪声、刚体环平流与主云剪切级联几何。
 - `taichi_impl.py`：体积密度场 `DiskV2Taichi.density_I` 与 Taichi 端频移。
 - `taichi_render.py`：主光追 `DiskV2Renderer`。
 - `postfx.py`：后处理链（白平衡 → bloom → 色散 → 保色度 ACES → sRGB）。

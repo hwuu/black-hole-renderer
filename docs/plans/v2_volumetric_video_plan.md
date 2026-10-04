@@ -2,6 +2,10 @@
 
 > **状态**：v0.5 已冻结（2026-10-01），按 §5 实施中。定稿为预设 M（§2，参数分三层）；L / J2 / H 保留为可退回预设（§2.4）。
 >
+> **后续（2026-10-04）**：烟雾层、尘埃、`core_opac` 与旧主云级联（`core_az_stretch` / `outer_detail_fade` 等）已被统一
+> 气体模型取代并删除；`scripts/proto_disk_reference.py`、`scripts/compare_v2_proto.py` 与 `test_disk_v2_proto_parity.py`
+> 随之删除。本文中的相关内容为历史记录，现行模型见 [`v2_unified_gas_plan.md`](v2_unified_gas_plan.md)。
+>
 > **触发原因**：
 >
 > 1. V2 单帧"烟雾/粒子感看不出来"，结构像贴图。
