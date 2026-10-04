@@ -66,5 +66,42 @@ class V2VolumeOverridesTest(unittest.TestCase):
             _args("--v2_az_stretch", "1.0")
 
 
+class CameraPathArgsTest(unittest.TestCase):
+    """运镜参数：组合校验与帧数确定。"""
+
+    PATH = "configs/camera_paths/interstellar_skim.json"
+
+    def test_invalid_combinations_rejected(self):
+        bad = [("--v2_camera_path", self.PATH, "--video", "--orbit"),
+               ("--v2_camera_path_time", "3"),
+               ("--v2_camera_path", self.PATH, "--video", "--v2_camera_path_time", "3"),
+               ("--v2_camera_path", self.PATH),
+               ("--v2_camera_path", self.PATH, "--video", "--interactive"),
+               ("--v2_camera_path", self.PATH, "--interactive", "--v2_camera_path_time", "3"),
+               ("--v2_camera_path", self.PATH, "--v2_camera_path_time", "nan"),
+               ("--video", "--v2_orbit_seconds", "0"),
+               ("--video", "--v2_orbit_seconds", "inf")]
+        for argv in bad:
+            with self.assertRaises(ValueError, msg=str(argv)):
+                cli.validate_args(_args(*argv))
+        with patch.object(sys, "argv", ["render.py", "--v2_camera_path", self.PATH, "--video"]):
+            with self.assertRaises(ValueError):
+                cli.validate_args(cli.parse_args())
+
+    def test_valid_combinations_accepted(self):
+        cli.validate_args(_args("--v2_camera_path", self.PATH, "--video"))
+        cli.validate_args(_args("--v2_camera_path", self.PATH, "--v2_camera_path_time", "3"))
+
+    def test_n_frames_resolution(self):
+        self.assertEqual(cli.resolve_n_frames(_args(), None), cli.N_FRAMES_DEFAULT)
+        self.assertEqual(cli.resolve_n_frames(_args("--n_frames", "10"), None), 10)
+        self.assertEqual(cli.resolve_n_frames(_args("--video", "--fps", "60"), 87.5), 5250)
+        self.assertEqual(cli.resolve_n_frames(_args("--video", "--fps", "60", "--n_frames", "5250"), 87.5), 5250)
+        with self.assertRaises(ValueError):
+            cli.resolve_n_frames(_args("--video", "--fps", "60", "--n_frames", "100"), 87.5)
+        with self.assertRaises(ValueError):
+            cli.resolve_n_frames(_args("--video", "--fps", "10"), 0.01)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -455,15 +455,19 @@ class DiskV2Renderer:
 
         self._ray_march_kernel = _ray_march_kernel
 
-    def _setup_camera(self, cam_pos: List[float], fov: float) -> None:
+    def _setup_camera(self, cam_pos: List[float], fov: float, forward=None,
+                      roll_deg: Optional[float] = None) -> None:
         """计算相机基向量并填到 Taichi field 中（与 V1 `build_camera` 一致）。
 
         Args:
-            cam_pos: 相机位置 `[x, y, z]`（r_s），看向原点，世界 up = +z。
+            cam_pos: 相机位置 `[x, y, z]`（r_s），世界 up = +z。
             fov: 竖直视野角（度）。
+            forward: 相机光轴方向（世界系 3 维向量）；None = 看向原点（与旧实现逐位一致）。
+            roll_deg: 本帧相机滚转角（度）；None = 构造时的 `camera_roll_deg`。运镜路径逐帧给出。
         """
+        roll = self.camera_roll_deg if roll_deg is None else float(roll_deg)
         cam_pos_arr, right, up, forward, pixel_width, pixel_height, _top_left = (
-            build_camera_v1_compatible(cam_pos, fov, self._iw, self._ih, self.camera_roll_deg)
+            build_camera_v1_compatible(cam_pos, fov, self._iw, self._ih, roll, forward=forward)
         )
         self.cam_pos_field[None] = cam_pos_arr.astype(np.float32).tolist()
         self.cam_right_field[None] = right.astype(np.float32).tolist()
@@ -517,18 +521,21 @@ class DiskV2Renderer:
             out = ti.min(out, self.color_temp_cap_K)
         return out
 
-    def render_hdr(self, cam_pos: List[float], fov: float, t: float = 2000.0):
+    def render_hdr(self, cam_pos: List[float], fov: float, t: float = 2000.0, forward=None,
+                   roll_deg: Optional[float] = None):
         """GPU 阶段：积分一帧，返回 `(disk_hdr, sky)`（均为 `(H, W, 3)` 线性光；无天空时 sky 为 None）。
 
         Args:
             cam_pos: 相机位置 `[x, y, z]`（r_s）。
             fov: 竖直视野角（度）。
             t: 帧物理时间（r_s/c）。
+            forward: 相机光轴方向（世界系 3 维向量）；None = 看向原点。
+            roll_deg: 本帧相机滚转角（度）；None = 构造时的 `camera_roll_deg`。
 
         Returns:
             `(hdr, sky)`；同时写入 `last_hdr`。
         """
-        self._setup_camera(cam_pos, fov)
+        self._setup_camera(cam_pos, fov, forward=forward, roll_deg=roll_deg)
         self.disk_ti.update_advection(float(t))
         self.jitter_seed[None] += 1
         self._ray_march_kernel()
@@ -537,23 +544,27 @@ class DiskV2Renderer:
         sky = self._downsample(self.sky_field) if self.sky_gain > 0.0 else None
         return hdr, sky
 
-    def finish(self, hdr: np.ndarray, sky) -> np.ndarray:
+    def finish(self, hdr: np.ndarray, sky, exposure: Optional[float] = None) -> np.ndarray:
         """CPU 阶段：曝光、叠加天空、后处理（可与下一帧的 `render_hdr` 并行）。
 
         Args:
             hdr: `render_hdr` 返回的盘发射 HDR。
             sky: `render_hdr` 返回的天空（线性光）或 None。
+            exposure: 本帧曝光系数（> 0，乘到盘 HDR 上）；None = 按 `fixed_exposure` 或自动曝光。
+                运镜视频逐帧传入 `E₀·2^{ev(t)}`；作为参数传入（不改实例状态），可在线程池中安全并行。
 
         Returns:
             `(H, W, 3)` float32 LDR `[0, 1]`（sRGB 编码）。
 
         Notes:
-            曝光：`fixed_exposure` 非空时直接用（视频首帧锁定）；否则
-            `exposure = 0.9 / p99.9(L) · 2^exposure_ev`，L 为盘区亮度（`L > 1e-4`，只看盘；
+            曝光优先级：参数 `exposure` → `fixed_exposure`（视频首帧锁定）→ 自动曝光
+            `0.9 / p99.9(L) · 2^exposure_ev`，L 为盘区亮度（`L > 1e-4`，只看盘；
             EV = 0 即参考实现预设 M 的 p99.9 → 0.9）。合成 `x = exposure·disk + sky_gain·sky`，
             再经 `postfx`：白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB。
         """
-        if self.fixed_exposure is not None:
+        if exposure is not None:
+            exposure = float(exposure)
+        elif self.fixed_exposure is not None:
             exposure = float(self.fixed_exposure)
         else:
             lum = hdr_luminance(hdr)

@@ -94,10 +94,14 @@
   - `renderer.py` `TaichiRenderer`（V1 光追核）；`pipeline.py` 单帧/交互/视频管线
 - `src/v2/`
   - 体积吸积盘（V2），见 `docs/design_ad_v2.md`
+  - 运镜：`camera_compose.py` 插值 / 平滑 / 构图求解；`camera_path.py` 路径与节奏；`exposure_curve.py` 测光 + 平滑曝光、淡入淡出；
+    `path_video.py` 路径文件加载与按路径渲染（见 `docs/plans/v2_camera_path_plan.md`）
 - `src/cli.py`
-  - 参数解析与模式分发（V1 / V2、单帧 / 视频）
+  - 参数解析与模式分发（V1 / V2、单帧 / 视频 / 运镜）
+- `configs/camera_paths/`
+  - 运镜路径文件；`interstellar_skim.json` 为示例路径（87.5 s）
 - `scripts/`
-  - 目前为空：V2 参考实现 `proto_disk_reference.py` 与对比工具 `compare_v2_proto.py` 已随旧烟雾 / 尘埃模型于 2026-10-04 删除
+  - `contact_sheet.py` 运镜联系表（审构图）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
 
 ### 视频旋转算法速记
@@ -193,6 +197,11 @@ python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
                  --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
 
 # V2 视频中断后续传：同一条命令加 --resume（每 240 帧一个分段，最多重渲 1 段）
+
+# V2 运镜视频（帧数 = round(路径时长 × fps)；先测光约 2 分钟）与联系表
+python render.py --disk_model v2 --video --v2_camera_path configs/camera_paths/interstellar_skim.json \
+                 --ar1 3 --ar2 30 --v2_reverse_rotation -r fhd --fps 60 --device gpu -o output/v2_path.mp4
+python scripts/contact_sheet.py configs/camera_paths/interstellar_skim.json --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
 
 # V2 单测全部
 python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')

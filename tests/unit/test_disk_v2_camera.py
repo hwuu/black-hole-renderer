@@ -67,5 +67,28 @@ class TestCameraRoll(unittest.TestCase):
         self.assertLess(y_left, 0.0, "画面左侧应下移")
 
 
+class TestCameraForward(unittest.TestCase):
+    """指定相机朝向：不传时与看向原点逐位一致，传入时光轴等于给定方向。"""
+
+    def test_forward_none_is_bit_identical(self):
+        """forward = None 与显式传入 −p/|p| 的结果逐位一致。"""
+        cam = [3.0, -22.0, 0.3]
+        a = build_camera_v1_compatible(cam, 50.0, 640, 360, camera_roll_deg=13.0)
+        b = build_camera_v1_compatible(cam, 50.0, 640, 360, camera_roll_deg=13.0, forward=None)
+        for x, y in zip(a, b):
+            np.testing.assert_array_equal(x, y)
+
+    def test_forward_sets_optical_axis(self):
+        """给定任意长度的 forward：返回的光轴为其单位向量，基向量正交归一。"""
+        cam = [3.0, -22.0, 0.3]
+        fwd = np.array([0.4, 2.0, -0.1])
+        _, r, u, f, *_ = build_camera_v1_compatible(cam, 50.0, 640, 360, camera_roll_deg=13.0, forward=fwd)
+        np.testing.assert_allclose(f, fwd / np.linalg.norm(fwd), atol=1e-12)
+        for v in (r, u):
+            np.testing.assert_allclose(np.linalg.norm(v), 1.0, atol=1e-12)
+            np.testing.assert_allclose(np.dot(v, f), 0.0, atol=1e-12)
+        np.testing.assert_allclose(np.dot(r, u), 0.0, atol=1e-12)
+
+
 if __name__ == "__main__":
     unittest.main()

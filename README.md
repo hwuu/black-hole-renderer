@@ -57,6 +57,16 @@ python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
 # 视频（内缘一圈 16 s，可加 --orbit 环绕）
 python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
                  --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
+
+# 运镜视频（示例路径 87.5 s：远景 → 掠云 → 穿过盘面 → 盘底 → 绕盘边回升 → 远景；帧数 = round(路径时长 × --fps)）
+python render.py --disk_model v2 --video --v2_camera_path configs/camera_paths/interstellar_skim.json \
+                 --ar1 3 --ar2 30 --v2_reverse_rotation -r fhd --fps 60 --device gpu -o output/v2_path.mp4
+
+# 运镜路径的单帧（检查构图）与联系表（各关键帧经过时刻各一格，画三分线与黑洞目标位置）
+python render.py --disk_model v2 --v2_camera_path configs/camera_paths/interstellar_skim.json --v2_camera_path_time 48.5 \
+                 --ar1 3 --ar2 30 --v2_reverse_rotation -r sd --device gpu -o output/v2_path_t48.png
+python scripts/contact_sheet.py configs/camera_paths/interstellar_skim.json --v2_reverse_rotation \
+                 -o output/v2_arts/contact_sheet.png
 ```
 
 ### 视频生成
@@ -86,7 +96,7 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | `--disk_texture` | 吸积盘纹理路径 | 程序生成 |
 | `--disk_generation_scale` | 程序生成吸积盘纹理时的降采样倍率：1/2/4 | 2 |
 | `--ar1` | 吸积盘内半径 | 2.0 rs |
-| `--ar2` | 吸积盘外半径 | 3.5 rs |
+| `--ar2` | 吸积盘外半径 | 15 rs |
 | `--disk_tilt` | 吸积盘倾角（度） | 0 |
 | `--step_size`, `-s` | 积分步长 | 0.1 |
 | `--r_max` | 逃逸半径 | 10 |
@@ -129,6 +139,8 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | ② 场景·辐射 | `--v2_color_floor` | 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区固定为暗金、只靠亮度变暗，颜色序列为 黑 → 暗金 → 金 → 白。只影响颜色不影响亮度；建议 2500–3000；0 = 不设下限 | 0 |
 | ③ 场景·背景 | `--v2_sky_gain` | 天空亮度系数（sRGB 解码为线性光后，曝光之后叠加；不影响盘曝光；0 = 黑天空） | 0.5 |
 | ④ 相机 | `--v2_camera_roll` | 相机滚转角（度），相机绕自身光轴旋转，整个画面（盘与星空）一起倾斜；在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向 | 0 |
+| ④ 相机 | `--v2_camera_path` | 运镜路径文件（JSON）。视频模式下每帧的相机位置、朝向、视野、滚转由路径给出，黑洞落在路径指定的画面位置；曝光改为沿路径测光 + 平滑，首尾淡入淡出；帧数 = round(路径时长 × `--fps`)。此时 `--pov`、`--fov`、`--v2_camera_roll` 不生效，不能与 `--orbit`、`--interactive` 同用。示例路径为 `configs/camera_paths/interstellar_skim.json`。格式见 [`docs/plans/v2_camera_path_plan.md`](docs/plans/v2_camera_path_plan.md) §5.1 | 不使用 |
+| ④ 相机 | `--v2_camera_path_time` | 单帧模式：渲染运镜路径在视频时刻 T（秒，0 ≤ T ≤ 路径时长）的画面，用于检查构图；曝光为单帧自动曝光 + `--v2_exposure_ev`；需配合 `--v2_camera_path` | 不使用 |
 | ⑤ 镜头 | `--v2_lens_glare` | 镜头眩光强度 ε（0–1）：镜头把每个点约 ε 的能量散射成平滑长尾（辉光）；能量守恒、作用于全部光、无阈值，辉光只在暗处（天空、黑洞阴影）显著，盘面不会被点亮。0 = 理想镜头；好镜头约 0.02，柔光镜约 0.2–0.5；越大辉光越明显，全画面对比度按 (1 − ε) 下降 | 0.5 |
 | ⑥ 传感器与 ISP | `--v2_exposure_ev` | 曝光补偿（档）：自动曝光（盘区亮度 p99.9 → 0.9，视频首帧锁定）之后再乘 2^EV。0 = 无过曝、最亮处只到浅金、缺少发光感；+1.5 = 内盘约 2% 的像素烧白、阴影内辉光约翻倍；负值更暗 | +1.5 |
 | ⑥ 传感器与 ISP | `--v2_white_balance` | 白平衡色温（K）：色温为该值的黑体显示为白色；盘面主体约 3000–5000 K。调低更白更冷（4000 K 偏惨白）、调高更暖更黄（参考实现 5000 K 偏暖黄）；色温封顶自动跟随 | 4500 |

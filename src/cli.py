@@ -11,6 +11,9 @@ from src.v1.pipeline import render_image, render_interactive, render_video
 from src.v1.renderer import TaichiRenderer
 from src.v1.texture import compute_disk_texture_resolution
 
+# 视频帧数默认值（未传 --n_frames、也未传 --v2_camera_path 时）
+N_FRAMES_DEFAULT = 3600
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Schwarzschild 黑洞光线追踪渲染器")
@@ -75,8 +78,9 @@ def parse_args() -> argparse.Namespace:
                         help="视频模式：相机围绕原点旋转（需配合 --video）")
     g_cam.add_argument("--orbit_degrees", type=float, default=360.0,
                         help="轨道模式下整段视频的总旋转角度，支持负数反向旋转 (default: 360.0)")
-    g_out.add_argument("--n_frames", type=int, default=3600,
-                        help="视频帧数 (default: 3600, 仅 --video 有效)")
+    g_out.add_argument("--n_frames", type=int, default=None,
+                        help=f"视频帧数，仅 --video 有效 (default: {N_FRAMES_DEFAULT}；"
+                             "传入 --v2_camera_path 时为 round(路径时长 × --fps)，显式传入须与之相等)")
     g_out.add_argument("--fps", type=int, default=36,
                         help="视频帧率 (default: 36, 仅 --video 有效)")
     g_out.add_argument("--resume", action="store_true",
@@ -153,6 +157,15 @@ def parse_args() -> argparse.Namespace:
                         help="V2 相机滚转角（度）：相机绕自身光轴旋转，整个画面（吸积盘与星空）一起倾斜；"
                              "在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向。"
                              "与 --v2_disk_roll（盘面绕世界 y 轴、星空不随动、环绕时倾角漂移）不同 (default: 0)")
+    g_cam.add_argument("--v2_camera_path", type=str, default=None, metavar="FILE",
+                        help="V2 运镜路径文件（JSON，格式见 docs/plans/v2_camera_path_plan.md §5.1；"
+                             "示例路径 configs/camera_paths/interstellar_skim.json）。视频模式：每帧的相机位置、朝向、"
+                             "视野、滚转由路径给出，黑洞落在路径指定的画面位置；曝光改为沿路径测光 + 平滑（在 "
+                             "--v2_exposure_ev 之上逐帧补偿），首尾淡入淡出；帧数 = round(路径时长 × --fps)。"
+                             "此时 --pov、--fov、--v2_camera_roll 不生效；不能与 --orbit、--interactive 同用 (default: 不使用)")
+    g_cam.add_argument("--v2_camera_path_time", type=float, default=None, metavar="T",
+                        help="V2 单帧模式：渲染运镜路径在视频时刻 T（秒，0 ≤ T ≤ 路径时长）的画面，用于检查构图；"
+                             "需配合 --v2_camera_path，曝光按单帧自动曝光 + --v2_exposure_ev (default: 不使用)")
     g_struct.add_argument("--v2_reverse_rotation", action="store_true",
                         help="V2 反转吸积盘旋转方向（平流结构与多普勒频移整体反向）")
     g_sky.add_argument("--v2_sky_gain", type=float, default=0.5,
@@ -199,43 +212,91 @@ def v2_volume_overrides(args) -> dict:
 
 
 def validate_args(args) -> None:
-    """Validate CLI arguments."""
-    # FOV range check
+    """校验 CLI 参数的取值范围与组合（在构造渲染器之前尽早报错）。
+
+    Args:
+        args: `parse_args` 返回的参数。
+
+    Raises:
+        ValueError: 视野不在 (0, 180)；盘内半径不小于外半径；积分步长 ≤ 0；抗锯齿强度不在 [0.5, 2]；
+            帧数或帧率 ≤ 0；轨道角度或内缘周期秒数不是有限值（内缘周期秒数还须 > 0）；
+            `--disk_texture` 用于视频或交互模式；运镜参数组合非法（只支持 V2、不能与 `--orbit` 或
+            `--interactive` 同用、单帧模式必须给 `--v2_camera_path_time`、视频模式不能给）。
+    """
     if not (0 < args.fov < 180):
-        raise ValueError(f"FOV must be between 0 and 180 degrees, got {args.fov}")
-
-    # Disk radius check
+        raise ValueError(f"--fov 必须在 (0, 180) 度之间，得到 {args.fov}")
     if args.disk_inner_radius >= args.disk_outer_radius:
-        raise ValueError(f"disk_inner_radius ({args.disk_inner_radius}) must be less than "
-                        f"disk_outer_radius ({args.disk_outer_radius})")
-
-    # Step size check
+        raise ValueError(f"disk_inner_radius（{args.disk_inner_radius}）必须小于 "
+                         f"disk_outer_radius（{args.disk_outer_radius}）")
     if args.step_size <= 0:
-        raise ValueError(f"step_size must be positive, got {args.step_size}")
-
-    # AA strength range
+        raise ValueError(f"--step_size 必须 > 0，得到 {args.step_size}")
     if not (0.5 <= args.aa_strength <= 2.0):
-        raise ValueError(f"aa_strength must be between 0.5 and 2.0, got {args.aa_strength}")
+        raise ValueError(f"--aa_strength 必须在 [0.5, 2.0] 之间，得到 {args.aa_strength}")
 
-    # Video parameters
-    if args.n_frames <= 0:
-        raise ValueError(f"n_frames must be positive, got {args.n_frames}")
-
+    # 视频参数
+    if args.n_frames is not None and args.n_frames <= 0:
+        raise ValueError(f"--n_frames 必须 > 0，得到 {args.n_frames}")
     if args.fps <= 0:
-        raise ValueError(f"fps must be positive, got {args.fps}")
-
+        raise ValueError(f"--fps 必须 > 0，得到 {args.fps}")
     if not math.isfinite(args.orbit_degrees):
-        raise ValueError(f"orbit_degrees must be finite, got {args.orbit_degrees}")
-
+        raise ValueError(f"--orbit_degrees 必须是有限值，得到 {args.orbit_degrees}")
+    if not (math.isfinite(args.v2_orbit_seconds) and args.v2_orbit_seconds > 0):
+        raise ValueError(f"--v2_orbit_seconds 必须是有限正数，得到 {args.v2_orbit_seconds}")
     if args.disk_texture and (args.video or args.interactive):
         raise ValueError("--disk_texture 仅支持静态单帧渲染，video/interactive 模式请使用生命周期系统")
 
+    # 运镜路径
+    if args.v2_camera_path is not None:
+        if args.disk_model != "v2":
+            raise ValueError("--v2_camera_path 仅支持 --disk_model v2")
+        if args.orbit:
+            raise ValueError("--v2_camera_path 不能与 --orbit 同用（相机运动由路径给出）")
+        if args.interactive:
+            raise ValueError("--v2_camera_path 不能与 --interactive 同用")
+    if args.v2_camera_path_time is not None:
+        if args.v2_camera_path is None:
+            raise ValueError("--v2_camera_path_time 需配合 --v2_camera_path")
+        if args.video:
+            raise ValueError("--v2_camera_path_time 仅用于单帧模式，不能与 --video 同用")
+        if not math.isfinite(args.v2_camera_path_time):
+            raise ValueError(f"--v2_camera_path_time 必须是有限值，得到 {args.v2_camera_path_time}")
+    elif args.v2_camera_path is not None and not args.video:
+        raise ValueError("--v2_camera_path 单帧模式需用 --v2_camera_path_time 指定时刻")
+
+
+def resolve_n_frames(args, path_duration) -> int:
+    """确定视频帧数。
+
+    Args:
+        args: CLI 参数（读取 `--n_frames`、`--fps`、`--video`）。
+        path_duration: 运镜路径时长（秒）；None = 未使用运镜路径。
+
+    Returns:
+        帧数：运镜视频为 `round(path_duration · fps)`；否则为 `--n_frames`，未传入时为 `N_FRAMES_DEFAULT`。
+
+    Raises:
+        ValueError: 运镜视频的帧数为 0（路径短于半帧），或显式传入的 `--n_frames` 与路径时长不符。
+    """
+    if path_duration is None or not args.video:
+        return args.n_frames if args.n_frames is not None else N_FRAMES_DEFAULT
+    n = int(round(path_duration * args.fps))
+    if n < 1:
+        raise ValueError(f"运镜路径时长 {path_duration} s 在 {args.fps} fps 下不足一帧")
+    if args.n_frames is not None and args.n_frames != n:
+        raise ValueError(f"--n_frames {args.n_frames} 与运镜路径不符：时长 {path_duration} s × {args.fps} fps = {n} 帧；"
+                         "去掉 --n_frames 或改为该值")
+    return n
+
 
 def main():
-
-
+    """命令行入口：解析与校验参数，按模式（V1 / V2，单帧 / 视频 / 运镜 / 交互）分发渲染。"""
     args = parse_args()
     validate_args(args)
+    camera_plan = None
+    if args.v2_camera_path is not None:
+        from src.v2.path_video import load_camera_plan
+        camera_plan = load_camera_plan(args.v2_camera_path)
+    args.n_frames = resolve_n_frames(args, camera_plan.path.duration if camera_plan else None)
 
     resolutions = {"4k": (3840, 2160), "fhd": (1920, 1080), "hd": (1280, 720), "sd": (640, 360)}
     width, height = resolutions[args.resolution]
@@ -260,7 +321,7 @@ def main():
             ignore_taichi_cache=args.ignore_taichi_cache
         )
 
-    def _make_v2_renderer(args, width, height, video=False):
+    def _make_v2_renderer(args, width, height, video=False, quality=None, init_taichi=True):
         """构造 V2 体积渲染器（单帧与视频共用）。
 
         Args:
@@ -270,6 +331,9 @@ def main():
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
                 （单帧 2、视频 1）未显式传入时的默认值。
+            quality: `(优化级别, 超采样倍率)`；None = 按 `resolve_v2_quality`。运镜测光渲染器用 `(3, 1)`。
+            init_taichi: 是否初始化 Taichi 运行时；同一进程构造第二个渲染器时传 False
+                （重新初始化会销毁已有渲染器的 field）。
 
         Returns:
             `DiskV2Renderer`，体积模型参数为 `DiskV2VolumeParams()` 默认值叠加 CLI 显式覆盖项（`v2_volume_overrides`）。
@@ -280,9 +344,10 @@ def main():
         from src.v2.params import DiskV2Params, DiskV2VolumeParams
         from src.v2.taichi_render import DiskV2Renderer
 
-        opt, ss = resolve_v2_quality(args, video)
-        print(f"[V2] 优化级别 {opt}，超采样倍率 {ss}（每像素 {ss * ss} 条光线）")
-        ti.init(arch=ti.gpu if args.device == "gpu" else ti.cpu, default_fp=ti.f32)
+        opt, ss = quality if quality is not None else resolve_v2_quality(args, video)
+        print(f"[V2] {width}×{height}，优化级别 {opt}，超采样倍率 {ss}（每像素 {ss * ss} 条光线）")
+        if init_taichi:
+            ti.init(arch=ti.gpu if args.device == "gpu" else ti.cpu, default_fp=ti.f32)
         skybox, _, _ = load_or_generate_skybox(args.texture, 2048, 1024, args.n_stars)
         return DiskV2Renderer(
             width=width, height=height,
@@ -330,13 +395,13 @@ def main():
         import math as _math
         import time as _time
 
+        from src.v2.path_video import inner_orbit_period
         from src.v2.video_segments import render_segmented
 
         renderer = _make_v2_renderer(args, width, height, video=True)
 
         # 物理时间步：内缘轨道周期 = v2_orbit_seconds 视频秒（r_in 取 ISCO 钳制后的值）
-        r_in_m = renderer.params.r_in
-        period_in = 2 * _math.pi / _math.sqrt(0.5 / r_in_m ** 3)
+        period_in = inner_orbit_period(renderer.params.r_in)
         dt_per_frame = period_in / (args.v2_orbit_seconds * args.fps)
 
         # 相机轨道
@@ -393,6 +458,89 @@ def main():
         pool.shutdown()
         print(f"[V2 video] 完成: {args.output} ({_time.time() - start:.1f}s)")
 
+    def _render_path_video_v2(args, width, height, plan):
+        """V2 运镜视频：路径报告与检查 → 沿路径测光 → 逐帧渲染（逐帧曝光、淡入淡出）→ 分段写出。
+
+        Args:
+            args: CLI 参数（读取 `--n_frames`（已由路径确定）、`--fps`、`--v2_orbit_seconds`、`--resume` 与渲染参数）。
+            width, height: 输出分辨率（像素）。
+            plan: `CameraPlan`。
+
+        Formula:
+            第 f 帧：视频时刻 t_f = f / fps，物理时刻见 `path_video.physical_time`，抖动种子 f + 1；
+            曝光 E_f = E₀·2^{ev(t_f)}，E₀ = 0.9 / p99.9(首帧盘区亮度)；输出 = α(t_f)·sRGB 画面。
+
+        Notes:
+            续传：进度文件保存 E₀，校验参数包含路径文件内容；曝光曲线每次运行重新测光（抖动种子固定，
+            结果可复现，约 2 分钟）。测光渲染器（128×72）与正片渲染器共用同一 Taichi 运行时。
+        """
+        import json as _json
+        import time as _time
+
+        from src.v2.exposure_curve import auto_exposure, fade_factor
+        from src.v2.path_video import meter_plan, render_path_hdr, time_scale
+        from src.v2.video_segments import render_segmented
+
+        path = plan.path
+        orbit_s = args.v2_orbit_seconds
+        path.check(width / height)
+        meter = _make_v2_renderer(args, *plan.metering.size, video=True, quality=(3, 1))
+        for line in path.report(time_scale(meter.params.r_in, orbit_s), meter.params.r_in, meter.params.r_out,
+                                meter.params.disk_spin):
+            print(line)
+        curve = meter_plan(meter, plan, meter.exposure_ev, orbit_s)
+        renderer = _make_v2_renderer(args, width, height, video=True, init_taichi=False)
+
+        start = _time.time()
+        pool = ThreadPoolExecutor(max_workers=1)
+
+        def _frame_u8(hdr, sky, exposure, alpha):
+            """CPU 阶段：曝光与后处理，再乘淡入淡出系数。
+
+            Args:
+                hdr, sky: `render_hdr` 返回的盘发射 HDR 与天空（线性光）。
+                exposure: 本帧曝光系数 E₀·2^{ev(t)}。
+                alpha: 淡入淡出系数 α ∈ [0, 1]，乘在 sRGB 编码值上。
+
+            Returns:
+                `(H, W, 3)` uint8 RGB 帧。
+            """
+            return (np.clip(renderer.finish(hdr, sky, exposure=exposure) * alpha, 0, 1) * 255).astype(np.uint8)
+
+        def _render_frames(f0, f1, e0):
+            """渲染帧 [f0, f1)，后处理交给单线程池，与下一帧 GPU 积分并行。
+
+            Args:
+                f0, f1: 帧序号范围（左闭右开）。
+                e0: 首帧自动曝光 E₀；None = 由第 f0 帧（只会是第 0 帧）计算。
+
+            Returns:
+                生成器，按帧序产出 `(uint8 帧, E₀)`（供 `render_segmented` 保存 E₀）。
+            """
+            pending = None
+            for f in range(f0, f1):
+                t = f / args.fps
+                hdr, sky = render_path_hdr(renderer, path, t, orbit_s, seed=f + 1)
+                if e0 is None:
+                    e0 = auto_exposure(hdr)
+                fut = pool.submit(_frame_u8, hdr, sky, e0 * 2.0 ** curve.ev_at(t),
+                                  fade_factor(t, path.duration, plan.fade))
+                if pending is not None:
+                    yield pending.result(), e0
+                pending = fut
+                if f % 24 == 0:
+                    print(f"  frame {f}/{args.n_frames}  t={t:.1f}s  ev={curve.ev_at(t):+.2f}  "
+                          f"{_time.time() - start:.1f}s", flush=True)
+            if pending is not None:
+                yield pending.result(), e0
+
+        params = {k: v for k, v in vars(args).items() if k not in ("output", "resume")}
+        params = _json.loads(_json.dumps({**params, "width": width, "height": height,
+                                          "camera_path_spec": plan.spec}, default=str))
+        render_segmented(args.n_frames, args.fps, args.output, params, args.resume, _render_frames)
+        pool.shutdown()
+        print(f"[V2 video] 完成: {args.output} ({_time.time() - start:.1f}s)")
+
     if args.disk_model == "v2":
         # V2 路径：独立 DiskV2Renderer（体积模型），不复用 V1 的 TaichiRenderer。
         if args.interactive:
@@ -402,8 +550,19 @@ def main():
                 "--disk_model v2 当前仅支持 --device gpu（CPU 路径单帧也要数分钟）；"
                 "请加上 '--device gpu' 后重试。"
             )
-        if args.video:
+        if args.video and camera_plan is not None:
+            _render_path_video_v2(args, width, height, camera_plan)
+        elif args.video:
             _render_video_v2(args, width, height, fov)
+        elif camera_plan is not None:
+            from src.v2.path_video import render_path_hdr
+            t_path = args.v2_camera_path_time
+            if not 0.0 <= t_path <= camera_plan.path.duration:
+                raise ValueError(f"--v2_camera_path_time 须在 [0, {camera_plan.path.duration}] 内，得到 {t_path}")
+            camera_plan.path.check(width / height)
+            renderer = _make_v2_renderer(args, width, height, video=False)
+            hdr, sky = render_path_hdr(renderer, camera_plan.path, t_path, args.v2_orbit_seconds, seed=1)
+            save_image(renderer.finish(hdr, sky), args.output)
         else:
             renderer = _make_v2_renderer(args, width, height, video=False)
             img = renderer.render(cam_pos=args.pov, fov=fov)

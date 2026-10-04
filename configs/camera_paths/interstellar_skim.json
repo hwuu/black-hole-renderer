@@ -1,0 +1,154 @@
+{
+  "duration": 87.5,
+  "path_smoothing": 0.5,
+  "progress": {
+    "near_weight": 0.03,
+    "near_height_floor": 0.3,
+    "smoothing": 0.3
+  },
+  "rhythm": {
+    "ramp_in": 6.0,
+    "ramp_out": 8.0,
+    "speed_start": 0.55,
+    "speed_end": 0.55
+  },
+  "exposure": {
+    "metering_step": 0.5,
+    "metering_size": [128, 72],
+    "smoothing": 1.5,
+    "gain": 0.6,
+    "ev_range": [-0.9, 1.1]
+  },
+  "fade": {
+    "fade_in": 2.0,
+    "fade_out": 3.0
+  },
+  "keyframes": [
+    {
+      "r": 72,
+      "phi_deg": -179,
+      "z": 10.0,
+      "fov": 32,
+      "roll": 12.5,
+      "subject_uv": [0.6, 0.45],
+      "label": "S1"
+    },
+    {
+      "r": 58,
+      "phi_deg": -172,
+      "z": 7.0,
+      "fov": 34,
+      "roll": 12.5,
+      "subject_uv": [0.6, 0.47],
+      "label": "S1"
+    },
+    {
+      "r": 44,
+      "phi_deg": -163,
+      "z": 3.8,
+      "fov": 38,
+      "roll": 13.5,
+      "subject_uv": [0.6, 0.5],
+      "label": "S1/S2"
+    },
+    {
+      "r": 32,
+      "phi_deg": -152,
+      "z": 1.3,
+      "fov": 44,
+      "roll": 15.5,
+      "subject_uv": [0.62, 0.55],
+      "label": "S2"
+    },
+    {
+      "r": 25,
+      "phi_deg": -140,
+      "z": 0.6,
+      "fov": 48,
+      "roll": 16.0,
+      "subject_uv": [0.62, 0.58],
+      "label": "S2/S3"
+    },
+    {
+      "r": 22.5,
+      "phi_deg": -131,
+      "z": 0.35,
+      "fov": 50,
+      "roll": 15.0,
+      "subject_uv": [0.56, 0.55],
+      "label": "S3/S4"
+    },
+    {
+      "r": 22,
+      "phi_deg": -123,
+      "z": 0.25,
+      "fov": 50,
+      "roll": 13.5,
+      "subject_uv": [0.52, 0.52],
+      "label": "S4"
+    },
+    {
+      "r": 22,
+      "phi_deg": -118,
+      "z": 0.0,
+      "fov": 50,
+      "roll": 13.0,
+      "subject_uv": [0.5, 0.5],
+      "label": "S4/S5"
+    },
+    {
+      "r": 22.3,
+      "phi_deg": -113,
+      "z": -0.3,
+      "fov": 50,
+      "roll": 12.5,
+      "subject_uv": [0.5, 0.5],
+      "label": "S5/S6"
+    },
+    {
+      "r": 24,
+      "phi_deg": -105,
+      "z": -0.9,
+      "fov": 46,
+      "roll": 12.5,
+      "subject_uv": [0.48, 0.46],
+      "label": "S6"
+    },
+    {
+      "r": 30,
+      "phi_deg": -96,
+      "z": -2.5,
+      "fov": 42,
+      "roll": 12.5,
+      "subject_uv": [0.45, 0.47],
+      "label": "S6/S7"
+    },
+    {
+      "r": 36,
+      "phi_deg": -88,
+      "z": 0.0,
+      "fov": 40,
+      "roll": 12.5,
+      "subject_uv": [0.43, 0.47],
+      "label": "S7"
+    },
+    {
+      "r": 44,
+      "phi_deg": -80,
+      "z": 4.0,
+      "fov": 36,
+      "roll": 12.5,
+      "subject_uv": [0.41, 0.46],
+      "label": "S7/S8"
+    },
+    {
+      "r": 54,
+      "phi_deg": -72,
+      "z": 8.0,
+      "fov": 34,
+      "roll": 12.5,
+      "subject_uv": [0.4, 0.45],
+      "label": "S8"
+    }
+  ]
+}
