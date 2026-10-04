@@ -159,7 +159,7 @@ def parse_args() -> argparse.Namespace:
                              "与 --v2_disk_roll（盘面绕世界 y 轴、星空不随动、环绕时倾角漂移）不同 (default: 0)")
     g_cam.add_argument("--v2_camera_path", type=str, default=None, metavar="FILE",
                         help="V2 运镜路径文件（JSON，格式见 docs/plans/v2_camera_path_plan.md §5.1；"
-                             "示例路径 configs/camera_paths/interstellar_skim.json）。视频模式：每帧的相机位置、朝向、"
+                             "示例路径 scenes/v2_arts/interstellar_skim.json）。视频模式：每帧的相机位置、朝向、"
                              "视野、滚转由路径给出，黑洞落在路径指定的画面位置；曝光改为沿路径测光 + 平滑（在 "
                              "--v2_exposure_ev 之上逐帧补偿），首尾淡入淡出；帧数 = round(路径时长 × --fps)。"
                              "此时 --pov、--fov、--v2_camera_roll 不生效；不能与 --orbit、--interactive 同用 (default: 不使用)")

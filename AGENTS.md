@@ -98,8 +98,9 @@
     `path_video.py` 路径文件加载与按路径渲染（见 `docs/plans/v2_camera_path_plan.md`）
 - `src/cli.py`
   - 参数解析与模式分发（V1 / V2、单帧 / 视频 / 运镜）
-- `configs/camera_paths/`
-  - 运镜路径文件；`interstellar_skim.json` 为示例路径（87.5 s）
+- `scenes/`
+  - 成品场景，每个场景一个目录，内含说明（README.md）、渲染命令与运镜路径文件；
+    `v2_arts/interstellar_skim.json` 为示例路径（87.5 s）
 - `scripts/`
   - `contact_sheet.py` 运镜联系表（审构图）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
@@ -199,9 +200,9 @@ python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
 # V2 视频中断后续传：同一条命令加 --resume（每 240 帧一个分段，最多重渲 1 段）
 
 # V2 运镜视频（帧数 = round(路径时长 × fps)；先测光约 2 分钟）与联系表
-python render.py --disk_model v2 --video --v2_camera_path configs/camera_paths/interstellar_skim.json \
+python render.py --disk_model v2 --video --v2_camera_path scenes/v2_arts/interstellar_skim.json \
                  --ar1 3 --ar2 30 --v2_reverse_rotation -r fhd --fps 60 --device gpu -o output/v2_path.mp4
-python scripts/contact_sheet.py configs/camera_paths/interstellar_skim.json --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
+python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
 
 # V2 单测全部
 python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')

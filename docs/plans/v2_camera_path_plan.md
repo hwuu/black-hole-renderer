@@ -78,7 +78,7 @@ BH u      0.60         0.60         0.61   0.56         0.50  0.50          0.45
 | **S7 绕边回升** | 64.6–81.1 s | 从盘外缘外侧回到上方；约 72.9 s 平视经过一线盘面与完整光环（不停留） | 黑洞向左三分线移动 | r 30 → 44、z −1.9 → 0 → 4.1；r > 30 处无气体，不会再次入雾 |
 | **S8 拉远** | 81.1–87.5 s | 盘面全貌，与开场镜像 | 黑洞在左三分线 (0.40, 0.45) | r 52、z 7.4，减速，淡出 |
 
-### 4.3 关键帧（示例路径 `configs/camera_paths/interstellar_skim.json`）
+### 4.3 关键帧（示例路径 `scenes/v2_arts/interstellar_skim.json`）
 
 配合 `--v2_reverse_rotation` 使用（盘从 +z 看顺时针旋转，φ 增大为逆行）。"经过时刻"由节奏曲线算出，不写进路径文件。
 
@@ -273,7 +273,7 @@ c 由 ∫₀ᵀ v dt = S_total 解出；S(t) = ∫₀ᵗ v dt；p(t) 满足 S(p(
 | `src/v2/exposure_curve.py`（新） | 盘区亮度水平、自动曝光、测光 + 平滑曝光曲线、淡入淡出 |
 | `src/v2/path_video.py`（新） | 路径文件加载、内缘周期与时间比例、视频时刻 → 物理时刻、按路径渲染单帧、沿路径测光 |
 | `src/cli.py` | `--v2_camera_path`、`--v2_camera_path_time`；参数校验；`resolve_n_frames`；运镜视频管线 `_render_path_video_v2`；环绕视频改用 `inner_orbit_period` |
-| `configs/camera_paths/interstellar_skim.json`（新） | 示例路径（§4.3、§5.1） |
+| `scenes/v2_arts/interstellar_skim.json`（新） | 示例路径（§4.3、§5.1）；场景说明与渲染命令见同目录 `README.md` |
 | `scripts/contact_sheet.py`（新） | 联系表 |
 | `tests/unit/test_v2_camera_path.py`、`test_v2_exposure_curve.py`（新）；`test_disk_v2_camera.py`、`test_v2_cli.py` | 见 §7 |
 | 文档 | `imaging_model.md` §3、§5、§7，README，AGENTS.md，本文 |
@@ -316,8 +316,8 @@ c 由 ∫₀ᵀ v dt = S_total 解出；S(t) = ∫₀ᵗ v dt；p(t) 满足 S(p(
 - **测光分辨率**：测光用 128×72、优化级别 3，与正片不同；只用其相对首帧的变化量，偏差基本抵消。
 - **速度**：1080p 级别 2 约 6.4 s/帧（估算），5250 帧约 9.3 h，另加测光约 2 min。
 - **静止观者近似**：示例路径远景推近段的局部速度约达 1 c，真实飞船无法这样飞行，飞得这么快时画面也应有明显的
-  光行差与整体频移；按决策 1 忽略。若要求运镜对应真实飞船，需放慢该段或调大 `--v2_orbit_seconds`
-  （物理时间相对视频时间变慢），并以路径报告的最大局部速度验收。
+  光行差与整体频移；按决策 1 忽略。若要求运镜对应真实飞船，需放慢该段或调小 `--v2_orbit_seconds`
+  （每视频秒对应更长的物理时间，相机的物理速度随之降低，盘也转得更快），并以路径报告的最大局部速度验收。
 
 ## 9. 实测数据
 

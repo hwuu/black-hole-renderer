@@ -14,7 +14,7 @@ from src.v2.camera_compose import (UniformSpline, camera_basis, gaussian_smooth,
 from src.v2.camera_path import CameraPath, Keyframe, PathTiming, load_camera_path, local_speed
 from src.v2.path_video import time_scale
 
-DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "configs", "camera_paths",
+DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "scenes", "v2_arts",
                             "interstellar_skim.json")
 
 

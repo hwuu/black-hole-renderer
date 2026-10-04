@@ -69,7 +69,7 @@ class V2VolumeOverridesTest(unittest.TestCase):
 class CameraPathArgsTest(unittest.TestCase):
     """运镜参数：组合校验与帧数确定。"""
 
-    PATH = "configs/camera_paths/interstellar_skim.json"
+    PATH = "scenes/v2_arts/interstellar_skim.json"
 
     def test_invalid_combinations_rejected(self):
         bad = [("--v2_camera_path", self.PATH, "--video", "--orbit"),

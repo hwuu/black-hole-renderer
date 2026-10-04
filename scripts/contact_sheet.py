@@ -5,7 +5,7 @@
 
 用法::
 
-    python scripts/contact_sheet.py configs/camera_paths/interstellar_skim.json \\
+    python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json \\
         --texture sky.jpg --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
 """
 
