@@ -25,6 +25,8 @@
 - 曝光：渲染前沿路径测光，平滑后按 0.6 的比例补偿亮度变化，叠加在曝光补偿 +1.5 档之上；进云变亮、盘底变暗的
   明暗变化得以保留。
 - 盘的旋转方向需配合 `--v2_reverse_rotation`：相机全程逆着盘的旋转方向飞行，盘面纹理与云层始终相对相机流动。
+- 盘的转速：`--v2_orbit_seconds 8`，内缘转一圈 8 视频秒（默认 16），全片内缘约转 11 圈；掠云处（r = 22）云层约
+  2.3°/s，相对相机约 3.5°/s。
 
 ## 渲染命令
 
@@ -34,7 +36,7 @@
 # 正片：1080p / 60 fps，5250 帧，优化级别 2（视频默认）
 python render.py --disk_model v2 --video \
     --v2_camera_path scenes/v2_arts/interstellar_skim.json \
-    --ar1 3 --ar2 30 --v2_reverse_rotation \
+    --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
     -r fhd --fps 60 --device gpu -o output/v2_arts/interstellar_skim_1080p60.mp4
 
@@ -43,19 +45,19 @@ python render.py --disk_model v2 --video \
 # 小样：360p / 15 fps
 python render.py --disk_model v2 --video \
     --v2_camera_path scenes/v2_arts/interstellar_skim.json \
-    --ar1 3 --ar2 30 --v2_reverse_rotation \
+    --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
     -r sd --fps 15 --device gpu -o output/v2_arts/interstellar_skim_360p15.mp4
 
 # 单帧：检查某一时刻的构图（例如 58.7 s 的盘底）
 python render.py --disk_model v2 \
     --v2_camera_path scenes/v2_arts/interstellar_skim.json --v2_camera_path_time 58.7 \
-    --ar1 3 --ar2 30 --v2_reverse_rotation \
+    --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
     -r sd --device gpu -o output/v2_arts/interstellar_skim_t58.png
 
 # 联系表：每个关键帧的经过时刻各一格，画三分线与黑洞目标位置
-python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation \
+python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation --v2_orbit_seconds 8 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg -o output/v2_arts/interstellar_skim_contact_sheet.png
 ```
 
@@ -67,14 +69,15 @@ python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_rever
 
 | 输出 | 帧数 | 耗时 |
 |------|------|------|
-| 1080p / 60 fps | 5250 | 约 9.3 h（约 6.4 s/帧，估算） |
+| 1080p / 60 fps | 5250 | 实测 8.7 h（平均 6.0 s/帧；贴近盘面、云雾浓的帧较慢） |
 | 360p / 15 fps | 1312 | 约 21 min（实测 0.97 s/帧） |
 | 测光（每次视频渲染前） | 176 张 128×72 | 约 1.5–2 min |
+| 4K 单帧（优化级别 1、超采样倍率 2） | 1 | 实测 137 s |
 
 ## 注意事项
 
-- **静止观者近似**：每一帧按位于该处的静止观者成像，不计相机速度带来的光行差与频移。开场推近段（约 4.8 s）
-  的局部速度约 1.01 c，真实飞船无法这样飞行；画面不受影响。渲染前的路径报告会打印这一数值。
+- **静止观者近似**：每一帧按位于该处的静止观者成像，不计相机速度带来的光行差与频移。全片最大局部速度
+  约 0.5 c（开场推近段，约 4.8 s）。渲染前的路径报告会打印这一数值；转速改回默认 16 s 时约 1.01 c。
 - **路径报告**：渲染前打印每个关键帧的经过时刻、位置、速度、顺行 / 逆行、相对气体角速度，以及两次穿越 z = 0 的
   时刻（48.6 s 穿过盘内；72.4 s 在盘外，无气体）。
 - **联系表的曝光**：联系表与单帧按单帧自动曝光成像，穿越盘面那一格偏亮；视频按测光曲线曝光。
