@@ -1,3 +1,4 @@
+import collections
 from concurrent.futures import ThreadPoolExecutor
 import argparse
 import math
@@ -13,6 +14,11 @@ from src.v1.texture import compute_disk_texture_resolution
 
 # 视频帧数默认值（未传 --n_frames、也未传 --v2_camera_path 时）
 N_FRAMES_DEFAULT = 3600
+
+# 视频后处理（曝光、镜头 PSF、色调映射等纯 NumPy 运算）的线程数。GPU 积分与后处理流水线并行，
+# 后处理单线程在低主频服务器 CPU 上会成为瓶颈（实测 4090 机器单线程 3.7 s/帧、8 线程 0.55 s/帧，
+# NumPy 在这些大数组运算中释放 GIL）；结果按帧序收集，帧数与单线程逐位一致
+POSTFX_THREADS = 8
 
 
 def parse_args() -> argparse.Namespace:
@@ -415,7 +421,7 @@ def main():
 
         t0 = 2000.0  # 物理起始时间（参考实现同款）
         start = _time.time()
-        pool = ThreadPoolExecutor(max_workers=1)
+        pool = ThreadPoolExecutor(max_workers=POSTFX_THREADS)
 
         def _to_u8(frame):
             return (np.clip(frame, 0, 1) * 255).astype(np.uint8)
@@ -431,9 +437,20 @@ def main():
             return renderer.render_hdr(cam_pos=cam, fov=fov, t=t0 + f * dt_per_frame)
 
         def _render_frames(f0, f1, exposure):
-            """按帧序产出 `(uint8 帧, 锁定曝光)`；后处理交给单线程池，与下一帧 GPU 积分并行。"""
+            """渲染帧 [f0, f1)，按帧序产出 `(uint8 帧, 锁定曝光)`。
+
+            GPU 积分在主线程串行执行；每帧的后处理交给 `POSTFX_THREADS` 线程的池，
+            与后续帧的 GPU 积分并行，结果按提交顺序收集（与单线程逐位一致）。
+
+            Args:
+                f0, f1: 帧序号范围（左闭右开）。
+                exposure: 首帧锁定的曝光；None = 由第 f0 帧（只会是第 0 帧）计算并锁定。
+
+            Returns:
+                生成器，按帧序产出 `(uint8 帧, 锁定曝光)`（供 `render_segmented` 保存曝光）。
+            """
             renderer.fixed_exposure = exposure
-            pending = None
+            queue = collections.deque()
             for f in range(f0, f1):
                 hdr, sky = _gpu_frame(f)
                 if renderer.fixed_exposure is None:
@@ -442,14 +459,14 @@ def main():
                     renderer.fixed_exposure = 1.0 / renderer.last_white_point
                     yield img, renderer.fixed_exposure
                 else:
-                    fut = pool.submit(lambda h=hdr, s=sky: _to_u8(renderer.finish(h, s)))
-                    if pending is not None:
-                        yield pending.result(), renderer.fixed_exposure
-                    pending = fut
+                    # 池满（在途帧数达到线程数）时先收最旧的一帧，背压 GPU 侧的内存占用
+                    if len(queue) >= POSTFX_THREADS:
+                        yield queue.popleft().result(), renderer.fixed_exposure
+                    queue.append(pool.submit(lambda h=hdr, s=sky: _to_u8(renderer.finish(h, s))))
                 if f % 24 == 0:
                     print(f"  frame {f}/{args.n_frames}  {_time.time() - start:.1f}s", flush=True)
-            if pending is not None:
-                yield pending.result(), renderer.fixed_exposure
+            while queue:
+                yield queue.popleft().result(), renderer.fixed_exposure
 
         # 续传校验：除输出路径与 --resume 外的全部参数（含分辨率、视野）
         params = {k: v for k, v in vars(args).items() if k not in ("output", "resume")}
@@ -492,7 +509,7 @@ def main():
         renderer = _make_v2_renderer(args, width, height, video=True, init_taichi=False)
 
         start = _time.time()
-        pool = ThreadPoolExecutor(max_workers=1)
+        pool = ThreadPoolExecutor(max_workers=POSTFX_THREADS)
 
         def _frame_u8(hdr, sky, exposure, alpha):
             """CPU 阶段：曝光与后处理，再乘淡入淡出系数。
@@ -508,7 +525,10 @@ def main():
             return (np.clip(renderer.finish(hdr, sky, exposure=exposure) * alpha, 0, 1) * 255).astype(np.uint8)
 
         def _render_frames(f0, f1, e0):
-            """渲染帧 [f0, f1)，后处理交给单线程池，与下一帧 GPU 积分并行。
+            """渲染帧 [f0, f1)，后处理交给多线程池，与下一帧 GPU 积分并行。
+
+            GPU 积分在主线程串行执行；每帧的后处理交给 `POSTFX_THREADS` 线程的池，
+            结果按提交顺序收集，与单线程逐位一致。
 
             Args:
                 f0, f1: 帧序号范围（左闭右开）。
@@ -517,22 +537,22 @@ def main():
             Returns:
                 生成器，按帧序产出 `(uint8 帧, E₀)`（供 `render_segmented` 保存 E₀）。
             """
-            pending = None
+            queue = collections.deque()
             for f in range(f0, f1):
                 t = f / args.fps
                 hdr, sky = render_path_hdr(renderer, path, t, orbit_s, seed=f + 1)
                 if e0 is None:
                     e0 = auto_exposure(hdr)
-                fut = pool.submit(_frame_u8, hdr, sky, e0 * 2.0 ** curve.ev_at(t),
-                                  fade_factor(t, path.duration, plan.fade))
-                if pending is not None:
-                    yield pending.result(), e0
-                pending = fut
+                # 池满（在途帧数达到线程数）时先收最旧的一帧，背压 GPU 侧的内存占用
+                if len(queue) >= POSTFX_THREADS:
+                    yield queue.popleft().result(), e0
+                queue.append(pool.submit(_frame_u8, hdr, sky, e0 * 2.0 ** curve.ev_at(t),
+                                         fade_factor(t, path.duration, plan.fade)))
                 if f % 24 == 0:
                     print(f"  frame {f}/{args.n_frames}  t={t:.1f}s  ev={curve.ev_at(t):+.2f}  "
                           f"{_time.time() - start:.1f}s", flush=True)
-            if pending is not None:
-                yield pending.result(), e0
+            while queue:
+                yield queue.popleft().result(), e0
 
         params = {k: v for k, v in vars(args).items() if k not in ("output", "resume")}
         params = _json.loads(_json.dumps({**params, "width": width, "height": height,

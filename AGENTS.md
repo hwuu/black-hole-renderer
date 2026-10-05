@@ -209,6 +209,45 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
 
 ```
 
+### 远程渲染（AutoDL RTX 4090）
+
+长视频与大图放到 AutoDL 的 RTX 4090 实例上渲染，本机只做开发、小样审阅与短验证。
+
+- **实例**：Ubuntu 22.04、RTX 4090（24 GB）、NVIDIA 驱动 580（CUDA 13.0）、Xeon Gold 6430（128 线程）。
+  SSH 地址与端口以 AutoDL 控制台为准；本机用 `ssh -i ~/.ssh/id_ed25519_mac -p <端口> root@<主机>` 免密登录。
+- **环境**：系统没有 `python` / `python3`，统一用 `/root/miniconda3/bin/python`（3.12）。
+  首次开机安装 `pip install taichi==1.7.4 av imageio`（numpy、pillow 已有）。Taichi 只依赖驱动，不需要 CUDA Toolkit；
+  `--device gpu` 在 Linux 上自动走 CUDA，命令与本机相同。
+- **目录**：代码 `/root/autodl-tmp/bhr`，天空贴图 `/root/autodl-tmp/TychoSkymapII.t5_8192x4096.jpg`，产物 `/root/autodl-tmp/out`
+  （`/root/autodl-tmp` 是数据盘，关机后保留 15 天）。
+
+```bash
+# 1. 同步代码（本机执行；包含未提交的改动时用 tar，否则可用 git archive HEAD）
+tar czf /tmp/bhr.tar.gz src tests scenes scripts render.py
+scp -i ~/.ssh/id_ed25519_mac -P <端口> /tmp/bhr.tar.gz root@<主机>:/tmp/
+ssh -i ~/.ssh/id_ed25519_mac -p <端口> root@<主机> 'mkdir -p /root/autodl-tmp/bhr && tar -xzf /tmp/bhr.tar.gz -C /root/autodl-tmp/bhr'
+
+# 2. 验证环境（远端）
+nvidia-smi
+/root/miniconda3/bin/python -c "import taichi as ti; ti.init(arch=ti.cuda); print('ok')"
+
+# 3. 渲染（远端，nohup 后台运行，断线不影响；中断后同一命令加 --resume 续传）
+cd /root/autodl-tmp/bhr && nohup /root/miniconda3/bin/python render.py --disk_model v2 --video \
+    --v2_camera_path scenes/v2_arts/interstellar_skim.json --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
+    -t /root/autodl-tmp/TychoSkymapII.t5_8192x4096.jpg -r fhd --fps 60 --device gpu \
+    -o /root/autodl-tmp/out/interstellar_skim_1080p60.mp4 > /root/autodl-tmp/out/interstellar_skim_1080p60.log 2>&1 &
+
+# 4. 取回产物（本机执行）
+scp -i ~/.ssh/id_ed25519_mac -P <端口> root@<主机>:/root/autodl-tmp/out/<文件> output/<场景>/
+```
+
+- **速度（实测，1080p、优化级别 2）**：GPU 积分 0.37–0.81 s/帧（M5 为 2.5–7.1 s/帧）；后处理按 `src/cli.py` 的
+  `POSTFX_THREADS = 8` 多线程执行，单线程 3.7 s/帧、8 线程约 0.55 s/帧；首次 kernel 编译约 40 s。
+  360p / 15 fps 的 60 s 运镜小样（900 帧）约 6 分钟。
+- **注意**：
+  - 按秒计费，渲染完及时关机；关机前把产物 scp 回本机。
+  - 本机不要跑完整长视频做验证：会让 GPU 长时间满载、机器卡顿；验证用几秒的短路径，或放到远端跑。
+
 
 ### 踩坑记录（v2.3 S0-S9 实施期间）
 
@@ -279,3 +318,18 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
     - 修复：曝光补偿 `--v2_exposure_ev` 默认 +1.5 档、白平衡 4500 K、眩光 0.5、`core_oct_gain` 0.6
     - 做法：同相机对比量化——曝光后盘区越过白点的比例、亮区饱和度、黑洞阴影内的 LDR 均值（纯镜头散射光），
       并逐项关闭（散射 / 大气）排除结构层；先定位到层再改参数
+
+37. **V2 在 CUDA（4090）上首帧 `CUDA_ERROR_ILLEGAL_ADDRESS`，Metal / CPU 正常**（2026-10-05）
+    - 现象：同一份代码在 M5 上跑了几千帧都正常，换到 4090 首帧即崩
+    - 根因：`taichi_impl` 的三处查表（黑体色、亮度、Page–Thorne 温度）只钳制了上端索引；表下限处运行时 f32 的 `log`
+      与编译期常量相差 1 ulp，`u` 变成小负数，`floor` 后 `i0 = −1`。CUDA 读到池基址之前的未映射显存而崩溃，
+      Metal / x64 越界落在已映射内存里、静默读到垃圾值
+    - 修复：两端钳制 `max(min(i0, N − 2), 0)`，与 NumPy 参考 `palette._lut_lookup` 的 `np.clip` 一致
+    - 做法：`compute-sanitizer --tool memcheck` 给出越界地址与所属内核；在远端临时副本里逐个把查表替换成常量二分定位；
+      注意 `DiskV2Renderer` 构造时会自动 `ti.init`（已改为仅在没有 Taichi 程序时才初始化），否则测试脚本指定的 arch 会被覆盖
+    - 保护测试：`tests/unit/test_disk_v2_palette_s2.py::TaichiLutFloorParityTest`（有 CUDA 时在 CUDA 上跑）
+
+38. **后台渲染的等待循环不要用 `pgrep -f <输出文件名>`**（2026-10-05）
+    - 现象：`while pgrep -f "x.mp4"; do sleep 30; done` 永不退出，渲染在后台长时间占满本机
+    - 根因：等待循环所在 shell 的命令行本身包含该字符串，`pgrep -f` 匹配到自己
+    - 做法：记录后台进程 PID（`$!`）后用 `kill -0 $PID` 判断；长渲染放远端，本机只跑几秒的短验证

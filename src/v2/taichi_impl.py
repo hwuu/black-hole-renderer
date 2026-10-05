@@ -574,7 +574,9 @@ class DiskV2Taichi:
             self._r_out - self._r_in
         )
         f = u * (_BB_LUT_N - 1)
-        i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+        # 两端钳制（与 palette._lut_lookup 的 np.clip 一致）：运行时 f32 的 log 与编译期常量的 log
+        # 在表下限处可相差 1 ulp，使 u 变成小负数、floor 后 i0 = −1；不钳下端会在 CUDA 上越界崩溃
+        i0 = ti.max(ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2), 0)
         w = f - ti.cast(i0, ti.f32)
         return self._t_peak_vol * (self._pt_lut[i0] * (1.0 - w) + self._pt_lut[i0 + 1] * w)
 
@@ -1055,7 +1057,7 @@ class DiskV2Taichi:
                 ti.log(_BB_T_MAX_K) - ti.log(_BB_T_MIN_K)
             )
             f = u * (_BB_LUT_N - 1)
-            i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+            i0 = ti.max(ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2), 0)  # 两端钳制，见 _page_thorne_temperature
             w = f - ti.cast(i0, ti.f32)
             rgb = self._bb_lut[i0] * (1.0 - w) + self._bb_lut[i0 + 1] * w
         return rgb
@@ -1082,7 +1084,7 @@ class DiskV2Taichi:
                 ti.log(_LNY_T_MAX_K) - ti.log(_LNY_T_MIN_K)
             )
             f = u * (_BB_LUT_N - 1)
-            i0 = ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2)
+            i0 = ti.max(ti.min(ti.cast(ti.floor(f), ti.i32), _BB_LUT_N - 2), 0)  # 两端钳制，见 _page_thorne_temperature
             w = f - ti.cast(i0, ti.f32)
             out = self._lny_lut[i0] * (1.0 - w) + self._lny_lut[i0 + 1] * w
         return out

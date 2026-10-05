@@ -225,6 +225,82 @@ def ti_exp(x):
     return np.exp(x)
 
 
+class TaichiLutFloorParityTest(unittest.TestCase):
+    """Taichi 查表在下限附近的钳制（与 NumPy 参考一致）。
+
+    背景（2026-10-05 在 RTX 4090 / CUDA 上定位的崩溃）：运行时 f32 的 log 与编译期常量的 log
+    在表下限（T = T_MIN）可以相差 1 ulp，使 u 变成小负数，floor 后 i0 = −1；原实现只钳制了
+    上端（min(i0, N−2)），下端越界在 CUDA 上读未映射显存直接崩溃，在 Metal / CPU 上静默读到
+    相邻内存的垃圾值。NumPy 参考 `_lut_lookup` 用 np.clip(i0, 0, N−2) 两端钳制；
+    Taichi 实现必须与之一致。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import taichi as ti
+
+        # 优先在 CUDA 上跑：本用例的原始故障（i0 = −1 越界）只在部分后端触发（CUDA 崩溃、
+        # Metal / x64 静默读错），x64 上甚至不出现负索引；有 CUDA 时必须覆盖它
+        ti.init(arch=ti.cuda, default_fp=ti.f32)
+        if ti.lang.impl.current_cfg().arch != ti.cuda:
+            ti.init(arch=ti.cpu, default_fp=ti.f32)
+        from src.v2 import taichi_impl as T
+
+        cls.ti, cls.T = ti, T
+        cls.disk = T.DiskV2Taichi.__new__(T.DiskV2Taichi)
+        cls.disk._init_luts()
+
+    def _run_color(self, temps):
+        ti = self.ti
+        t_f = ti.field(ti.f32, shape=len(temps))
+        out = ti.Vector.field(3, ti.f32, shape=len(temps))
+        vals = np.asarray(temps, dtype=np.float32)
+        t_f.from_numpy(vals)
+
+        @ti.kernel
+        def k():
+            for i in t_f:
+                out[i] = self.disk.blackbody_color_ti(t_f[i])
+
+        k()
+        return out.to_numpy(), vals
+
+    def test_color_lut_floor_parity(self):
+        """T 在色度表下限附近（含略低于下限）时取下限颜色，与参考一致。"""
+        temps = [999.9999, 1000.0, 1000.0001, 985.28827, 300.0, 1.0]
+        out, vals = self._run_color(temps)
+        for i, t in enumerate(vals):
+            np.testing.assert_allclose(out[i], np.asarray(blackbody_color(float(t))),
+                                       rtol=2e-3, atol=1e-4,
+                                       err_msg=f"T={t}")
+
+    def test_luminance_lut_floor_parity(self):
+        """T 在亮度表下限（300 K）附近时取下限亮度，与参考一致。
+
+        比较 lnY 而非 Y：Y(300 K) ≈ 8e-45，是 float32 的次正规数，Taichi 运行时会打开宿主的
+        FTZ / DAZ（次正规数按零处理），float32 的 exp / 除法会把它冲成 0 / NaN，无法直接比较。
+        """
+        from src.v2.palette import _LNY_T_MIN_K
+
+        ti = self.ti
+        temps = [299.9999, float(_LNY_T_MIN_K), 300.0001, 150.0]
+        t_f = ti.field(ti.f32, shape=len(temps))
+        out = ti.field(ti.f32, shape=len(temps))
+        vals = np.asarray(temps, dtype=np.float32)
+        t_f.from_numpy(vals)
+
+        @ti.kernel
+        def k():
+            for i in t_f:
+                out[i] = self.disk.blackbody_luminance_ti(t_f[i])
+
+        k()
+        arr = out.to_numpy()
+        for i, t in enumerate(vals):
+            ref_ln_y = math.log(blackbody_luminance(float(t)))
+            self.assertLessEqual(abs(float(arr[i]) - ref_ln_y), 1e-3, msg=f"T={t}")
+
+
 class LutBoundaryTest(unittest.TestCase):
     """LUT 越界行为。"""
 

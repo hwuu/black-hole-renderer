@@ -119,7 +119,9 @@ class DiskV2Renderer:
         device: str = "gpu",
     ) -> None:
         """初始化渲染器：上传天空盒、构造盘体 Taichi 句柄并编译主 kernel。"""
-        if not ti.lang.impl.get_runtime().materialized:
+        # 调用方（CLI / 测试 / 脚本）未初始化 Taichi 时才初始化；已有程序时跳过，
+        # 重复 init 会销毁已存在的所有 field
+        if ti.lang.impl.get_runtime().prog is None:
             ti.init(arch=ti.cpu if device == "cpu" else ti.gpu, default_fp=ti.f32)
 
         self.width = width
