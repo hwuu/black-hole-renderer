@@ -44,6 +44,14 @@ from .noise_ti import (
 )
 from .params import DiskV2Params, DiskV2VolumeParams
 from .shear_cascade import shear_cascade_geometry
+from .temperature_turbulence import (
+    LN_R_ANCHOR as _TT_LN_R_ANCHOR,
+    U_OFFSET as _TT_U_OFFSET,
+    W_OFFSET as _TT_W_OFFSET,
+    W_OFFSET_STEP as _TT_W_OFFSET_STEP,
+    temp_turb_gains,
+    temp_turb_geometry,
+)
 
 # 厚度扰动方位拉长 az_stretch_t = 1 时方位周期等于基础周期 n 的参考半径（r_s）：r_b = 6·s 处 n_φ = n。
 # 取 6（≈ ISCO 外侧亮区）使内区特征与参考实现相同，外圈按 r_b/(6·s) 增加周期。
@@ -279,6 +287,25 @@ class DiskV2Taichi:
         self._sc_c = list(_geom.shear)
         self._sc_g = [float(vp.core_oct_gain) ** k for k in range(self._sc_n)]
         self._sc_con = float(vp.shear_con)
+        # 小尺度温度湍流：剪切级联最细八度之后再延伸 E 个八度，只调制温度
+        # （σ_T = 0 时 _tt_n = 0、相关代码在编译期移除；见 docs/plans/v2_temperature_turbulence_plan.md）
+        self._tt_sig = float(vp.temp_turb_sigma)
+        self._tt_on = self._tt_sig > 0.0
+        _tg = temp_turb_geometry(vp.shear_k0, vp.shear_octaves, vp.shear_ar_small, vp.shear_tilt_k,
+                                 vp.temp_turb_octaves, float(self.params.disk_spin))
+        self._tt_n = len(_tg.kr) if self._tt_on else 0
+        self._tt_kr = list(_tg.kr)
+        self._tt_per = list(_tg.period)
+        self._tt_ua = list(_tg.u_scale)
+        self._tt_c = list(_tg.shear)
+        self._tt_a = list(temp_turb_gains(vp.temp_turb_octaves, vp.temp_turb_gain))
+        self._tt_a2_sum = sum(a * a for a in self._tt_a)
+        # 径向格宽 c_e = r·_tt_cell[e]（径向噪声坐标 |N₀₀|·K·ln r 的一格换算成 r_s）
+        self._tt_cell = [1.0 / (ua * kr) for ua, kr in zip(self._tt_ua, self._tt_kr)]
+        self._tt_k = float(vp.temp_turb_clamp_px)
+        self._tt_lens_half = 0.5 * math.radians(vp.temp_turb_lens_deg)
+        # 单图案标准差 N（_calibrate_volume 中标定，标定前取 1）
+        self._tt_norm = 1.0
         self._core_contrast = float(vp.core_contrast)
         # 保方差混合的单图案均值 m（主云 c / 厚度扰动 tn；_calibrate_volume 中标定，标定前取 1）
         self._mc_single = 1.0
@@ -380,6 +407,22 @@ class DiskV2Taichi:
         self._low_norm = max(float(lbuf.to_numpy().std()), 1e-6)
         self._atm_fine_norm = max(float(fbuf.to_numpy().std()), 1e-6)
 
+        # 温度湍流单图案标准差 N：全部 w_e = 1（足迹取 1e-9 r_s、L = 1），种子偏移 0，与上面同一 (ln r, φ) 网格；
+        # z/r = ζ/100（ζ 同大气小尺度起伏），使竖直噪声坐标跨越多个格——值噪声在整数格点平面上方差偏大
+        if self._tt_on:
+            tbuf = ti.field(dtype=ti.f32, shape=(n_r, n_phi))
+
+            @ti.kernel
+            def _raw_temp_turb(out: ti.template()):
+                for i, j in out:
+                    lnr = ln_r_in + (ln_r_out - ln_r_in) * (ti.cast(i, ti.f32) + 0.5) / n_r
+                    phi = (ti.cast(j, ti.f32) + 0.5) / n_phi * 2.0 * math.pi
+                    zr = (ti.cast((i * 7 + j * 13) % 17, ti.f32) / 17.0 * 4.0 - 2.0) / 100.0
+                    out[i, j] = self._temp_turb_pattern(lnr, ti.exp(lnr), phi, zr, 0.0, 0.0, 1e-9, 1.0)
+
+            _raw_temp_turb(tbuf)
+            self._tt_norm = max(float(tbuf.to_numpy().std()), 1e-6)
+
         # 保方差混合的单图案均值 m：必须先于 ⟨c⟩（⟨c⟩ 经 _flow_I 使用 m）
         if self._seam_fix:
             mbuf = ti.Vector.field(2, dtype=ti.f32, shape=4096)
@@ -427,7 +470,8 @@ class DiskV2Taichi:
                 col = 0.0
                 for k in range(800):
                     z = -zmax + (ti.cast(k, ti.f32) + 0.5) / 800.0 * 2.0 * zmax
-                    em_c, tf_c, ab_c, ab_a, em_a, sc_a = self.density_I(r, z, phi, 0.0)
+                    # 透镜权重 0：温度湍流不参与 κ 标定（且只改温度，不影响吸收柱）
+                    em_c, tf_c, ab_c, ab_a, em_a, sc_a = self.density_I(r, z, phi, 0.0, 1.0, 0.0)
                     col += (ab_c + ab_a) * 2.0 * zmax / 800.0
                 out[i] = col
 
@@ -934,21 +978,206 @@ class DiskV2Taichi:
                 wsq += w[k] * w[k]
         return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._atm_fine_norm
 
+    # ---- 小尺度温度湍流（docs/plans/v2_temperature_turbulence_plan.md） ----
+
+    @ti.func
+    def _temp_turb_weight(self, r, foot, lens_w, e: ti.template()):
+        """第 e 个延伸八度的钳制权重（与 `temperature_turbulence.temp_turb_clamp_weights` 逐值一致）。
+
+        Args:
+            r: 盘局部柱坐标半径（r_s，> 0）。
+            foot: 像素足迹 F（r_s，> 0）。
+            lens_w: 透镜权重 L（[0, 1]）。
+            e: 八度下标（编译期常量）。
+
+        Returns:
+            标量，[0, 1]：格宽 ≤ K 个足迹时为 0，≥ 2K 个足迹时为 L。
+
+        Formula:
+            `w_e = L·sstep((c_e/F − K)/K)`，`c_e = r/(|N₀₀|_e·K_e)`，`sstep(s) = 3s² − 2s³`（s 截断到 [0, 1]）
+
+        Physical Meaning:
+            频率钳制：比像素足迹还小的八度淡出为其统计均值 0；强透镜光线（L → 0）全部淡出。
+
+        Simplifications:
+            只按径向格宽判断（方位格宽更大、更晚淡出）。
+        """
+        t = ti.min(ti.max((r * self._tt_cell[e] / foot - self._tt_k) / self._tt_k, 0.0), 1.0)
+        return lens_w * t * t * (3.0 - 2.0 * t)
+
+    @ti.func
+    def _temp_turb_variance(self, r, foot, lens_w):
+        """钳制后 n_T 的方差 `V = Σ_e (a_e·w_e)² / Σ_e a_e²`（与 `temp_turb_variance` 逐值一致）。
+
+        Args:
+            r, foot, lens_w: 同 `_temp_turb_weight`。
+
+        Returns:
+            标量，[0, 1]：全部 w_e = 1 时为 1，全部为 0 时为 0。
+
+        Physical Meaning:
+            像素内仍可分辨的温度起伏占全尺度起伏的方差比例，供 f_T 的通量守恒补偿使用。
+
+        Simplifications:
+            各八度视为独立、同方差（见 `temperature_turbulence.temp_turb_variance`）。
+        """
+        v = 0.0
+        for e in ti.static(range(self._tt_n)):
+            v += (self._tt_a[e] * self._temp_turb_weight(r, foot, lens_w, e)) ** 2
+        return v / self._tt_a2_sum
+
+    @ti.func
+    def _temp_turb_pattern(self, lnr, r, phi0, zr, ox, oz, foot, lens_w):
+        """单个图案的未归一化温度起伏 `Σ_e a_e·w_e·ν_e`（与 `temp_turb_pattern_np` 逐值一致）。
+
+        Args:
+            lnr, r: `ln r` 与 r（盘局部柱坐标半径，r_s；调用方已算好，避免重复取对数）。
+            phi0: 带内流坐标 φ'（rad，已扣除刚体环带转动）。
+            zr: 无量纲高度 `z / r`。
+            ox, oz: 刚体环带种子偏移（与主云共用）。
+            foot, lens_w: 像素足迹（r_s）与透镜权重，见 `_temp_turb_weight`。
+
+        Returns:
+            标量，零均值；除以 `_tt_norm` 后在全部 w_e = 1 时为单位方差。
+
+        Formula:
+            ```
+            u0  = K_e·(ln r − ln 20)
+            ν_e = vnoise(|N₀₀|_e·u0 + ox + 1000,  φ'/2π·P_e + spin·s_e·u0,  K_e·z/r + oz + 23 + 5e;  P_e)
+            ```
+            权重为 0 的八度跳过（结果相同）。
+
+        Simplifications:
+            加性值噪声；竖直方向各向同性（`K_e·z/r`）；优化级别 ≥ 1 用 `vnoise_fast`（与 `vnoise` 逐位一致）。
+        """
+        s = 0.0
+        for e in ti.static(range(self._tt_n)):
+            w = self._temp_turb_weight(r, foot, lens_w, e)
+            if w > 0.0:
+                u0 = self._tt_kr[e] * (lnr - _TT_LN_R_ANCHOR)
+                x = self._tt_ua[e] * u0 + ox + _TT_U_OFFSET
+                y = phi0 / (2.0 * math.pi) * self._tt_per[e] + self._spin * self._tt_c[e] * u0
+                z = self._tt_kr[e] * zr + oz + _TT_W_OFFSET + _TT_W_OFFSET_STEP * e
+                n = 0.0
+                if ti.static(self._opt >= 1):
+                    n = vnoise_fast(x, y, z, self._tt_per[e])
+                else:
+                    n = vnoise(x, y, z, self._tt_per[e])
+                s += self._tt_a[e] * w * n
+        return s
+
+    @ti.func
+    def _temp_turb_I(self, r, phi, zr, t_delay, foot, lens_w):
+        """温度湍流的归一化起伏 n_T（刚体环两带 × 两相位混合；优化级别 0 的参考路径）。
+
+        Args:
+            r, phi: 盘局部柱坐标（r_s, rad）。
+            zr: 无量纲高度 `z / r`。
+            t_delay: 光行时间延迟 `Δt ≥ 0`（同 `_flow_I`）。
+            foot, lens_w: 像素足迹（r_s）与透镜权重。
+
+        Returns:
+            标量，零均值，方差约为 `_temp_turb_variance(r, foot, lens_w)`。
+
+        Formula:
+            `n_T = Σ_k ω_k·q_k / √Σω_k² / N`（ω_k 为带 × 相位权重，与 `_atm_fine_I` 共用平流表与种子；
+            q_k 为 `_temp_turb_pattern`，N = `_tt_norm`）。
+
+        Physical Meaning:
+            温度团块随刚体环带转动、按带重新播种，视频中不卷绕；保方差混合使带间接缝处起伏强度不变。
+
+        Simplifications:
+            四个图案共用同一组钳制权重，混合后方差仍为 V。
+        """
+        lnr = ti.log(r)
+        fb = self._band_coord(lnr, phi)
+        b0 = ti.floor(fb)
+        fbf = fb - b0
+        acc = 0.0
+        wsq = 0.0
+        for db in ti.static(range(2)):
+            bi = ti.cast(b0, ti.i32) + db
+            wb = ti.cos(0.5 * math.pi * fbf) ** 2
+            if db == 1:
+                wb = ti.sin(0.5 * math.pi * fbf) ** 2
+            idx = bi - self._adv_core_f.b_lo
+            if 0 <= idx < self._adv_core_f.rot.shape[0]:
+                phi_rigid = phi - _delayed_rot(self._adv_core_f.rot[idx], self._adv_core_f.om_b[idx], t_delay) - self._adv_core_f.phi_b[idx]
+                for p in ti.static(range(2)):
+                    fr, cyc = _delayed_seed(self._adv_core_f.frac[idx][p], self._adv_core_f.cyc[idx][p], self._adv_core_f.t_life[idx], t_delay)
+                    wp = ti.sin(math.pi * fr) ** 2
+                    ox = _hashf(bi, cyc, 2 * p) * 97.0
+                    oz = _hashf(bi, cyc, 2 * p + 1) * 97.0
+                    w = wb * wp
+                    acc += w * self._temp_turb_pattern(lnr, r, phi_rigid, zr, ox, oz, foot, lens_w)
+                    wsq += w * w
+        return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._tt_norm
+
+    @ti.func
+    def _temp_turb_shared(self, lnr, r, zr, w, ph, ox, oz, foot, lens_w):
+        """`_temp_turb_I` 的共享带信息版本（优化级别 ≥ 1；跳过权重为 0 的组合，结果相同）。
+
+        Args:
+            lnr, r: `ln r` 与 r（r_s）。
+            zr: 无量纲高度 `z / r`。
+            w, ph, ox, oz: `_band_info` 的返回值。
+            foot, lens_w: 像素足迹（r_s）与透镜权重。
+
+        Returns:
+            标量，零均值，方差约为 `_temp_turb_variance(r, foot, lens_w)`；与 `_temp_turb_I` 在浮点舍入内一致。
+
+        Formula:
+            同 `_temp_turb_I`，带信息由 `_band_info` 预先算好。
+        """
+        acc = 0.0
+        wsq = 0.0
+        for k in ti.static(range(4)):
+            if w[k] != 0.0:
+                acc += w[k] * self._temp_turb_pattern(lnr, r, ph[k // 2], zr, ox[k], oz[k], foot, lens_w)
+                wsq += w[k] * w[k]
+        return acc / ti.sqrt(ti.max(wsq, 1e-6)) / self._tt_norm
+
+    @ti.func
+    def _temp_turb_lens_weight(self, cos_delta):
+        """透镜权重 L（与 `temperature_turbulence.temp_turb_lens_weight` 逐值一致）。
+
+        Args:
+            cos_delta: 当前光线方向与离开相机时方向的夹角余弦（两者均为单位向量）。
+
+        Returns:
+            标量，[0, 1]：δ ≤ δ₀/2 时为 1，δ ≥ δ₀ 时为 0。
+
+        Formula:
+            `δ = acos(clamp(cos_delta, −1, 1))`，`L = 1 − sstep((δ − δ₀/2)/(δ₀/2))`
+
+        Physical Meaning:
+            累计偏折角越大，像素足迹 λθ 的直线近似越不可信，温度湍流越弱。
+
+        Simplifications:
+            用累计偏折角代替完整的光线映射；δ₀ 为经验阈值。
+        """
+        d = ti.acos(ti.min(ti.max(cos_delta, -1.0), 1.0))
+        t = ti.min(ti.max((d - self._tt_lens_half) / self._tt_lens_half, 0.0), 1.0)
+        return 1.0 - t * t * (3.0 - 2.0 * t)
+
     # ---- 体积密度场（统一气体模型） ----
 
     @ti.func
-    def density_I(self, r, z, phi, t_delay):
+    def density_I(self, r, z, phi, t_delay, foot, lens_w):
         """统一气体模型的体积密度场：盘面（高斯核心）与大气（指数尾巴）是同一团气体、同一湍流场。
 
         Args:
             r, z, phi: 盘局部柱坐标（r_s, r_s, rad）；z 为离中面高度，可正可负。
             t_delay: 光行时间延迟 `Δt ≥ 0`（r_s/c）；采样时刻 = 帧时刻 − Δt，
                 标定与无光行时间渲染时传 0。
+            foot: 像素足迹 F（r_s，> 0）：一个输出像素在采样点处覆盖的尺寸，供温度湍流的频率钳制使用。
+            lens_w: 透镜权重 L（[0, 1]）：0 = 温度湍流全部淡出（标定时传 0）。
+                温度湍流关闭（`temp_turb_sigma = 0`）时两者不参与计算。
 
         Returns:
             6 元组标量 `(em_c, tf_c, ab_c, ab_a, em_a, sc_a)`：
-            `em_c ≥ 0` 核心发射权重；`tf_c ∈ [0.7, 1.3·grey_cap]` 灰大气温度倍率（核心与大气共用，
-            围绕 1）；`ab_c ≥ 0` 核心吸收（无量纲，渲染核乘 κ）；`ab_a ≥ 0` 大气消光（吸收 + 散射）；
+            `em_c ≥ 0` 核心发射权重；`tf_c` 温度倍率（核心与大气共用，围绕 1）：温度湍流关闭时
+            `∈ [0.7, 1.3·grey_cap]`，开启时再乘对数正态因子 f_T，只保证 > 0；`ab_c ≥ 0` 核心吸收（无量纲，渲染核乘 κ）；`ab_a ≥ 0` 大气消光（吸收 + 散射）；
             `em_a = (1 − ω)·ab_a ∈ [0, ab_a]` 大气热发射权重；
             `sc_a = ω·ab_a·(1 − e^{−τ_c}) ∈ [0, ab_a − em_a]` 大气散射权重（渲染核乘 `scatter_j·S_disk`）。
             盘外或大气顶以上为 `(0, 1, 0, 0, 0, 0)`。
@@ -962,6 +1191,7 @@ class DiskV2Taichi:
             ω      = 1/(1 + q·ρ_a/ρ_mid)，ρ_mid = Σ/(√(2π)·H)         （q = abs_scatter_ratio）
             τ_z    = κ·[ cfac·Σ·½·erfc(|z|/(√2·H_s)) + ½·A·Σ·ĉ·cov·exp(−|z|/H_a) ]
             tf     = 1 + grey_mix·(min((¾(τ_z + ⅔))^{1/4}, grey_cap) − 1)，再乘 clamp(1 + dt_i·(ĉ − 1), 0.7, 1.3)
+            f_T    = exp(σ_T·n_T − 2σ_T²·V)，tf ← tf·f_T                （温度湍流，`_temp_turb_*`；σ_T = 0 时无此项）
             τ_c    = κ·cfac·Σ                                         （当地核心整柱光学深度）
             J      = scatter_j·S_disk·(1 − e^{−τ_c})                  （渲染核：sc_a·scatter_j·S_disk）
             ```
@@ -971,6 +1201,7 @@ class DiskV2Taichi:
 
         Physical Meaning:
             同一团气体在竖直方向的两段剖面：等温静力平衡的致密核心 + 被加热、上浮的稀薄大气。
+            温度湍流是级联最小尺度上的温度起伏，按平均热辐射通量 ⟨T⁴⟩ 守恒归一，只改热发射、不改密度与吸收。
             大气密度跟随下方湍流（ĉ），稀处出现空隙；温度由上方光学深度按灰大气规律连续给出；
             散射比例 ω 由密度决定（Kramers 吸收 ∝ ρ，电子散射与 ρ 无关），稀薄大气以散射为主。
             散射的入射光来自下方盘面：光学深度为 τ_c 的核心层发出的强度是 S·(1 − e^{−τ_c})，
@@ -1001,16 +1232,26 @@ class DiskV2Taichi:
                 c = 0.0
                 tn = 0.0
                 na = 0.0  # 大气小尺度起伏（零均值、单位方差）
+                nt = 0.0  # 温度湍流起伏 n_T（零均值，方差 tv）
+                tv = 0.0  # 钳制后的方差 V；全部八度淡出时为 0，n_T 不计算
+                if ti.static(self._tt_on):
+                    tv = self._temp_turb_variance(r, foot, lens_w)
                 if ti.static(self._opt >= 1):
                     # 优化级别 ≥ 1：带信息每采样点只算一次（与 _flow_I / _atm_fine_I 逐位一致）
                     bw, bph, box, boz, bnb = self._band_info(lnr, phi, t_delay)
                     c, tn = self._flow_shared(r, z, bw, bph, box, boz, bnb)
                     if ti.static(self._atm_fsig > 0.0):
                         na = self._atm_fine_shared(lnr, self._atm_ffz * z / h_a, bw, bph, box, boz)
+                    if ti.static(self._tt_on):
+                        if tv > 0.0:
+                            nt = self._temp_turb_shared(lnr, r, z / r, bw, bph, box, boz, foot, lens_w)
                 else:
                     c, tn = self._flow_I(r, phi, z, t_delay)
                     if ti.static(self._atm_fsig > 0.0):
                         na = self._atm_fine_I(r, phi, self._atm_ffz * z / h_a, t_delay)
+                    if ti.static(self._tt_on):
+                        if tv > 0.0:
+                            nt = self._temp_turb_I(r, phi, z / r, t_delay, foot, lens_w)
                 cn = c / self._c_mean
                 softsat = 1.0 - 1.0 / (ti.max(tn, 0.0) + 1.0)
                 h_s = ti.max(h_geo * (1.0 - self._surf_noise + self._surf_noise * softsat), 1e-6)
@@ -1039,6 +1280,9 @@ class DiskV2Taichi:
                 tf_c = 1.0 + self._grey_mix * (
                     ti.min(ti.pow(0.75 * (tau_z + 2.0 / 3.0), 0.25), self._grey_cap) - 1.0)
                 tf_c *= ti.min(ti.max(1.0 + self._dt_i * (cn - 1.0), 0.7), 1.3)
+                if ti.static(self._tt_on):
+                    # 平均通量守恒的对数正态温度起伏：⟨f_T⁴⟩ = 1；tv = 0 时 nt = 0，f_T 精确为 1
+                    tf_c *= ti.exp(self._tt_sig * nt - 2.0 * self._tt_sig * self._tt_sig * tv)
         return em_c, tf_c, ab_c, ab_a, em_a, sc_a
 
     @ti.func

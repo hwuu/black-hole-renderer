@@ -31,6 +31,7 @@ from .palette import doppler_lum_compensation
 from .params import DiskV2Params, DiskV2VolumeParams
 from .postfx import hdr_luminance, postfx, postfx_params_defaults, srgb_decode
 from .taichi_impl import DiskV2Taichi, disk_g_factor_ti
+from .temperature_turbulence import MIN_PATH_LENGTH as _TT_MIN_PATH
 
 
 # Schwarzschild 半径，与 render.py 保持一致（无量纲单位）。
@@ -228,6 +229,9 @@ class DiskV2Renderer:
         step_c = float(self._step_c)
         # 盘内基础步长随盘厚缩放（固定 0.03 r_s 在薄盘中会比盘本身还厚）
         thick = float(disk._thick)
+        # 温度湍流（σ_T = 0 时相关代码在编译期移除）；像素足迹按输出像素计算：内部像素高度 × 每轴超采样倍率
+        tt_on = bool(disk._tt_on)
+        ss_f = float(self.ss)
 
         @ti.func
         def _compute_acceleration(pos, L2):
@@ -302,6 +306,7 @@ class DiskV2Renderer:
             cf = self.cam_forward_field[None]
             pw = self.pixel_width_field[None]
             ph = self.pixel_height_field[None]
+            theta_out = ph * ss_f  # 输出像素的像素角（像平面距相机 1，小角度近似）
             # 与 V1 `render._ray_march_kernel` 完全一致：垂直 FOV + aspect 像素步长。
             center = cp + cf * 1.0
             tl = center - cr * (pw * img_w / 2.0) + cu * (ph * img_h / 2.0)
@@ -322,6 +327,7 @@ class DiskV2Renderer:
                 pos = cp
                 step_idx = 0
                 dir_ = ray_dir
+                dir0 = ray_dir  # 光线离开相机时的方向（单位向量；温度湍流的累计偏折角以它为参考）
 
                 # 角动量平方 L² = |r × dir|²。
                 L_vec = pos.cross(dir_)
@@ -361,6 +367,14 @@ class DiskV2Renderer:
                     h = ti.min(h, sc * 0.03 * thick + 0.3 * d_slab)
                     d_atm = ti.max(ti.abs(pl[2]) - (disk._atm_ext * disk._atm_h * rc_h + 0.02), 0.0) + rad_out
                     h = ti.min(h, sc * ti.max(0.3 * disk._atm_h * rc_h, 0.03 * thick) + 0.3 * d_atm)
+                    if ti.static(tt_on):
+                        # 温度湍流：大气包络内每个可见最细格宽至少 2/sc 个采样点
+                        #   h ≤ sc·½·max(c_last, K·F)，F = max(λ, λ_min)·θ（λ 取段起点）；透镜权重为 0 时不约束
+                        if d_atm == 0.0:
+                            if disk._temp_turb_lens_weight(dir_.normalized().dot(dir0)) > 0.0:
+                                foot_h = ti.max(lam, _TT_MIN_PATH) * theta_out
+                                c_last = rc_h * disk._tt_cell[disk._tt_n - 1]
+                                h = ti.min(h, sc * 0.5 * ti.max(c_last, disk._tt_k * foot_h))
 
                     # 首步抖动：起点沿光线随机偏移 [0, h)，与超采样一起构成蒙特卡洛体积积分
                     if step_idx == 0:
@@ -404,8 +418,14 @@ class DiskV2Renderer:
                             t_delay = 0.0
                             if ti.static(light_delay):
                                 t_delay = lam - 0.5 * ds
+                            # 温度湍流的像素足迹（λ 取段中点）与透镜权重（段中点方向相对出射方向的偏折角）
+                            foot = 1.0
+                            lens_w = 0.0
+                            if ti.static(tt_on):
+                                foot = ti.max(lam - 0.5 * ds, _TT_MIN_PATH) * theta_out
+                                lens_w = disk._temp_turb_lens_weight((0.5 * (dir_ + new_dir)).normalized().dot(dir0))
                             em_c, tf_c, ab_c, ab_a, em_a, sc_a = disk.density_I(
-                                r_local, z_local, phi_local, t_delay)
+                                r_local, z_local, phi_local, t_delay, foot, lens_w)
                             if em_c + em_a + ab_c + ab_a > 1e-9:
                                 g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
                                 g_col = ti.pow(g_phys, self.doppler_color)

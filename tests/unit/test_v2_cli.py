@@ -56,6 +56,15 @@ class V2VolumeOverridesTest(unittest.TestCase):
             _args("--v2_atm_frac", "0.3", "--v2_atm_height", "0.02", "--v2_atm_fine", "0.7")))
         self.assertEqual((vp.atm_frac, vp.atm_height, vp.atm_fine_sigma), (0.3, 0.02, 0.7))
 
+    def test_temp_turb_flag(self):
+        """`--v2_temp_turb` 写入 `temp_turb_sigma`；未传时保持默认（关闭）。"""
+        from src.v2.params import DiskV2VolumeParams
+        self.assertNotIn("temp_turb_sigma", cli.v2_volume_overrides(_args()))
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_temp_turb", "0.1")))
+        self.assertEqual(vp.temp_turb_sigma, 0.1)
+        with self.assertRaises(ValueError):
+            DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_temp_turb", "0.6")))
+
     def test_exposure_ev_flag(self):
         self.assertIsNone(_args().v2_exposure_ev)
         self.assertEqual(_args("--v2_exposure_ev", "0.5").v2_exposure_ev, 0.5)

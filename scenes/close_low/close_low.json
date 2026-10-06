@@ -1,0 +1,46 @@
+{
+  "duration": 60.0,
+  "path_smoothing": 0.0,
+  "progress": {
+    "smoothing": 0.0
+  },
+  "rhythm": {
+    "ramp_in": 0.0,
+    "ramp_out": 0.0,
+    "speed_start": 1.0,
+    "speed_end": 1.0
+  },
+  "fade": {
+    "fade_in": 2.0,
+    "fade_out": 3.0
+  },
+  "keyframes": [
+    {
+      "r": 22.0,
+      "phi_deg": -129.1,
+      "z": 0.45,
+      "fov": 28.0,
+      "roll": 10.0,
+      "subject_uv": [0.5, 0.62],
+      "label": "start"
+    },
+    {
+      "r": 22.0,
+      "phi_deg": -87.69,
+      "z": 0.45,
+      "fov": 28.0,
+      "roll": 10.0,
+      "subject_uv": [0.5, 0.62],
+      "label": "mid"
+    },
+    {
+      "r": 22.0,
+      "phi_deg": -46.28,
+      "z": 0.45,
+      "fov": 28.0,
+      "roll": 10.0,
+      "subject_uv": [0.5, 0.62],
+      "label": "end"
+    }
+  ]
+}

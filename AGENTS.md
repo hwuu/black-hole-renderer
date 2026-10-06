@@ -96,11 +96,13 @@
   - 体积吸积盘（V2），见 `docs/design_ad_v2.md`
   - 运镜：`camera_compose.py` 插值 / 平滑 / 构图求解；`camera_path.py` 路径与节奏；`exposure_curve.py` 测光 + 平滑曝光、淡入淡出；
     `path_video.py` 路径文件加载与按路径渲染（见 `docs/plans/v2_camera_path_plan.md`）
+  - 小尺度温度湍流：`temperature_turbulence.py` 几何、频率钳制 / 透镜权重与 NumPy 参考；Taichi 实现为
+    `taichi_impl.DiskV2Taichi._temp_turb_*`（见 `docs/plans/v2_temperature_turbulence_plan.md`）
 - `src/cli.py`
   - 参数解析与模式分发（V1 / V2、单帧 / 视频 / 运镜）
 - `scenes/`
   - 成品场景，每个场景一个目录，内含说明（README.md）、渲染命令与运镜路径文件；
-    `v2_arts/interstellar_skim.json` 为示例路径（87.5 s）
+    `v2_arts/interstellar_skim.json` 为示例路径（87.5 s）；`close_low/close_low.json` 为贴云顶匀速环绕（60 s，开启温度湍流）
 - `scripts/`
   - `contact_sheet.py` 运镜联系表（审构图）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验

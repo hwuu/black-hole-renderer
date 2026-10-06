@@ -147,6 +147,12 @@ def parse_args() -> argparse.Namespace:
                              "能量守恒、作用于全部光、无阈值；辉光只在暗处（天空、黑洞阴影）显著，盘面不会被点亮。"
                              "0 = 理想镜头（无辉光）；好镜头约 0.02，柔光镜约 0.2–0.5；越大辉光越明显，"
                              "全画面对比度按 (1 − ε) 下降。原理见 docs/imaging_model.md (default: 0.5)")
+    g_rad.add_argument("--v2_temp_turb", type=float, default=None,
+                        help="V2 小尺度温度湍流强度 σ_T（0–0.5）：核心与大气的温度乘对数正态起伏 "
+                             "exp(σ_T·n − 2σ_T²·V)（平均热辐射通量 ⟨T⁴⟩ 守恒），n 为主云剪切级联向更小尺度延伸 2 个八度的"
+                             "起伏，比像素小的八度自动淡出（方差降为 V）、经过强透镜的光线不加。只改温度、不改密度与遮挡，"
+                             "使贴盘面视角的近处云层出现明暗与冷暖细节，远景基本不变。0.1 = 温度起伏约 10%%（亮度起伏约"
+                             " 40–70%%）；视频耗时约 1.7 倍。0 = 关闭。默认 0。原理见 docs/plans/v2_temperature_turbulence_plan.md")
     g_rad.add_argument("--v2_color_floor", type=float, default=0.0,
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
@@ -206,14 +212,15 @@ def v2_volume_overrides(args) -> dict:
 
     Args:
         args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_core_contrast`、
-            `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`，None = 未传入）。
+            `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`、`--v2_temp_turb`，None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
     """
     fields = {"thickness_scale": args.v2_thickness_scale, "lum_temp_scale": args.v2_lum_temp_scale,
               "core_contrast": args.v2_core_contrast, "atm_frac": args.v2_atm_frac,
-              "atm_height": args.v2_atm_height, "atm_fine_sigma": args.v2_atm_fine}
+              "atm_height": args.v2_atm_height, "atm_fine_sigma": args.v2_atm_fine,
+              "temp_turb_sigma": args.v2_temp_turb}
     return {k: v for k, v in fields.items() if v is not None}
 
 

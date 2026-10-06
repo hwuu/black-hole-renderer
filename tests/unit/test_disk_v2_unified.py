@@ -118,7 +118,7 @@ class DensityTaichiTest(unittest.TestCase):
                 h_s = ti.max(h_geo * (1.0 - disk._surf_noise + disk._surf_noise * softsat), 1e-6)
                 na = disk._atm_fine_I(r, phi, disk._atm_ffz * z / (disk._atm_h * r), 0.0)
                 loc_f[i] = ti.Vector([sig, h_geo, h_s, c / disk._c_mean, na])
-                a0, a1, a2, a3, a4, a5 = disk.density_I(r, z, phi, 0.0)
+                a0, a1, a2, a3, a4, a5 = disk.density_I(r, z, phi, 0.0, 1.0, 0.0)
                 out_f[i] = ti.Vector([a0, a1, a2, a3, a4, a5])
 
         k()
@@ -167,7 +167,7 @@ class DensityTaichiTest(unittest.TestCase):
                 col = 0.0
                 for j in range(3200):
                     z = -zmax + (ti.cast(j, ti.f32) + 0.5) / 3200.0 * 2.0 * zmax
-                    a0, a1, ab_c, ab_a, a4, a5 = disk.density_I(r, z, phi, 0.0)
+                    a0, a1, ab_c, ab_a, a4, a5 = disk.density_I(r, z, phi, 0.0, 1.0, 0.0)
                     col += (ab_c + ab_a) * 2.0 * zmax / 3200.0
                 out[i] = col
 

@@ -11,6 +11,8 @@ from __future__ import annotations
 import warnings
 from dataclasses import dataclass
 
+from .temperature_turbulence import MAX_OCTAVES as TEMP_TURB_MAX_OCTAVES
+
 
 # Schwarzschild 黑洞的最内稳定圆轨道（ISCO）半径，单位为 Schwarzschild 半径 r_s。
 # 薄盘假设盘截断于 ISCO；若用户给的 r_in 比 ISCO 还小，则落入 plunging region，
@@ -140,6 +142,20 @@ class DiskV2VolumeParams:
         shear_tilt_k: 拖尾倾角系数（≥ 0）：`θ_k = k·atan(1/(AR_k − 1))`。1 = 由长宽比推出的物理估计
             （大尺度约 6°、小尺度约 34°）；0 = 长轴严格沿方位方向。默认 0.01：静态倾角在视频中会造成
             "向内流动"的错觉（孔径问题），真实团块随时间继续卷绕、倾角趋于 0。
+        temp_turb_sigma: 小尺度温度湍流强度 σ_T（[0, 0.5]，无量纲）：核心与大气的温度倍率乘
+            `f_T = exp(σ_T·n_T − 2σ_T²·V)`（⟨f_T⁴⟩ = 1，平均热辐射通量守恒），n_T 为剪切级联向小尺度延伸的
+            零均值起伏，按像素足迹频率钳制、钳制后方差为 V。σ_T 是全部延伸八度可见时 ln T 起伏的标准差。
+            只改温度，不改密度与吸收；使贴盘面视角的近处云层出现细节，远处自动淡出。
+            0 = 关闭（相关代码在编译期移除，输出与改动前逐位一致）。默认 0；close_low 场景取 0.1。
+            见 docs/plans/v2_temperature_turbulence_plan.md。
+        temp_turb_octaves: 温度湍流延伸八度数 E（1 或 2）：第 e 个八度的频率为
+            `shear_k0·3^(shear_octaves + e)`。上限 2 由单精度坐标精度决定（E = 3 时出现插值台阶条纹）。默认 2。
+        temp_turb_gain: 延伸八度的逐八度幅度比（(0, 1]）：第 e 个八度幅度乘 gain^e。
+            默认 0.69 ≈ 3^(−1/3)（Kolmogorov 标度，尺度缩小到 1/3 时起伏幅度乘 3^(−1/3)）。
+        temp_turb_clamp_px: 频率钳制阈值 K（> 0）：八度的径向格宽小于 K 个像素足迹时完全淡出，
+            大于 2K 个时完全可见。越小细节越多、越易出现锯齿。默认 3。
+        temp_turb_lens_deg: 透镜淡出角 δ₀（度，(0, 90]）：光线累计偏折角 δ ≤ δ₀/2 时延伸八度完全可见，
+            δ ≥ δ₀ 时完全淡出（强透镜下像素足迹的直线近似失效）。默认 10。
         dln_r / k_rigid: 刚体环带宽与种子寿命（主云 + 厚度扰动共用）。
         light_delay: 1 = 采样时间 = t - 光程（光行时间）。
         static_cam: 1 = 相机为静止观者本地标架。
@@ -195,6 +211,11 @@ class DiskV2VolumeParams:
     shear_ar_small: float = 2.5
     shear_con: float = 50.0
     shear_tilt_k: float = 0.01
+    temp_turb_sigma: float = 0.0
+    temp_turb_octaves: int = 2
+    temp_turb_gain: float = 0.69
+    temp_turb_clamp_px: float = 3.0
+    temp_turb_lens_deg: float = 10.0
     dln_r: float = 0.1989  # ln(1.22)
     k_rigid: float = 4.0
     light_delay: bool = True
@@ -251,3 +272,13 @@ class DiskV2VolumeParams:
             raise ValueError("shear_con must be positive")
         if self.shear_tilt_k < 0.0:
             raise ValueError("shear_tilt_k must be >= 0")
+        if not 0.0 <= self.temp_turb_sigma <= 0.5:
+            raise ValueError("temp_turb_sigma must be in [0, 0.5]")
+        if not 1 <= self.temp_turb_octaves <= TEMP_TURB_MAX_OCTAVES:
+            raise ValueError(f"temp_turb_octaves must be in [1, {TEMP_TURB_MAX_OCTAVES}]")
+        if not 0.0 < self.temp_turb_gain <= 1.0:
+            raise ValueError("temp_turb_gain must be in (0, 1]")
+        if self.temp_turb_clamp_px <= 0.0:
+            raise ValueError("temp_turb_clamp_px must be positive")
+        if not 0.0 < self.temp_turb_lens_deg <= 90.0:
+            raise ValueError("temp_turb_lens_deg must be in (0, 90]")
