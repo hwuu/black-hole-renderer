@@ -234,7 +234,8 @@ def solve_forward(pos: np.ndarray, subject_uv: np.ndarray, fov_deg: np.ndarray, 
 
     Args:
         pos: 相机位置（r_s），形状 `(N, 3)`，不能为原点。
-        subject_uv: 黑洞的目标画面位置 `(u, v)`，形状 `(N, 2)`；u 从左到右、v 从上到下，[0, 1]。
+        subject_uv: 黑洞的目标画面位置 `(u, v)`，形状 `(N, 2)`；u 从左到右、v 从上到下，[0, 1] 为画面内，
+            越出时目标在画面外（路径文件限定在 [−1, 2]，见 `camera_path.SUBJECT_UV_MIN/MAX`）。
         fov_deg: 竖直视野角（度），形状 `(N,)`。
         aspect: 画面宽高比 W / H。
         roll_deg: 滚转角（度），形状 `(N,)`。

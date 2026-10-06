@@ -35,6 +35,10 @@ MIN_DURATION = 3 * TIME_STEP
 # 路径报告：速度的中心差分半窗口（视频秒）、扫描盘面穿越与最大速度的采样间隔（视频秒）
 REPORT_SPEED_HALF_WINDOW = 0.05
 REPORT_SCAN_STEP = 0.1
+# 黑洞目标画面位置 (u, v) 的取值范围：[0, 1] 为画面内；越出时黑洞在画面外（如长焦特写只拍盘的一侧），
+# 最多偏出一个画面宽 / 高，避免光轴远离黑洞时构图求解失去意义
+SUBJECT_UV_MIN = -1.0
+SUBJECT_UV_MAX = 2.0
 
 
 @dataclass(frozen=True)
@@ -47,7 +51,8 @@ class Keyframe:
         z: 离盘面高度（r_s），负值为盘下方。
         fov: 竖直视野角（度，(0, 180)）。
         roll: 相机滚转角（度），正值使画面左低右高。
-        subject_uv: 黑洞在画面中的目标位置 `(u, v)`，u 从左到右、v 从上到下，均在 [0, 1]。
+        subject_uv: 黑洞在画面中的目标位置 `(u, v)`，u 从左到右、v 从上到下；[0, 1] 为画面内，
+            允许范围 [`SUBJECT_UV_MIN`, `SUBJECT_UV_MAX`] = [−1, 2]，越出 [0, 1] 时黑洞在画面外。
         label: 镜头标签，只用于报告与联系表。
     """
 
@@ -416,7 +421,7 @@ def _validate(keyframes: List[Keyframe], timing: PathTiming) -> None:
 
     Raises:
         ValueError: 信息中给出字段名。关键帧少于 2 个；任一数值不是有限数；r ≤ 0；fov 不在 (0, 180)；
-            subject_uv 不在 [0, 1]；duration < `MIN_DURATION`；path_smoothing、progress_smoothing、near_weight、ramp_in、
+            subject_uv 不在 [−1, 2]；duration < `MIN_DURATION`；path_smoothing、progress_smoothing、near_weight、ramp_in、
             ramp_out < 0；near_height_floor ≤ 0；ramp_in + ramp_out 超过 duration；speed_start / speed_end 不在 (0, 1]。
     """
     if len(keyframes) < 2:
@@ -430,8 +435,9 @@ def _validate(keyframes: List[Keyframe], timing: PathTiming) -> None:
             raise ValueError(f"关键帧 {i}：r 必须 > 0，得到 {k.r}")
         if not 0 < k.fov < 180:
             raise ValueError(f"关键帧 {i}：fov 必须在 (0, 180)，得到 {k.fov}")
-        if not all(0.0 <= c <= 1.0 for c in k.subject_uv):
-            raise ValueError(f"关键帧 {i}：subject_uv 必须在 [0, 1]，得到 {k.subject_uv}")
+        if not all(SUBJECT_UV_MIN <= c <= SUBJECT_UV_MAX for c in k.subject_uv):
+            raise ValueError(f"关键帧 {i}：subject_uv 必须在 [{SUBJECT_UV_MIN:g}, {SUBJECT_UV_MAX:g}]，"
+                             f"得到 {k.subject_uv}")
     tm = timing
     for name in ("duration", "path_smoothing", "near_weight", "near_height_floor", "progress_smoothing",
                  "ramp_in", "ramp_out", "speed_start", "speed_end"):

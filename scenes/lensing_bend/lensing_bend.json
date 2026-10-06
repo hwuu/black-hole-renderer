@@ -1,0 +1,37 @@
+{
+  "duration": 30.0,
+  "path_smoothing": 0.0,
+  "progress": {
+    "smoothing": 0.0
+  },
+  "rhythm": {
+    "ramp_in": 0.0,
+    "ramp_out": 0.0,
+    "speed_start": 1.0,
+    "speed_end": 1.0
+  },
+  "fade": {
+    "fade_in": 2.0,
+    "fade_out": 3.0
+  },
+  "keyframes": [
+    {
+      "r": 39.9,
+      "phi_deg": -93.0,
+      "z": 2.8,
+      "fov": 6.0,
+      "roll": 0.0,
+      "subject_uv": [-0.3, 0.6],
+      "label": "start"
+    },
+    {
+      "r": 39.9,
+      "phi_deg": -87.0,
+      "z": 2.8,
+      "fov": 6.0,
+      "roll": 0.0,
+      "subject_uv": [-0.3, 0.6],
+      "label": "end"
+    }
+  ]
+}

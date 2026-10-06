@@ -16,6 +16,8 @@ from src.v2.path_video import time_scale
 
 DEFAULT_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "scenes", "v2_arts",
                             "interstellar_skim.json")
+LENSING_BEND_PATH = os.path.join(os.path.dirname(__file__), "..", "..", "scenes", "lensing_bend",
+                                 "lensing_bend.json")
 
 
 def _simple_path(**timing) -> CameraPath:
@@ -116,6 +118,14 @@ class TestCompose(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "构图无解"):
             solve_forward(pos, np.array([[0.3639603, 0.4139306]]), np.array([44.07397]), 16 / 9, np.array([12.48697]))
 
+    def test_off_frame_subject_lands_on_target(self):
+        """黑洞目标在画面外（u、v 在 [−1, 2] 内越出 [0, 1]）时，投影仍落在目标位置。"""
+        pos = np.array([[0.0, -39.9, 2.8], [0.0, -39.9, 2.8], [10.0, -30.0, 4.0]])
+        uv = np.array([[-0.3, 0.6], [1.8, -0.5], [-1.0, 2.0]])
+        fov, roll = np.array([6.0, 6.0, 40.0]), np.array([0.0, 5.0, 12.5])
+        fwd = solve_forward(pos, uv, fov, 16 / 9, roll)
+        np.testing.assert_allclose(project_origin(pos, fwd, roll, fov, 16 / 9), uv, atol=1e-6)
+
     def test_centre_points_at_subject(self):
         pos = np.array([[10.0, -30.0, 4.0]])
         fwd = solve_forward(pos, np.array([[0.5, 0.5]]), np.array([40.0]), 16 / 9, np.array([12.5]))
@@ -192,7 +202,8 @@ class TestLoadAndValidate(unittest.TestCase):
         bad = [lambda s: s.update(duration=0.0),
                lambda s: s.update(keyframes=s["keyframes"][:1]),
                lambda s: s["keyframes"][0].update(fov=180.0),
-               lambda s: s["keyframes"][0].update(subject_uv=[1.2, 0.5]),
+               lambda s: s["keyframes"][0].update(subject_uv=[2.1, 0.5]),
+               lambda s: s["keyframes"][0].update(subject_uv=[0.5, -1.1]),
                lambda s: s["rhythm"].update(speed_start=0.0),
                lambda s: s["rhythm"].update(ramp_in=80.0),
                lambda s: s.update(duration=float("inf")),
@@ -208,6 +219,17 @@ class TestLoadAndValidate(unittest.TestCase):
             mutate(spec)
             with self.assertRaises(ValueError):
                 load_camera_path(spec)
+
+    def test_off_frame_subject_accepted(self):
+        """黑洞目标画面位置可越出画面：边界 −1、2 可加载，构图落在目标位置。"""
+        for uv in ([-1.0, 0.5], [2.0, 0.5], [0.5, -1.0], [0.5, 2.0], [-0.3, 0.6]):
+            spec = json.loads(json.dumps(self.spec))
+            for k in spec["keyframes"]:
+                k["subject_uv"] = uv
+            st = load_camera_path(spec).state_at(40.0, 16 / 9)
+            np.testing.assert_allclose(
+                project_origin(st.pos[None, :], st.forward[None, :], np.array([st.roll]), np.array([st.fov]),
+                               16 / 9)[0], uv, atol=1e-6)
 
     def test_check_includes_end_point(self):
         """时长不是采样步长整数倍时也检查终点：终点离黑洞不足 3 r_s 须报错。"""
@@ -226,6 +248,38 @@ class TestLoadAndValidate(unittest.TestCase):
         kfs = [Keyframe(0.5, 0.0, 30.0, 40.0, 0.0, (0.5, 0.5)), Keyframe(0.5, 10.0, 31.0, 40.0, 0.0, (0.5, 0.5))]
         with self.assertRaises(ValueError):
             CameraPath(kfs, PathTiming(duration=5.0, ramp_in=1.0, ramp_out=1.0)).check(16 / 9)
+
+
+class TestLensingBendScene(unittest.TestCase):
+    """lensing_bend 场景路径：黑洞在画面外的固定构图 + 极慢的匀速逆行环绕。"""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(LENSING_BEND_PATH) as f:
+            cls.path = load_camera_path(json.load(f))
+
+    def test_passes_check(self):
+        self.path.check(16 / 9)
+
+    def test_subject_fixed_off_frame(self):
+        """每个时刻黑洞都投影到画面外的 (−0.3, 0.6)，视野 6°、滚转 0°、半径与高度不变。"""
+        for t in np.linspace(0.0, self.path.duration, 13):
+            st = self.path.state_at(float(t), 16 / 9)
+            uv = project_origin(st.pos[None, :], st.forward[None, :], np.array([st.roll]), np.array([st.fov]),
+                                16 / 9)[0]
+            np.testing.assert_allclose(uv, [-0.3, 0.6], atol=1e-6)
+            self.assertAlmostEqual(st.fov, 6.0, places=9)
+            self.assertAlmostEqual(st.roll, 0.0, places=9)
+            self.assertAlmostEqual(float(np.hypot(st.pos[0], st.pos[1])), 39.9, places=9)
+            self.assertAlmostEqual(float(st.pos[2]), 2.8, places=9)
+
+    def test_uniform_slow_retrograde_orbit(self):
+        """方位角 30 s 内从 −93° 匀速转到 −87°（0.2°/s）；盘反转（disk_spin = −1）时为逆行。"""
+        ts = np.linspace(0.0, self.path.duration, 61)
+        phi = np.array([np.degrees(np.arctan2(*self.path.state_at(float(t), 16 / 9).pos[1::-1])) for t in ts])
+        np.testing.assert_allclose(phi, -93.0 + 0.2 * ts, atol=1e-6)
+        lines = self.path.report(time_scale=time_scale(3.0, 8.0), r_in=3.0, r_out=30.0, disk_spin=-1.0)
+        self.assertTrue(all("逆行" in ln for ln in lines if ln.startswith("  t=")))
 
 
 if __name__ == "__main__":
