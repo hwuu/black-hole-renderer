@@ -181,8 +181,9 @@ class TestLoadAndValidate(unittest.TestCase):
         cls.path = load_camera_path(cls.spec)
 
     def test_default_path_keyframe_times(self):
-        """默认路径各关键帧的经过时刻与方案 v0.3 §4.3 一致（±0.05 s）。"""
-        expected = [0.0, 5.9, 13.2, 22.4, 31.5, 38.6, 44.2, 48.5, 53.1, 58.7, 64.6, 72.9, 81.1, 87.5]
+        """默认路径（120 s 版）各关键帧的经过时刻与 scenes/v2_arts/README.md 的分镜一致（±0.05 s）。"""
+        expected = [0.0, 5.8, 13.0, 21.9, 30.7, 37.4, 44.2, 51.7, 58.1, 63.9, 70.0, 76.6, 83.5, 90.6, 100.7,
+                    109.5, 115.0, 120.0]
         np.testing.assert_allclose(self.path.keyframe_times(), expected, atol=0.05)
 
     def test_default_path_passes_check(self):
@@ -205,7 +206,7 @@ class TestLoadAndValidate(unittest.TestCase):
                lambda s: s["keyframes"][0].update(subject_uv=[2.1, 0.5]),
                lambda s: s["keyframes"][0].update(subject_uv=[0.5, -1.1]),
                lambda s: s["rhythm"].update(speed_start=0.0),
-               lambda s: s["rhythm"].update(ramp_in=80.0),
+               lambda s: s["rhythm"].update(ramp_in=115.0),
                lambda s: s.update(duration=float("inf")),
                lambda s: s.update(path_smoothing=float("nan")),
                lambda s: s["progress"].update(near_weight=float("inf")),

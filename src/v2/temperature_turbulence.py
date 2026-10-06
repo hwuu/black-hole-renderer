@@ -4,17 +4,19 @@
 E 个八度，只调制温度、不调制密度：
 
 ```
-tf_c ← tf_c·f_T，f_T = exp(σ_T·n_T − 2σ_T²·V)          （⟨f_T⁴⟩ = 1，平均热辐射通量守恒）
+tf_c ← tf_c·f_T，f_T = exp(σ_l·n_T − 2σ_l²·V)          （⟨f_T⁴⟩ = 1，平均热辐射通量守恒）
+σ_l  = σ_T·m(ĉ)                                          （间歇性：强度随主云密度 ĉ）
 n_T  = Σ_e a_e·w_e·ν_e / N，V = Σ_e (a_e·w_e)² / Σ_e a_e²
 ```
 
-各八度按像素足迹做频率钳制（比像素小的八度淡出为其均值 0），经过强透镜的光线按偏折角淡出。
+各八度按像素足迹做频率钳制（比像素小的八度淡出为其均值 0），经过强透镜的光线按偏折角淡出；
+噪声坐标按半频梯度噪声扭曲，打散格子的行列排布。
 模型、推导与原型实测见 `docs/plans/v2_temperature_turbulence_plan.md`；
 Taichi 实现见 `taichi_impl.DiskV2Taichi._temp_turb_*`，与本模块逐值一致。
 """
 
 import math
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 
@@ -29,6 +31,13 @@ W_OFFSET: float = 23.0
 W_OFFSET_STEP: float = 5.0
 # 延伸八度数上限：E = 3 时最细八度方位周期约 1.2×10⁴，接近单精度台阶出现条纹的量级（方案 §3.5）
 MAX_OCTAVES: int = 2
+# 间歇性：主云密度 ĉ 的截断上限（防止极少数高密度点的起伏过强）
+INTERMITTENCY_CN_MAX: float = 3.0
+# 坐标扭曲：gnoise 的实测标准差（noise_ti.gnoise 文档），把扭曲幅度换算成"格"
+GNOISE_STD: float = 0.19
+# 坐标扭曲噪声的固定偏移（与图案本身去相关；两个分量之间去相关）
+WARP_X_OFFSETS: Tuple[float, float] = (7.1, 13.7)
+WARP_Z_OFFSETS: Tuple[float, float] = (1.7, 9.3)
 # 像素足迹的路径长度下限（r_s）：只用于频率钳制与步长控制，使相机附近 λ → 0 时足迹不退化为 0；
 # 不影响光线积分本身的路径长度
 MIN_PATH_LENGTH: float = 1.0e-3
@@ -112,6 +121,69 @@ def temp_turb_gains(n_octaves: int, gain: float) -> Tuple[float, ...]:
     return tuple(float(gain) ** e for e in range(n_octaves))
 
 
+def temp_turb_warp_period(period: int) -> int:
+    """坐标扭曲噪声的方位周期 `P_w = max(1, round(P/2))`（约为该八度频率的一半）。
+
+    Args:
+        period: 该八度的方位周期 P（正整数）。
+
+    Returns:
+        正整数 P_w；扭曲噪声的方位坐标取 `y·P_w/P`，绕盘一圈前进 P_w 格，φ 方向无缝。
+    """
+    return max(1, int(round(period / 2)))
+
+
+def temp_turb_intermittency_norm(cn, gamma: float) -> float:
+    """间歇性的归一化常数 `M = √⟨clip(ĉ, 0, 3)^{2γ}⟩`（γ = 0 时为 1）。
+
+    Args:
+        cn: 归一化主云密度 ĉ = c/⟨c⟩ 的样本（数组，≥ 0；构造期取 ⟨c⟩ 的标定样本）。
+        gamma: 间歇性指数 γ（[0, 3]）。
+
+    Returns:
+        正标量；使 `⟨m(ĉ)²⟩ = 1`，即局部强度的全盘均方根等于 σ_T。
+
+    Formula:
+        `M = √mean(clip(ĉ, 0, 3)^{2γ})`
+
+    Physical Meaning:
+        保持 σ_T 的含义为"全盘均方根强度"，间歇性只重新分配强度、不改变总体水平。
+
+    Simplifications:
+        用 z = 0 的有限样本估计全盘平均。
+    """
+    if gamma == 0.0:
+        return 1.0
+    q = np.clip(np.asarray(cn, dtype=np.float64), 0.0, INTERMITTENCY_CN_MAX)
+    return float(max(np.sqrt(np.mean(q ** (2.0 * gamma))), 1e-6))
+
+
+def temp_turb_intermittency_factor(cn, gamma: float, m_norm: float):
+    """间歇性的局部强度系数 m(ĉ)（局部强度 σ_l = σ_T·m）。
+
+    Args:
+        cn: 采样点的归一化主云密度 ĉ（标量或数组）。
+        gamma: 间歇性指数 γ（[0, 3]）；0 = 处处同强。
+        m_norm: 归一化常数 M（`temp_turb_intermittency_norm` 的返回值）。
+
+    Returns:
+        与 `cn` 同形状，≥ 0；γ = 0 时恒为 1，否则随 ĉ 单调不减、ĉ ≥ 3 时取最大值 3^γ/M。
+
+    Formula:
+        `m(ĉ) = 1`（γ = 0）；`m(ĉ) = clip(ĉ, 0, 3)^γ / M`（γ > 0）
+
+    Physical Meaning:
+        湍流耗散发热集中在密度高的团块里，稀薄处起伏弱：温度起伏的强度成片分布（间歇性）。
+
+    Simplifications:
+        用主云密度代替湍流耗散率；γ 与截断上限 3 由画面选定。
+    """
+    if gamma == 0.0:
+        return np.ones_like(np.asarray(cn, dtype=np.float64))
+    q = np.clip(np.asarray(cn, dtype=np.float64), 0.0, INTERMITTENCY_CN_MAX)
+    return q ** gamma / m_norm
+
+
 def temp_turb_lens_weight(delta_rad, lens_rad: float):
     """透镜权重 L：光线累计偏折角越大，像素足迹的直线近似越不可信，延伸八度越弱。
 
@@ -193,16 +265,17 @@ def temp_turb_variance(weights, gains: Tuple[float, ...]):
     return ((a * w) ** 2).sum(axis=-1) / (a * a).sum()
 
 
-def temp_turb_temperature(sigma: float, n, var):
-    """温度湍流的温度倍率 `f_T = exp(σ_T·n_T − 2σ_T²·V)`（围绕 1，⟨f_T⁴⟩ = 1）。
+def temp_turb_temperature(sigma, n, var):
+    """温度湍流的温度倍率 `f_T = exp(σ_l·n_T − 2σ_l²·V)`（围绕 1，⟨f_T⁴⟩ = 1）。
 
     Args:
-        sigma: 温度起伏强度 σ_T（≥ 0）：全部 w_e = 1 时 ln T 起伏的标准差。
+        sigma: 局部强度 σ_l（≥ 0，标量或与 `n` 可广播的数组）：全部 w_e = 1 时该处 ln T 起伏的标准差，
+            即 σ_T·m(ĉ)。
         n: 归一化起伏 n_T（零均值，方差约为 `var`）；标量或数组。
         var: 钳制后的方差 V（[0, 1]），与 `n` 可广播。
 
     Returns:
-        与 `broadcast(n, var)` 同形状，> 0，围绕 1 波动；σ_T = 0 或 n = V = 0 时精确为 1。
+        与 `broadcast(sigma, n, var)` 同形状，> 0，围绕 1 波动；σ_l = 0 或 n = V = 0 时精确为 1。
 
     Formula:
         n_T ~ N(0, V) 时 `⟨exp(4σ·n)⟩ = exp(8σ²V)`，所以 `⟨f_T⁴⟩ = ⟨exp(4σn − 8σ²V)⟩ = 1`。
@@ -213,13 +286,16 @@ def temp_turb_temperature(sigma: float, n, var):
     Simplifications:
         值噪声之和视为高斯（工程近似）。
     """
-    s = float(sigma)
+    s = np.asarray(sigma, dtype=np.float64)
     return np.exp(s * np.asarray(n, dtype=np.float64) - 2.0 * s * s * np.asarray(var, dtype=np.float64))
 
 
 def temp_turb_pattern_np(lnr, phi, zr, ox: float, oz: float, geom: ShearCascadeGeometry,
                          gains: Tuple[float, ...], weights, disk_spin: float,
-                         noise: Callable[[np.ndarray, np.ndarray, np.ndarray, int], np.ndarray]) -> np.ndarray:
+                         noise: Callable[[np.ndarray, np.ndarray, np.ndarray, int], np.ndarray],
+                         warp: float = 0.0,
+                         warp_noise: Optional[Callable[[np.ndarray, np.ndarray, np.ndarray, int], np.ndarray]] = None
+                         ) -> np.ndarray:
     """单个图案（一条刚体环带、一个种子相位）的未归一化温度起伏 `Σ_e a_e·w_e·ν_e`。
 
     Args:
@@ -232,14 +308,18 @@ def temp_turb_pattern_np(lnr, phi, zr, ox: float, oz: float, geom: ShearCascadeG
         weights: 钳制权重，形状 `broadcast(lnr, phi, zr).shape + (E,)`，或可广播到该形状。
         disk_spin: 盘旋转方向（+1 / −1），须与构造 `geom` 时一致。
         noise: 三维值噪声 `noise(x, y, z, period)`，y 方向周期为 `period`，输出 `[-1, 1]`、零均值。
+        warp: 坐标扭曲幅度 A（格，[0, 1)）；0 = 不扭曲（`warp_noise` 可为 None）。
+        warp_noise: 三维梯度噪声 `warp_noise(x, y, z, period)`（与 `noise_ti.gnoise` 一致），`warp > 0` 时必须提供。
 
     Returns:
-        与输入广播形状相同的数组，零均值；除以标定常数 N 后为单位方差（全部 w_e = 1 时）。
+        与输入广播形状相同的数组，零均值；除以标定常数 N 后在标定分布上为单位方差（全部 w_e = 1 时）。
 
     Formula:
         ```
         u0  = K_e·(ln r − ln 20)
-        ν_e = noise(|N₀₀|_e·u0 + ox + 1000,  φ'/2π·P_e + spin·s_e·u0,  K_e·z/r + oz + 23 + 5e;  P_e)
+        (x, y, z) = (|N₀₀|_e·u0 + ox + 1000,  φ'/2π·P_e + spin·s_e·u0,  K_e·z/r + oz + 23 + 5e)
+        d_x = gnoise(½x + 7.1, y·P_w/P_e, ½z + 1.7; P_w)，d_y = gnoise(½x + 13.7, y·P_w/P_e, ½z + 9.3; P_w)
+        ν_e = noise(x + A·d_x/0.19,  y + A·d_y/0.19,  z;  P_e)          （A = 0 时不扭曲）
         ```
         权重为 0 的八度贡献为 0（参考实现仍计算噪声再乘 0；Taichi 实现跳过，结果相同）。
 
@@ -247,8 +327,10 @@ def temp_turb_pattern_np(lnr, phi, zr, ox: float, oz: float, geom: ShearCascadeG
         湍流级联最小尺度上的温度团块，形状按开普勒剪切取形，竖直方向与径向尺度相当。
 
     Simplifications:
-        加性值噪声（非乘性级联）；竖直方向各向同性（`K_e·z/r`）。
+        加性值噪声（非乘性级联）；竖直方向各向同性（`K_e·z/r`）；扭曲对特征的局部压缩未计入钳制权重。
     """
+    if warp > 0.0 and warp_noise is None:
+        raise ValueError("warp > 0 requires warp_noise")
     lnr, phi, zr = np.broadcast_arrays(np.asarray(lnr, dtype=np.float64), np.asarray(phi, dtype=np.float64),
                                        np.asarray(zr, dtype=np.float64))
     w = np.broadcast_to(np.asarray(weights, dtype=np.float64), lnr.shape + (len(geom.kr),))
@@ -258,6 +340,13 @@ def temp_turb_pattern_np(lnr, phi, zr, ox: float, oz: float, geom: ShearCascadeG
         x = geom.u_scale[e] * u0 + ox + U_OFFSET
         y = phi / (2.0 * math.pi) * geom.period[e] + disk_spin * geom.shear[e] * u0
         z = geom.kr[e] * zr + oz + W_OFFSET + W_OFFSET_STEP * e
+        if warp > 0.0:
+            pw = temp_turb_warp_period(geom.period[e])
+            yw = y * (pw / geom.period[e])
+            dx = warp_noise(0.5 * x + WARP_X_OFFSETS[0], yw, 0.5 * z + WARP_Z_OFFSETS[0], pw)
+            dy = warp_noise(0.5 * x + WARP_X_OFFSETS[1], yw, 0.5 * z + WARP_Z_OFFSETS[1], pw)
+            x = x + warp / GNOISE_STD * dx
+            y = y + warp / GNOISE_STD * dy
         n = noise(x, y, z, geom.period[e])
         s = s + gains[e] * w[..., e] * n
     return s

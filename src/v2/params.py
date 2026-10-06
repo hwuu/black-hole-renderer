@@ -143,8 +143,9 @@ class DiskV2VolumeParams:
             （大尺度约 6°、小尺度约 34°）；0 = 长轴严格沿方位方向。默认 0.01：静态倾角在视频中会造成
             "向内流动"的错觉（孔径问题），真实团块随时间继续卷绕、倾角趋于 0。
         temp_turb_sigma: 小尺度温度湍流强度 σ_T（[0, 0.5]，无量纲）：核心与大气的温度倍率乘
-            `f_T = exp(σ_T·n_T − 2σ_T²·V)`（⟨f_T⁴⟩ = 1，平均热辐射通量守恒），n_T 为剪切级联向小尺度延伸的
-            零均值起伏，按像素足迹频率钳制、钳制后方差为 V。σ_T 是全部延伸八度可见时 ln T 起伏的标准差。
+            `f_T = exp(σ_l·n_T − 2σ_l²·V)`（⟨f_T⁴⟩ = 1，平均热辐射通量守恒），n_T 为剪切级联向小尺度延伸的
+            零均值起伏，按像素足迹频率钳制、钳制后方差为 V；局部强度 σ_l = σ_T·m(ĉ) 随主云密度变化（间歇性）。
+            σ_T 是 σ_l 的全盘均方根，即全部延伸八度可见时 ln T 起伏标准差的典型值。
             只改温度，不改密度与吸收；使贴盘面视角的近处云层出现细节，远处自动淡出。
             0 = 关闭（相关代码在编译期移除，输出与改动前逐位一致）。默认 0；close_low 场景取 0.1。
             见 docs/plans/v2_temperature_turbulence_plan.md。
@@ -156,6 +157,12 @@ class DiskV2VolumeParams:
             大于 2K 个时完全可见。越小细节越多、越易出现锯齿。默认 3。
         temp_turb_lens_deg: 透镜淡出角 δ₀（度，(0, 90]）：光线累计偏折角 δ ≤ δ₀/2 时延伸八度完全可见，
             δ ≥ δ₀ 时完全淡出（强透镜下像素足迹的直线近似失效）。默认 10。
+        temp_turb_intermittency: 温度湍流的间歇性指数 γ（[0, 3]）：局部强度 σ_l = σ_T·m(ĉ)，
+            `m = clip(ĉ, 0, 3)^γ / M`（ĉ 为归一化主云密度，M 使全盘 ⟨m²⟩ = 1）。主云浓处起伏强、稀处接近平静，
+            起伏成片出现，避免处处同强的"均匀贴图"感。0 = 处处同强。默认 1.5。
+        temp_turb_warp: 温度湍流的坐标扭曲幅度 A（格，[0, 1)）：每个延伸八度的噪声坐标按半频梯度噪声偏移约 A 格，
+            打散值噪声格子的行列排布。越大越不规则，但 ≥ 0.8 时特征被压缩到一格以下、出现颗粒感。
+            0 = 不扭曲。默认 0.35（视频档贴盘帧耗时约增加 40%）。
         dln_r / k_rigid: 刚体环带宽与种子寿命（主云 + 厚度扰动共用）。
         light_delay: 1 = 采样时间 = t - 光程（光行时间）。
         static_cam: 1 = 相机为静止观者本地标架。
@@ -216,6 +223,8 @@ class DiskV2VolumeParams:
     temp_turb_gain: float = 0.69
     temp_turb_clamp_px: float = 3.0
     temp_turb_lens_deg: float = 10.0
+    temp_turb_intermittency: float = 1.5
+    temp_turb_warp: float = 0.35
     dln_r: float = 0.1989  # ln(1.22)
     k_rigid: float = 4.0
     light_delay: bool = True
@@ -282,3 +291,7 @@ class DiskV2VolumeParams:
             raise ValueError("temp_turb_clamp_px must be positive")
         if not 0.0 < self.temp_turb_lens_deg <= 90.0:
             raise ValueError("temp_turb_lens_deg must be in (0, 90]")
+        if not 0.0 <= self.temp_turb_intermittency <= 3.0:
+            raise ValueError("temp_turb_intermittency must be in [0, 3]")
+        if not 0.0 <= self.temp_turb_warp < 1.0:
+            raise ValueError("temp_turb_warp must be in [0, 1)")

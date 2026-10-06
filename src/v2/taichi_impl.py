@@ -45,12 +45,18 @@ from .noise_ti import (
 from .params import DiskV2Params, DiskV2VolumeParams
 from .shear_cascade import shear_cascade_geometry
 from .temperature_turbulence import (
+    GNOISE_STD as _TT_GNOISE_STD,
+    INTERMITTENCY_CN_MAX as _TT_CN_MAX,
     LN_R_ANCHOR as _TT_LN_R_ANCHOR,
+    WARP_X_OFFSETS as _TT_WARP_X,
+    WARP_Z_OFFSETS as _TT_WARP_Z,
     U_OFFSET as _TT_U_OFFSET,
     W_OFFSET as _TT_W_OFFSET,
     W_OFFSET_STEP as _TT_W_OFFSET_STEP,
     temp_turb_gains,
     temp_turb_geometry,
+    temp_turb_intermittency_norm,
+    temp_turb_warp_period,
 )
 
 # 厚度扰动方位拉长 az_stretch_t = 1 时方位周期等于基础周期 n 的参考半径（r_s）：r_b = 6·s 处 n_φ = n。
@@ -306,6 +312,13 @@ class DiskV2Taichi:
         self._tt_lens_half = 0.5 * math.radians(vp.temp_turb_lens_deg)
         # 单图案标准差 N（_calibrate_volume 中标定，标定前取 1）
         self._tt_norm = 1.0
+        # 间歇性：局部强度 σ_l = σ_T·clip(ĉ, 0, 3)^γ / M（γ = 0 时编译期移除；M 在 ⟨c⟩ 标定后计算，标定前取 1）
+        self._tt_gam = float(vp.temp_turb_intermittency)
+        self._tt_intm = 1.0
+        # 坐标扭曲：幅度 A/0.19（gnoise 标准差换算成格）；扭曲噪声周期 P_w 与方位坐标缩放 P_w/P
+        self._tt_warp = float(vp.temp_turb_warp) / _TT_GNOISE_STD
+        self._tt_wper = [temp_turb_warp_period(p) for p in self._tt_per]
+        self._tt_wsc = [pw / p for pw, p in zip(self._tt_wper, self._tt_per)]
         self._core_contrast = float(vp.core_contrast)
         # 保方差混合的单图案均值 m（主云 c / 厚度扰动 tn；_calibrate_volume 中标定，标定前取 1）
         self._mc_single = 1.0
@@ -457,6 +470,9 @@ class DiskV2Taichi:
 
         _cmean(cbuf)
         self._c_mean = max(float(cbuf.to_numpy().mean()), 1e-6)
+        # 温度湍流间歇性的归一化常数 M：同一组样本上使 ⟨m(ĉ)²⟩ = 1
+        if self._tt_on:
+            self._tt_intm = temp_turb_intermittency_norm(cbuf.to_numpy() / self._c_mean, self._tt_gam)
 
         # κ
         kbuf = ti.field(dtype=ti.f32, shape=256)
@@ -1043,12 +1059,18 @@ class DiskV2Taichi:
         Formula:
             ```
             u0  = K_e·(ln r − ln 20)
-            ν_e = vnoise(|N₀₀|_e·u0 + ox + 1000,  φ'/2π·P_e + spin·s_e·u0,  K_e·z/r + oz + 23 + 5e;  P_e)
+            (x, y, z) = (|N₀₀|_e·u0 + ox + 1000,  φ'/2π·P_e + spin·s_e·u0,  K_e·z/r + oz + 23 + 5e)
+            d_x = gnoise(½x + 7.1, y·P_w/P_e, ½z + 1.7; P_w)，d_y = gnoise(½x + 13.7, y·P_w/P_e, ½z + 9.3; P_w)
+            ν_e = vnoise(x + A·d_x/0.19,  y + A·d_y/0.19,  z;  P_e)          （A = 0 时编译期移除扭曲）
             ```
             权重为 0 的八度跳过（结果相同）。
 
+        Physical Meaning:
+            湍流级联最小尺度上的温度团块；坐标扭曲打散值噪声格子的行列排布，使团块成为不规则的丝缕。
+
         Simplifications:
-            加性值噪声；竖直方向各向同性（`K_e·z/r`）；优化级别 ≥ 1 用 `vnoise_fast`（与 `vnoise` 逐位一致）。
+            加性值噪声；竖直方向各向同性（`K_e·z/r`）；扭曲对特征的局部压缩未计入钳制权重；
+            优化级别 ≥ 1 用 `vnoise_fast` / `gnoise_fast`（与 `vnoise` / `gnoise` 逐位一致）。
         """
         s = 0.0
         for e in ti.static(range(self._tt_n)):
@@ -1058,6 +1080,12 @@ class DiskV2Taichi:
                 x = self._tt_ua[e] * u0 + ox + _TT_U_OFFSET
                 y = phi0 / (2.0 * math.pi) * self._tt_per[e] + self._spin * self._tt_c[e] * u0
                 z = self._tt_kr[e] * zr + oz + _TT_W_OFFSET + _TT_W_OFFSET_STEP * e
+                if ti.static(self._tt_warp > 0.0):
+                    yw = y * self._tt_wsc[e]
+                    dx = self._gn(0.5 * x + _TT_WARP_X[0], yw, 0.5 * z + _TT_WARP_Z[0], self._tt_wper[e])
+                    dy = self._gn(0.5 * x + _TT_WARP_X[1], yw, 0.5 * z + _TT_WARP_Z[1], self._tt_wper[e])
+                    x += self._tt_warp * dx
+                    y += self._tt_warp * dy
                 n = 0.0
                 if ti.static(self._opt >= 1):
                     n = vnoise_fast(x, y, z, self._tt_per[e])
@@ -1191,7 +1219,8 @@ class DiskV2Taichi:
             ω      = 1/(1 + q·ρ_a/ρ_mid)，ρ_mid = Σ/(√(2π)·H)         （q = abs_scatter_ratio）
             τ_z    = κ·[ cfac·Σ·½·erfc(|z|/(√2·H_s)) + ½·A·Σ·ĉ·cov·exp(−|z|/H_a) ]
             tf     = 1 + grey_mix·(min((¾(τ_z + ⅔))^{1/4}, grey_cap) − 1)，再乘 clamp(1 + dt_i·(ĉ − 1), 0.7, 1.3)
-            f_T    = exp(σ_T·n_T − 2σ_T²·V)，tf ← tf·f_T                （温度湍流，`_temp_turb_*`；σ_T = 0 时无此项）
+            f_T    = exp(σ_l·n_T − 2σ_l²·V)，tf ← tf·f_T                （温度湍流，`_temp_turb_*`；σ_T = 0 时无此项）
+            σ_l    = σ_T·clip(ĉ, 0, 3)^γ / M                           （间歇性；γ = 0 时 σ_l = σ_T）
             τ_c    = κ·cfac·Σ                                         （当地核心整柱光学深度）
             J      = scatter_j·S_disk·(1 − e^{−τ_c})                  （渲染核：sc_a·scatter_j·S_disk）
             ```
@@ -1281,8 +1310,12 @@ class DiskV2Taichi:
                     ti.min(ti.pow(0.75 * (tau_z + 2.0 / 3.0), 0.25), self._grey_cap) - 1.0)
                 tf_c *= ti.min(ti.max(1.0 + self._dt_i * (cn - 1.0), 0.7), 1.3)
                 if ti.static(self._tt_on):
+                    # 间歇性：局部强度随主云密度（浓处起伏强、稀处平静；⟨m²⟩ = 1）
+                    sl = self._tt_sig
+                    if ti.static(self._tt_gam > 0.0):
+                        sl = self._tt_sig * ti.pow(ti.min(ti.max(cn, 0.0), _TT_CN_MAX), self._tt_gam) / self._tt_intm
                     # 平均通量守恒的对数正态温度起伏：⟨f_T⁴⟩ = 1；tv = 0 时 nt = 0，f_T 精确为 1
-                    tf_c *= ti.exp(self._tt_sig * nt - 2.0 * self._tt_sig * self._tt_sig * tv)
+                    tf_c *= ti.exp(sl * nt - 2.0 * sl * sl * tv)
         return em_c, tf_c, ab_c, ab_a, em_a, sc_a
 
     @ti.func

@@ -185,7 +185,7 @@ def fade_factor(t: float, duration: float, settings: FadeSettings) -> float:
 
     Returns:
         标量，值域 [0, 1]；t = 0 与 t = T 处为 0（对应时长 > 0 时），中段为 1。视频末帧
-        t_last = (round(T·fps) − 1) / fps，系数接近 0（示例路径 87.5 s、60 fps、淡出 3 s 时约 9e-5）。
+        t_last = (round(T·fps) − 1) / fps，系数接近 0（60 fps、淡出 3 s 时约 9e-5，与时长无关）。
 
     Formula:
         α = sstep(min(t / T_in, 1, (T − t) / T_out))，sstep(s) = 3s² − 2s³（s 截断到 [0, 1]）。

@@ -10,6 +10,7 @@
 - `*_ti` 一致性：单图案与透镜权重的 Taichi 实现与 NumPy 参考一致（优化级别 0 / 1，第 4 项）；
   `density_I` 级别 0 与 1 一致（第 5 项）；归一化后方差约为 1 / V、真实噪声下 ⟨f_T⁴⟩ ≈ 1（第 6 项）；
   L = 0 时 `density_I` 与关闭时逐位相同（第 7 项）。
+- v1.5：间歇性（第 13 项）、坐标扭曲（第 14 项）、含扭曲时的归一化（第 15 项）、新参数校验（第 16 项）。
 
 渲染核中的步长约束、像素足迹（λ 取段起点 / 中点、θ = ss·像素高度）与关闭时的编译期移除由 §7 第 10–12 项
 的端到端验收覆盖（4090，结果见方案 §8）。
@@ -26,20 +27,29 @@ import numpy as np
 import taichi as ti
 
 from src.v2.params import DiskV2Params, DiskV2VolumeParams
+from src.v2.shear_cascade import ShearCascadeGeometry
 from src.v2.temperature_turbulence import (
+    INTERMITTENCY_CN_MAX,
     LN_R_ANCHOR,
     smoothstep01,
     temp_turb_clamp_weights,
     temp_turb_gains,
     temp_turb_geometry,
+    temp_turb_intermittency_factor,
+    temp_turb_intermittency_norm,
     temp_turb_lens_weight,
     temp_turb_pattern_np,
     temp_turb_temperature,
     temp_turb_variance,
+    temp_turb_warp_period,
 )
-from tests.unit.test_disk_v2_noise_ti import _vnoise
+from src.v2.noise_ti import hashf as _hashf_ti
+from tests.unit.test_disk_v2_noise_ti import _gnoise, _vnoise
 
 _vnoise_vec = np.vectorize(_vnoise, otypes=[np.float64])
+_gnoise_vec = np.vectorize(_gnoise, otypes=[np.float64])
+# 默认参数下的坐标扭曲幅度（格）
+_WARP = DiskV2VolumeParams().temp_turb_warp
 
 # 与默认 DiskV2VolumeParams 一致的主云剪切级联参数
 _K0, _NOCT, _AR_SMALL, _TILT = 6.67, 4, 2.5, 0.01
@@ -130,6 +140,57 @@ class TemperatureFactorTest(unittest.TestCase):
         self.assertAlmostEqual(float(temp_turb_variance(np.array([1.0, 0.0]), a)), 1.0 / (1.0 + 0.69 ** 2))
 
 
+class IntermittencyTest(unittest.TestCase):
+    """间歇性系数 m(ĉ)：γ = 0 恒为 1；⟨m²⟩ = 1；单调、截断（§7 第 13 项的 NumPy 部分）。"""
+
+    def test_gamma_zero_is_uniform(self):
+        cn = np.array([0.0, 0.5, 1.0, 5.0])
+        self.assertEqual(temp_turb_intermittency_norm(cn, 0.0), 1.0)
+        np.testing.assert_array_equal(temp_turb_intermittency_factor(cn, 0.0, 1.0), np.ones(4))
+
+    def test_unit_mean_square(self):
+        cn = np.random.default_rng(2).lognormal(0.0, 0.6, 50_000)
+        for g in (0.5, 1.5, 3.0):
+            m = temp_turb_intermittency_factor(cn, g, temp_turb_intermittency_norm(cn, g))
+            self.assertAlmostEqual(float(np.mean(m ** 2)), 1.0, places=10)
+
+    def test_monotone_and_clipped(self):
+        cn = np.linspace(-1.0, 6.0, 300)
+        m = temp_turb_intermittency_factor(cn, 1.5, 1.85)
+        self.assertTrue(np.all(np.diff(m) >= 0.0))
+        self.assertEqual(float(m[0]), 0.0)
+        np.testing.assert_allclose(m[cn >= INTERMITTENCY_CN_MAX], INTERMITTENCY_CN_MAX ** 1.5 / 1.85)
+
+
+class WarpTest(unittest.TestCase):
+    """坐标扭曲：周期取半、A = 0 不变、φ 方向无缝（含最小周期 P = 1、2、3；§7 第 14 项的 NumPy 部分）。"""
+
+    def test_warp_period(self):
+        self.assertEqual([temp_turb_warp_period(p) for p in (1, 2, 3, 4, 1358, 4073)], [1, 1, 2, 2, 679, 2036])
+
+    def test_zero_warp_unchanged(self):
+        g = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, 1.0)
+        rng = np.random.default_rng(4)
+        lnr, phi, zr = np.log(rng.uniform(5, 25, 40)), rng.uniform(0, 6.28, 40), rng.uniform(-0.01, 0.01, 40)
+        a = temp_turb_pattern_np(lnr, phi, zr, 1.0, 2.0, g, (1.0, 0.69), np.ones(2), 1.0, _vnoise_vec)
+        b = temp_turb_pattern_np(lnr, phi, zr, 1.0, 2.0, g, (1.0, 0.69), np.ones(2), 1.0, _vnoise_vec,
+                                 warp=0.0, warp_noise=_gnoise_vec)
+        np.testing.assert_array_equal(a, b)
+        with self.assertRaises(ValueError):
+            temp_turb_pattern_np(lnr, phi, zr, 1.0, 2.0, g, (1.0, 0.69), np.ones(2), 1.0, _vnoise_vec, warp=0.3)
+
+    def test_phi_periodic_small_periods(self):
+        for periods in ((1, 2), (3, 7)):
+            g = ShearCascadeGeometry(kr=(5.0, 15.0), period=periods, u_scale=(1.0, 1.0), shear=(0.01, 0.01),
+                                     aspect=(2.5, 2.5), tilt_rad=(0.0, 0.0))
+            rng = np.random.default_rng(6)
+            lnr, phi, zr = np.log(rng.uniform(5, 25, 30)), rng.uniform(0, 6.28, 30), rng.uniform(-0.01, 0.01, 30)
+            args = (zr, 1.0, 2.0, g, (1.0, 0.69), np.ones(2), 1.0, _vnoise_vec)
+            a = temp_turb_pattern_np(lnr, phi, *args, warp=_WARP, warp_noise=_gnoise_vec)
+            b = temp_turb_pattern_np(lnr, phi + 2.0 * math.pi, *args, warp=_WARP, warp_noise=_gnoise_vec)
+            np.testing.assert_allclose(a, b, rtol=0, atol=1e-9, err_msg=str(periods))
+
+
 class ParamsValidationTest(unittest.TestCase):
     """`DiskV2VolumeParams` 温度湍流字段越界报错。"""
 
@@ -139,7 +200,9 @@ class ParamsValidationTest(unittest.TestCase):
     def test_invalid(self):
         for kw in ({"temp_turb_sigma": -0.01}, {"temp_turb_sigma": 0.51}, {"temp_turb_octaves": 0},
                    {"temp_turb_octaves": 3}, {"temp_turb_gain": 0.0}, {"temp_turb_gain": 1.01},
-                   {"temp_turb_clamp_px": 0.0}, {"temp_turb_lens_deg": 0.0}, {"temp_turb_lens_deg": 91.0}):
+                   {"temp_turb_clamp_px": 0.0}, {"temp_turb_lens_deg": 0.0}, {"temp_turb_lens_deg": 91.0},
+                   {"temp_turb_intermittency": -0.1}, {"temp_turb_intermittency": 3.1},
+                   {"temp_turb_warp": -0.1}, {"temp_turb_warp": 1.0}):
             with self.assertRaises(ValueError, msg=str(kw)):
                 DiskV2VolumeParams(**kw)
 
@@ -147,7 +210,8 @@ class ParamsValidationTest(unittest.TestCase):
 class TaichiParityTest(unittest.TestCase):
     """Taichi 实现与 NumPy 参考一致；`density_I` 级别 0 / 1 一致、L = 0 时与关闭逐位相同。
 
-    构造 3 个 `DiskV2Taichi`（开启 × 级别 0 / 1、关闭 × 级别 1），每个含 κ 标定（CPU 上约 40 s）。
+    构造 4 个 `DiskV2Taichi`（开启 × 级别 0 / 1、开启但无间歇性与扭曲 × 级别 1、关闭 × 级别 1），
+    每个含 κ 标定（CPU 上约 40 s）。
     """
 
     @classmethod
@@ -158,6 +222,8 @@ class TaichiParityTest(unittest.TestCase):
         cls.vp_on = DiskV2VolumeParams(temp_turb_sigma=0.1)
         cls.on = {opt: DiskV2Taichi(cls.params, cls.vp_on, opt_level=opt) for opt in (0, 1)}
         cls.off = DiskV2Taichi(cls.params, DiskV2VolumeParams(), opt_level=1)
+        cls.plain = DiskV2Taichi(cls.params, DiskV2VolumeParams(temp_turb_sigma=0.1, temp_turb_intermittency=0.0,
+                                                                 temp_turb_warp=0.0), opt_level=1)
         cls.geom = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, -1.0)
         cls.gains = temp_turb_gains(2, 0.69)
         rng = np.random.default_rng(17)
@@ -186,9 +252,12 @@ class TaichiParityTest(unittest.TestCase):
         f_r, f_p, f_z, f_f, f_l = self._fields(self.r, self.phi, self.zr, self.foot, self.lens)
         r, phi, zr, foot, lens = (self._f32(a) for a in (self.r, self.phi, self.zr, self.foot, self.lens))
         w = temp_turb_clamp_weights(r, foot, lens, self.geom, 3.0)
-        ref = temp_turb_pattern_np(np.log(r), phi, zr, 3.7, 11.2, self.geom, self.gains, w, -1.0, _vnoise_vec)
+        ref = temp_turb_pattern_np(np.log(r), phi, zr, 3.7, 11.2, self.geom, self.gains, w, -1.0, _vnoise_vec,
+                                   warp=_WARP, warp_noise=_gnoise_vec)
+        ref_plain = temp_turb_pattern_np(np.log(r), phi, zr, 3.7, 11.2, self.geom, self.gains, w, -1.0, _vnoise_vec)
         ref_v = temp_turb_variance(w, self.gains)
-        for opt, disk in self.on.items():
+        cases = [(f"opt_level={opt}", disk, ref) for opt, disk in self.on.items()] + [("无扭曲", self.plain, ref_plain)]
+        for label, disk, expect in cases:
             out = ti.field(ti.f32, shape=self.n)
             out_v = ti.field(ti.f32, shape=self.n)
 
@@ -200,9 +269,26 @@ class TaichiParityTest(unittest.TestCase):
                     out_v[i] = disk._temp_turb_variance(f_r[i], f_f[i], f_l[i])
 
             k()
-            # 噪声坐标量级 10³，f32 坐标舍入使值噪声相差约 1e-3
-            np.testing.assert_allclose(out.to_numpy(), ref, rtol=0, atol=5e-3, err_msg=f"opt_level={opt}")
-            np.testing.assert_allclose(out_v.to_numpy(), ref_v, rtol=1e-5, atol=1e-6, err_msg=f"opt_level={opt}")
+            # 噪声坐标量级 10³，f32 坐标舍入使值噪声相差约 1e-3；扭曲把舍入误差再放大约 A/0.19 倍
+            np.testing.assert_allclose(out.to_numpy(), expect, rtol=0, atol=1e-2, err_msg=label)
+            np.testing.assert_allclose(out_v.to_numpy(), ref_v, rtol=1e-5, atol=1e-6, err_msg=label)
+
+    def test_pattern_phi_periodic(self):
+        """含扭曲的 Taichi 单图案在 φ 与 φ + 2π 处一致（f32 舍入内）。"""
+        disk = self.on[1]
+        f_r, f_p, f_q, f_z = self._fields(self.r, self.phi, self.phi + 2.0 * math.pi, self.zr)
+        a = ti.field(ti.f32, shape=self.n)
+        b = ti.field(ti.f32, shape=self.n)
+
+        @ti.kernel
+        def k():
+            for i in range(self.n):
+                a[i] = disk._temp_turb_pattern(ti.log(f_r[i]), f_r[i], f_p[i], f_z[i], 3.7, 11.2, 1e-9, 1.0)
+                b[i] = disk._temp_turb_pattern(ti.log(f_r[i]), f_r[i], f_q[i], f_z[i], 3.7, 11.2, 1e-9, 1.0)
+
+        k()
+        # φ/2π·P 在 P ≈ 4000 时 f32 舍入约 2×10⁻⁴ 格；接缝是 O(1) 的跳变，会被该容差捕获
+        np.testing.assert_allclose(a.to_numpy(), b.to_numpy(), rtol=0, atol=2e-2)
 
     def test_lens_weight_matches_numpy(self):
         disk = self.on[1]
@@ -242,6 +328,7 @@ class TaichiParityTest(unittest.TestCase):
     def test_density_lens_zero_equals_off(self):
         zero = np.zeros(self.n)
         np.testing.assert_array_equal(self._density(self.on[1], zero), self._density(self.off, zero))
+        np.testing.assert_array_equal(self._density(self.plain, zero), self._density(self.off, zero))
 
     def test_temperature_actually_modulated(self):
         """开启且八度可见时 tf_c 偏离关闭值（防止实现被意外静态移除）。"""
@@ -291,6 +378,62 @@ class TaichiParityTest(unittest.TestCase):
         # 部分八度可见时按实际 V 补偿，平均通量同样守恒
         f4c = temp_turb_temperature(0.1, coarse, v) ** 4
         self.assertAlmostEqual(float(f4c.mean()), 1.0, delta=0.02)
+
+    def test_intermittency_binned_flux(self):
+        """间歇性（§7 第 13 项）：样本上 ⟨m²⟩ ≈ 1；按 ĉ 分箱，⟨f_T⁴⟩ 与 ⟨m²·n_T²⟩ 接近 1。"""
+        disk = self.on[1]
+        m_samples = 40000
+        rng = np.random.default_rng(9)
+        r = rng.uniform(3.5, 20.0, m_samples)
+        phi = rng.uniform(-math.pi, math.pi, m_samples)
+        f_r, f_p = self._fields(r, phi)
+        out_c = ti.field(ti.f32, shape=m_samples)
+        out_n = ti.field(ti.f32, shape=m_samples)
+
+        @ti.kernel
+        def k():
+            for i in range(m_samples):
+                lnr = ti.log(f_r[i])
+                w, ph, ox, oz, nb = disk._band_info(lnr, f_p[i], 0.0)
+                c, tn = disk._flow_shared(f_r[i], 0.0, w, ph, ox, oz, nb)
+                out_c[i] = c / disk._c_mean
+                out_n[i] = disk._temp_turb_shared(lnr, f_r[i], 0.0, w, ph, ox, oz, 1e-9, 1.0)
+
+        k()
+        cn = out_c.to_numpy().astype(np.float64)
+        nt = out_n.to_numpy().astype(np.float64)
+        m = temp_turb_intermittency_factor(cn, 1.5, disk._tt_intm)
+        # M 由构造期 4096 个样本标定，这里用独立的 40000 个样本检查
+        self.assertAlmostEqual(float(np.mean(m ** 2)), 1.0, delta=0.08)
+        self.assertAlmostEqual(float(np.mean(m ** 2 * nt ** 2)), 1.0, delta=0.15)
+        f4 = temp_turb_temperature(0.1 * m, nt, 1.0) ** 4
+        edges = np.quantile(cn, [0.0, 0.25, 0.5, 0.75, 1.0])
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            sel = (cn >= lo) & (cn <= hi)
+            msg = f"ĉ ∈ [{lo:.2f}, {hi:.2f}]"
+            self.assertAlmostEqual(float(f4[sel].mean()), 1.0, delta=0.03, msg=msg)
+            # 箱内 m 近似为常数，⟨m²·n_T²⟩/⟨m²⟩ ≈ ⟨n_T²⟩ ≈ 1 检查 n_T 与 ĉ 近似不相关
+            ratio = float(np.mean(m[sel] ** 2 * nt[sel] ** 2) / np.mean(m[sel] ** 2))
+            self.assertAlmostEqual(ratio, 1.0, delta=0.2, msg=msg)
+
+    def test_intermittency_norm_matches_numpy(self):
+        """构造期 Taichi 标定的 M 与 NumPy 在同一组 ⟨c⟩ 标定样本上的结果一致。"""
+        disk = self.on[1]
+        cbuf = ti.field(dtype=ti.f32, shape=4096)
+
+        @ti.kernel
+        def k():
+            for i in cbuf:
+                # 与 `_calibrate_volume` 中 ⟨c⟩ 的样本公式相同
+                r = disk._r_in + 0.5 + _hashf_ti(i, 3, 7) * (ti.min(disk._r_out, 20.0) - disk._r_in - 0.5)
+                phi = _hashf_ti(i, 5, 11) * 2.0 * math.pi
+                c, tn = disk._flow_I(r, phi, 0.0, 0.0)
+                cbuf[i] = c
+
+        k()
+        c = cbuf.to_numpy().astype(np.float64)
+        self.assertAlmostEqual(float(c.mean()), disk._c_mean, delta=1e-4 * disk._c_mean)
+        self.assertAlmostEqual(temp_turb_intermittency_norm(c / c.mean(), 1.5), disk._tt_intm, delta=1e-4)
 
     def test_anchor_constant(self):
         self.assertAlmostEqual(LN_R_ANCHOR, math.log(20.0))
