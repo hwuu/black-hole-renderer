@@ -342,6 +342,50 @@ def tonemap_chroma_aces(
     return np.clip(y * (1 - w_white) + w_white, 0.0, 1.0)
 
 
+def tonemap_film(
+    hdr: np.ndarray,
+    film_response: float = 0.0,
+    white_blend: float = 0.12,
+) -> np.ndarray:
+    """胶片响应色调映射：保色度 ACES 与逐通道 ACES 按 `film_response` 线性混合。
+
+    Args:
+        hdr: `(H, W, 3)` 非负线性 HDR RGB（已曝光、白平衡、经过镜头）。
+        film_response: 胶片响应 m ∈ [0, 1]。0 = 保色度 ACES（与 `tonemap_chroma_aces` 逐位一致）；
+            1 = 三个通道各自过 ACES 曲线；中间值线性混合。
+        white_blend: 传给保色度 ACES 的超色域向白混合斜率。
+
+    Returns:
+        `(H, W, 3)`，`[0, 1]` 线性 LDR，形状同输入。灰色输入在任何 m 下仍为灰色。
+
+    Formula:
+        ```
+        A(x)       = x(2.51x + 0.03) / (x(2.43x + 0.59) + 0.14)       （ACES 拟合曲线，截断到 [0, 1]）
+        T_chroma   = tonemap_chroma_aces(x, white_blend)               （只压亮度 L，RGB 等比缩放）
+        T_channel  = (A(x_R), A(x_G), A(x_B))                          （逐通道）
+        y          = (1 − m)·T_chroma + m·T_channel
+        ```
+
+    Physical Meaning:
+        胶片的三层乳剂（数码传感器的 R/G/B 光电位）各有一条特性曲线、各自饱和：强通道先到肩部，
+        弱通道继续增长，于是同一颜色越亮饱和度越低，最亮处趋近白色（"通往白色的路径"）。
+        保色度 ACES 只压亮度，最亮处止于浅金、不会烧白；m 控制向真实胶片响应靠近的程度。
+
+    Simplifications:
+        三层共用同一条 ACES 曲线（不模拟各层感光度、趾部差异与层间串扰）；
+        逐通道曲线的趾部会略微提高暗部饱和度（与胶片一致）。
+    """
+    m = float(film_response)
+    if not 0.0 <= m <= 1.0:
+        raise ValueError(f"film_response must be in [0, 1], got {film_response!r}")
+    y = tonemap_chroma_aces(hdr, white_blend)
+    if m == 0.0:
+        return y
+    x = np.maximum(hdr, 0.0)
+    y_ch = np.clip((x * (_ACES_A * x + _ACES_B)) / (x * (_ACES_C * x + _ACES_D) + _ACES_E), 0.0, 1.0)
+    return (1.0 - m) * y + m * y_ch
+
+
 # ---------------------------------------------------------------------------
 # 5.5 饱和度调整（ACES 后、sRGB 前）
 # ---------------------------------------------------------------------------
@@ -426,6 +470,8 @@ def postfx_params_defaults() -> dict:
         "fringe_color": (0.3, 0.45, 1.0),
         "lateral_ca": 0.0025,
         "white_blend": 0.12,
+        # 胶片响应 m（ISP 层）：0 = 保色度 ACES（高光止于浅金）；1 = 逐通道 ACES（各层独立饱和，高光趋白）
+        "film_response": 0.0,
     "saturation": 1.0,
     }
 
@@ -435,7 +481,7 @@ def postfx(
     exposure: float = 1.0,
     **params,
 ) -> np.ndarray:
-    """完整后处理链：曝光 → WB → 镜头 PSF（或 legacy：bloom + 镶边）→ 横向色散 → ACES → sRGB。
+    """完整后处理链：曝光 → WB → 镜头 PSF（或 legacy：bloom + 镶边）→ 横向色散 → ACES（胶片响应）→ sRGB。
 
     Args:
         hdr: `(H, W, 3)` 线性 HDR RGB。
@@ -457,7 +503,7 @@ def postfx(
     else:
         raise ValueError(f"lens_model must be 'psf' or 'legacy', got {p['lens_model']!r}")
     x = apply_lateral_ca(x, p["lateral_ca"])
-    x = tonemap_chroma_aces(x, p["white_blend"])
+    x = tonemap_film(x, p["film_response"], p["white_blend"])
     x = adjust_saturation(x, p["saturation"])
     x = srgb_encode(x)
     return (np.clip(x, 0, 1) * 255 + 0.5).astype(np.uint8)

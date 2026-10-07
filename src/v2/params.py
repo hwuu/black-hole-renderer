@@ -89,7 +89,9 @@ class DiskV2VolumeParams:
         grey_cap: 灰大气温度倍率上限（tau ≈ 2 处；侧壁斜入的平行平面近似保护）。
         core_floor: 核心密度起伏下限 f ∈ [0, 1]：核心密度因子 `cfac = f + (1 − f)·c/⟨c⟩`（温和起伏、无空洞）。
             默认 0.15（稀处密度降到均值的 15%，盘面出现明显的稀疏区；预设 M 为 0.35）。
-        dt_i: 核心温度起伏：T ← T·(1 + DT_I·(c/⟨c⟩ - 1))。
+        dt_i: 密度–温度耦合 ∈ [0, 1]：T ← T·clamp(1 + DT_I·(c/⟨c⟩ − 1), 0.7, 1.3)。局部耗散加热 ∝ 柱密度 Σ、
+            T_eff⁴ ∝ 耗散通量，故 T ∝ Σ^{1/4}，线性化得物理值 0.25；默认 0.05（弱耦合，团块明暗较淡）。
+            盘光学厚时亮度只取决于温度（基尔霍夫：源函数 = B(T)），密度起伏须经此耦合才显出团块明暗。
         surf_lo / surf_k: 表面增亮源函数（M 预设为 1.0 / 0.0 = 竖直均匀，灰大气取代）。
         tau_i: r ∈ [5.5, 6.5] 处 face-on 竖直光学深度（核心 + 大气总柱）的标定目标（> 0）。
             默认 1.84（预设 M 为 1.5 且核心另乘 core_opac = 2；统一模型取消该倍率后提高 tau_i 保持核心观感）。
@@ -237,6 +239,8 @@ class DiskV2VolumeParams:
             raise ValueError("grey_cap must be >= 1")
         if not 0.0 <= self.core_floor <= 1.0:
             raise ValueError("core_floor must be in [0, 1]")
+        if not 0.0 <= self.dt_i <= 1.0:
+            raise ValueError("dt_i must be in [0, 1]")
         if self.thickness_scale <= 0.0:
             raise ValueError("thickness_scale must be positive")
         if self.lum_temp_scale <= 0.0:

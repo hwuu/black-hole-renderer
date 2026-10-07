@@ -85,6 +85,9 @@ class DiskV2Renderer:
             0 = 盘区 p99.9 亮度落在 0.9（画面无过曝，最亮处只到浅金、缺少"发光"感）；默认 1.5
             （×2.83：视频构图下约 2% 的盘区像素越过白点烧白，阴影内辉光约为 EV = 0 时的 2 倍）。负值更暗。视频首帧锁定的
             曝光已包含补偿。
+        film_response: 胶片响应 m ∈ [0, 1]（ISP 层，传给 `postfx.tonemap_film`）：0（默认）= 保色度 ACES，
+            与引入该参数前逐位一致，高光止于浅金；1 = 逐通道 ACES（胶片各层 / 传感器各通道独立饱和），
+            同一颜色越亮越淡、最亮处趋白；中间值线性混合。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
         ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
@@ -114,6 +117,7 @@ class DiskV2Renderer:
         lens_model: str = "psf",
         lens_glare: Optional[float] = None,
         exposure_ev: float = 1.5,
+        film_response: float = 0.0,
         sky_gain: float = 0.5,
         ss: int = 1,
         opt_level: int = 0,
@@ -162,6 +166,9 @@ class DiskV2Renderer:
         # None = 用 postfx 默认值
         self.lens_glare = None if lens_glare is None else float(lens_glare)
         self.exposure_ev = float(exposure_ev)
+        if not 0.0 <= film_response <= 1.0:
+            raise ValueError("film_response must be in [0, 1]")
+        self.film_response = float(film_response)
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
@@ -582,7 +589,7 @@ class DiskV2Renderer:
             曝光优先级：参数 `exposure` → `fixed_exposure`（视频首帧锁定）→ 自动曝光
             `0.9 / p99.9(L) · 2^exposure_ev`，L 为盘区亮度（`L > 1e-4`，只看盘；
             EV = 0 即参考实现预设 M 的 p99.9 → 0.9）。合成 `x = exposure·disk + sky_gain·sky`，
-            再经 `postfx`：白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB。
+            再经 `postfx`：白平衡 → 镜头 PSF → 色散 → ACES（胶片响应 `film_response`）→ sRGB。
         """
         if exposure is not None:
             exposure = float(exposure)
@@ -598,7 +605,7 @@ class DiskV2Renderer:
         if sky is not None:
             x = x + self.sky_gain * sky
         fx = {"bloom_luma_threshold": self.bloom_luma_threshold, "lens_model": self.lens_model,
-              "white_balance_K": self.white_balance_K}
+              "white_balance_K": self.white_balance_K, "film_response": self.film_response}
         if self.lens_glare is not None:
             fx["lens_glare"] = self.lens_glare
         img = postfx(x, exposure=1.0, **fx)

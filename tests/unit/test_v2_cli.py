@@ -49,6 +49,19 @@ class V2VolumeOverridesTest(unittest.TestCase):
         self.assertEqual(cli.v2_volume_overrides(a),
                          {"atm_frac": 0.2, "atm_height": 0.015, "atm_fine_sigma": 0.0})
 
+    def test_core_floor_and_coupling_flags(self):
+        """`--v2_core_floor` → core_floor，`--v2_temp_density_coupling` → dt_i；未传时保持默认 0.15 / 0.05。"""
+        from src.v2.params import DiskV2VolumeParams
+        self.assertEqual(cli.v2_volume_overrides(_args()), {})
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(
+            _args("--v2_core_floor", "0", "--v2_temp_density_coupling", "0.25")))
+        self.assertEqual((vp.core_floor, vp.dt_i), (0.0, 0.25))
+        self.assertEqual((DiskV2VolumeParams().core_floor, DiskV2VolumeParams().dt_i), (0.15, 0.05))
+        for kv in (("--v2_core_floor", "1.2"), ("--v2_temp_density_coupling", "-0.1"),
+                   ("--v2_temp_density_coupling", "1.5")):
+            with self.assertRaises(ValueError):
+                DiskV2VolumeParams(**cli.v2_volume_overrides(_args(*kv)))
+
     def test_atmosphere_overrides_build_params(self):
         """覆盖项可直接构造 DiskV2VolumeParams（字段名有效、取值通过校验）。"""
         from src.v2.params import DiskV2VolumeParams
@@ -68,6 +81,14 @@ class V2VolumeOverridesTest(unittest.TestCase):
     def test_exposure_ev_flag(self):
         self.assertIsNone(_args().v2_exposure_ev)
         self.assertEqual(_args("--v2_exposure_ev", "0.5").v2_exposure_ev, 0.5)
+
+    def test_film_response_flag(self):
+        """`--v2_film_response`：未传为 None（渲染器取默认 0）；超出 [0, 1] 在校验阶段报错。"""
+        self.assertIsNone(_args().v2_film_response)
+        self.assertEqual(_args("--v2_film_response", "1").v2_film_response, 1.0)
+        for bad in ("-0.1", "1.5"):
+            with self.assertRaises(ValueError):
+                cli.validate_args(_args("--v2_film_response", bad))
 
     def test_az_stretch_flag_removed(self):
         """旧主云级联已删除，`--v2_az_stretch` 不再接受。"""

@@ -34,6 +34,7 @@ from src.v2.postfx import (
     postfx_params_defaults,
     srgb_encode,
     tonemap_chroma_aces,
+    tonemap_film,
 )
 
 
@@ -170,6 +171,64 @@ class ACESChromaTest(unittest.TestCase):
         self.assertTrue(np.all(out >= 0) and np.all(out <= 1.0))
 
 
+class FilmResponseTest(unittest.TestCase):
+    """胶片响应 m：保色度 ACES 与逐通道 ACES（各层独立饱和）按 m 线性混合。"""
+
+    @staticmethod
+    def _aces(x):
+        return np.clip(x * (2.51 * x + 0.03) / (x * (2.43 * x + 0.59) + 0.14), 0.0, 1.0)
+
+    def setUp(self):
+        rng = np.random.default_rng(7)
+        self.x = rng.uniform(0.0, 4.0, (16, 24, 3)) * rng.uniform(0.0, 2.0, (16, 24, 1))
+
+    def test_zero_is_bitwise_chroma_aces(self):
+        """m = 0 与现有保色度 ACES 逐位一致（默认设置下现有场景不变）。"""
+        np.testing.assert_array_equal(tonemap_film(self.x, 0.0, 0.12), tonemap_chroma_aces(self.x, 0.12))
+
+    def test_one_is_per_channel_aces(self):
+        """m = 1 时每个通道独立过 ACES 曲线。"""
+        np.testing.assert_allclose(tonemap_film(self.x, 1.0, 0.12), self._aces(self.x), atol=1e-12)
+
+    def test_half_is_linear_mix(self):
+        mix = 0.5 * tonemap_chroma_aces(self.x, 0.12) + 0.5 * self._aces(self.x)
+        np.testing.assert_allclose(tonemap_film(self.x, 0.5, 0.12), mix, atol=1e-12)
+
+    def test_gray_stays_gray(self):
+        """灰色输入在任何 m 下保持灰色（不引入色偏）。"""
+        g = np.linspace(0.0, 20.0, 50)[:, None, None] * np.ones((1, 1, 3))
+        for m in (0.0, 0.5, 1.0):
+            out = tonemap_film(g, m, 0.12)
+            np.testing.assert_allclose(out[..., 0], out[..., 1], atol=1e-9)
+            np.testing.assert_allclose(out[..., 1], out[..., 2], atol=1e-9)
+
+    def test_highlight_path_to_white(self):
+        """m = 1：同一橙色越亮饱和度越低，极亮时趋近白色。"""
+        c = np.array([1.0, 0.6, 0.3])
+        k = np.array([0.5, 2.0, 8.0, 64.0])
+        out = tonemap_film(k[:, None, None] * c, 1.0, 0.12)[:, 0, :]
+        sat = (out.max(-1) - out.min(-1)) / out.max(-1)
+        self.assertTrue(np.all(np.diff(sat) < 0))
+        self.assertLess(sat[-1], 0.05)
+
+    def test_output_in_unit_interval(self):
+        for m in (0.0, 0.3, 1.0):
+            out = tonemap_film(self.x * 100.0, m, 0.12)
+            self.assertTrue(np.all(out >= 0.0) and np.all(out <= 1.0))
+
+    def test_invalid_raises(self):
+        for m in (-0.1, 1.1, float("nan")):
+            with self.assertRaises(ValueError):
+                tonemap_film(self.x, m, 0.12)
+
+    def test_postfx_default_zero(self):
+        """postfx 默认 film_response = 0；显式传 1 时输出变化。"""
+        self.assertEqual(postfx_params_defaults()["film_response"], 0.0)
+        hdr = self.x * 3.0
+        np.testing.assert_array_equal(postfx(hdr), postfx(hdr, film_response=0.0))
+        self.assertFalse(np.array_equal(postfx(hdr), postfx(hdr, film_response=1.0)))
+
+
 class SRGBTest(unittest.TestCase):
     def test_roundtrip(self):
         """srgb_encode 的输出在 [0,1]，暗端斜率 12.92。"""
@@ -292,7 +351,8 @@ class ExposureCompensationTest(unittest.TestCase):
 
         from src.v2.taichi_render import DiskV2Renderer
         stub = SimpleNamespace(fixed_exposure=fixed, exposure_ev=ev, sky_gain=0.0, bloom_luma_threshold=True,
-                               lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, last_white_point=1.0)
+                               lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=0.0,
+                               last_white_point=1.0)
         rng = np.random.default_rng(3)
         hdr = rng.uniform(0.01, 1.0, (24, 32, 3)) * rng.uniform(0.0, 2.0, (24, 32, 1))
         DiskV2Renderer.finish(stub, hdr, None)
@@ -308,6 +368,24 @@ class ExposureCompensationTest(unittest.TestCase):
         """视频锁定曝光（首帧已含补偿）直接使用，不再重复乘 2^EV。"""
         got, _ = self._finish(1.5, fixed=0.37)
         self.assertAlmostEqual(got, 0.37, places=6)
+
+    def test_finish_passes_film_response(self):
+        """`finish` 把渲染器的 film_response 传给 postfx。"""
+        from types import SimpleNamespace
+
+        from src.v2.taichi_render import DiskV2Renderer
+        hdr = np.random.default_rng(5).uniform(0.0, 3.0, (12, 16, 3))
+        outs = []
+        for m in (0.0, 1.0):
+            stub = SimpleNamespace(fixed_exposure=1.0, exposure_ev=0.0, sky_gain=0.0, bloom_luma_threshold=True,
+                                   lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=m,
+                                   last_white_point=1.0)
+            outs.append(DiskV2Renderer.finish(stub, hdr, None))
+        expect0 = postfx(hdr, white_balance_K=4500.0, lens_glare=0.0).astype(np.float32) / 255.0
+        np.testing.assert_array_equal(outs[0], expect0)
+        self.assertFalse(np.array_equal(outs[0], outs[1]))
+        expect = postfx(hdr, white_balance_K=4500.0, lens_glare=0.0, film_response=1.0).astype(np.float32) / 255.0
+        np.testing.assert_array_equal(outs[1], expect)
 
 
 if __name__ == "__main__":
