@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Tuple
+from typing import List, Sequence, Tuple
 
 import numpy as np
 
@@ -90,6 +90,45 @@ class PathTiming:
     ramp_out: float = 8.0
     speed_start: float = 0.55
     speed_end: float = 0.55
+
+
+@dataclass(frozen=True)
+class Pan:
+    """时间域摇镜：黑洞画面横坐标在 [start, end] 内平滑移向 u、停留、再平滑移回路径给出的值。
+
+    Attributes:
+        start: 开始摇出的视频时刻（秒，≥ 0）。
+        end: 摇回结束的视频时刻（秒，≤ 路径时长）。
+        ramp: 摇出 / 摇回各自的时长（秒，> 0，2·ramp ≤ end − start）。
+        u: 停留段黑洞的目标画面横坐标（[`SUBJECT_UV_MIN`, `SUBJECT_UV_MAX`]）；纵坐标 v 保持路径值。
+    """
+
+    start: float
+    end: float
+    ramp: float
+    u: float
+
+    def weight(self, t: float) -> float:
+        """摇镜权重 w(t) ∈ [0, 1]：摇出段由 0 升到 1，停留段为 1，摇回段降回 0，区间外为 0。
+
+        Args:
+            t: 视频时刻（秒）。
+
+        Returns:
+            标量，值域 [0, 1]；一、二阶导数连续（摇镜角速度、角加速度两端为 0）。
+
+        Formula:
+            w(t) = ss((t − start)/ramp)·(1 − ss((t − end + ramp)/ramp))，ss 为五次缓动 `_smootherstep`。
+
+        Physical Meaning:
+            摄影师在相机继续飞行的同时平稳转动镜头：起步与停止都没有突兀的角速度跳变。
+
+        Simplifications:
+            在黑洞的画面横坐标上插值，再反解光轴；转过的角度随相机位置略有变化，不是按固定角速度转动。
+        """
+        rise = _smootherstep(np.float64((t - self.start) / self.ramp))
+        fall = _smootherstep(np.float64((t - self.end + self.ramp) / self.ramp))
+        return float(rise * (1.0 - fall))
 
 
 @dataclass(frozen=True)
@@ -176,21 +215,24 @@ class CameraPath:
     Args:
         keyframes: 至少 2 个关键帧（按经过顺序）。
         timing: 平滑、感知进度与节奏参数。
+        pans: 时间域摇镜（按时间先后、互不重叠）；默认无。
 
     Raises:
-        ValueError: 关键帧或参数取值非法（见 `_validate`），或构图求解不收敛（见 `solve_forward`）。
+        ValueError: 关键帧、摇镜或参数取值非法（见 `_validate`），或构图求解不收敛（见 `solve_forward`）。
     """
 
-    def __init__(self, keyframes: List[Keyframe], timing: PathTiming):
+    def __init__(self, keyframes: List[Keyframe], timing: PathTiming, pans: Sequence[Pan] = ()):
         """校验参数，构造空间路径与节奏曲线。
 
         Args:
             keyframes: 至少 2 个关键帧（按经过顺序）。
             timing: 平滑、感知进度与节奏参数。
+            pans: 时间域摇镜（按时间先后、互不重叠）；只改变光轴，不参与节奏（感知进度）计算。
         """
-        _validate(keyframes, timing)
+        _validate(keyframes, timing, pans)
         self.keyframes = list(keyframes)
         self.timing = timing
+        self.pans = tuple(pans)
         self._build_space()
         self._build_rhythm()
 
@@ -315,8 +357,16 @@ class CameraPath:
 
         Returns:
             `CameraState`；把它的 `pos`、`forward`、`fov`、`roll` 交给渲染器即可。
+
+        Formula:
+            摇镜区间内黑洞目标横坐标 u ← u + w(t)·(u_pan − u)（见 `Pan.weight`），再按新目标反解光轴；
+            区间外不改动，与无摇镜时逐位相同。
         """
         cfg = self.config_at(t)[None, :]
+        for pan in self.pans:
+            w = pan.weight(float(t))
+            if w > 0.0:
+                cfg[0, 5] += w * (pan.u - cfg[0, 5])
         pos = _position(cfg)
         fwd = solve_forward(pos, cfg[:, 5:7], cfg[:, 3], aspect, cfg[:, 4])
         return CameraState(pos=pos[0], forward=fwd[0], fov=float(cfg[0, 3]), roll=float(cfg[0, 4]),
@@ -412,18 +462,34 @@ class CameraPath:
         return lines
 
 
-def _validate(keyframes: List[Keyframe], timing: PathTiming) -> None:
-    """校验关键帧与节奏参数（所有数值必须有限）。
+def _validate(keyframes: List[Keyframe], timing: PathTiming, pans: Sequence[Pan] = ()) -> None:
+    """校验关键帧、节奏参数与摇镜（所有数值必须有限）。
 
     Args:
         keyframes: 关键帧列表。
         timing: 节奏参数。
+        pans: 摇镜列表。
 
     Raises:
         ValueError: 信息中给出字段名。关键帧少于 2 个；任一数值不是有限数；r ≤ 0；fov 不在 (0, 180)；
             subject_uv 不在 [−1, 2]；duration < `MIN_DURATION`；path_smoothing、progress_smoothing、near_weight、ramp_in、
-            ramp_out < 0；near_height_floor ≤ 0；ramp_in + ramp_out 超过 duration；speed_start / speed_end 不在 (0, 1]。
+            ramp_out < 0；near_height_floor ≤ 0；ramp_in + ramp_out 超过 duration；speed_start / speed_end 不在 (0, 1]；
+            摇镜 start < 0、end > duration、ramp ≤ 0、2·ramp > end − start、u 不在 [−1, 2]，或与前一个摇镜重叠。
     """
+    prev_end = -math.inf
+    for i, p in enumerate(pans):
+        for name in ("start", "end", "ramp", "u"):
+            if not math.isfinite(getattr(p, name)):
+                raise ValueError(f"摇镜 {i}：{name} 必须是有限数，得到 {getattr(p, name)}")
+        if not (0.0 <= p.start and p.end <= timing.duration):
+            raise ValueError(f"摇镜 {i}：start / end 必须在 [0, duration]，得到 {p.start} / {p.end}")
+        if not (p.ramp > 0.0 and 2.0 * p.ramp <= p.end - p.start):
+            raise ValueError(f"摇镜 {i}：ramp 必须 > 0 且 2·ramp ≤ end − start，得到 ramp = {p.ramp}")
+        if not SUBJECT_UV_MIN <= p.u <= SUBJECT_UV_MAX:
+            raise ValueError(f"摇镜 {i}：u 必须在 [{SUBJECT_UV_MIN:g}, {SUBJECT_UV_MAX:g}]，得到 {p.u}")
+        if p.start < prev_end:
+            raise ValueError(f"摇镜 {i}：与前一个摇镜重叠（start {p.start} < 前一个 end {prev_end}）")
+        prev_end = p.end
     if len(keyframes) < 2:
         raise ValueError("相机路径至少需要 2 个关键帧")
     for i, k in enumerate(keyframes):
@@ -479,7 +545,8 @@ def load_camera_path(spec: dict) -> CameraPath:
     """由路径文件内容（JSON 解析后的字典）构造 `CameraPath`。
 
     Args:
-        spec: 含 `duration`、`keyframes`，可选 `path_smoothing`、`progress`、`rhythm` 块；
+        spec: 含 `duration`、`keyframes`，可选 `path_smoothing`、`progress`、`rhythm` 块与 `pans` 数组
+            （每项 `start`、`end`、`ramp`、`u`，见 `Pan`）；
             格式见 `docs/plans/v2_camera_path_plan.md` §5.1。省略的可选项取 `PathTiming` 默认值。
 
     Returns:
@@ -513,8 +580,13 @@ def load_camera_path(spec: dict) -> CameraPath:
             keyframes.append(Keyframe(r=float(k["r"]), phi_deg=float(k["phi_deg"]), z=float(k["z"]),
                                       fov=float(k["fov"]), roll=float(k["roll"]), subject_uv=(float(uv[0]), float(uv[1])),
                                       label=str(k.get("label", ""))))
+        pans_spec = spec.get("pans", [])
+        if not isinstance(pans_spec, list):
+            raise ValueError(f"pans 必须是数组，得到 {pans_spec!r}")
+        pans = [Pan(start=float(p["start"]), end=float(p["end"]), ramp=float(p["ramp"]), u=float(p["u"]))
+                for p in pans_spec]
     except KeyError as exc:
         raise ValueError(f"路径文件缺少必填字段 {exc}") from exc
     except (TypeError, AttributeError) as exc:
         raise ValueError(f"路径文件结构错误：{exc}") from exc
-    return CameraPath(keyframes, timing)
+    return CameraPath(keyframes, timing, pans)

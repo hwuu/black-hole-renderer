@@ -297,14 +297,16 @@ class DiskV2Taichi:
         # （σ_T = 0 时 _tt_n = 0、相关代码在编译期移除；见 docs/plans/v2_temperature_turbulence_plan.md）
         self._tt_sig = float(vp.temp_turb_sigma)
         self._tt_on = self._tt_sig > 0.0
+        # 八度顺序：temp_turb_coarse 个粗尺度八度（主云尺度）在前，temp_turb_octaves 个延伸八度在后
         _tg = temp_turb_geometry(vp.shear_k0, vp.shear_octaves, vp.shear_ar_small, vp.shear_tilt_k,
-                                 vp.temp_turb_octaves, float(self.params.disk_spin))
+                                 vp.temp_turb_octaves, float(self.params.disk_spin),
+                                 n_coarse=vp.temp_turb_coarse, shear_ar_big=vp.shear_ar_big)
         self._tt_n = len(_tg.kr) if self._tt_on else 0
         self._tt_kr = list(_tg.kr)
         self._tt_per = list(_tg.period)
         self._tt_ua = list(_tg.u_scale)
         self._tt_c = list(_tg.shear)
-        self._tt_a = list(temp_turb_gains(vp.temp_turb_octaves, vp.temp_turb_gain))
+        self._tt_a = list(temp_turb_gains(vp.temp_turb_octaves, vp.temp_turb_gain, n_coarse=vp.temp_turb_coarse))
         self._tt_a2_sum = sum(a * a for a in self._tt_a)
         # 径向格宽 c_e = r·_tt_cell[e]（径向噪声坐标 |N₀₀|·K·ln r 的一格换算成 r_s）
         self._tt_cell = [1.0 / (ua * kr) for ua, kr in zip(self._tt_ua, self._tt_kr)]

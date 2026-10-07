@@ -27,7 +27,7 @@ import numpy as np
 import taichi as ti
 
 from src.v2.params import DiskV2Params, DiskV2VolumeParams
-from src.v2.shear_cascade import ShearCascadeGeometry
+from src.v2.shear_cascade import ShearCascadeGeometry, shear_cascade_geometry
 from src.v2.temperature_turbulence import (
     INTERMITTENCY_CN_MAX,
     LN_R_ANCHOR,
@@ -73,6 +73,46 @@ class GeometryTest(unittest.TestCase):
         for n, g in ((0, 0.69), (3, 0.69), (2, 0.0), (2, 1.5)):
             with self.assertRaises(ValueError):
                 temp_turb_gains(n, g)
+
+
+class CoarseOctaveTest(unittest.TestCase):
+    """向粗尺度延伸 S 级（`n_coarse`）：粗尺度在前、细尺度在后，S = 0 与改动前完全相同。"""
+
+    def test_zero_coarse_is_unchanged(self):
+        a = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, -1.0)
+        b = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, -1.0, n_coarse=0, shear_ar_big=10.0)
+        self.assertEqual(a, b)
+        self.assertEqual(temp_turb_gains(2, 0.69), temp_turb_gains(2, 0.69, n_coarse=0))
+
+    def test_coarse_octaves_reuse_main_cascade_geometry(self):
+        main = shear_cascade_geometry(_K0, _NOCT, 10.0, _AR_SMALL, _TILT, -1.0)
+        fine = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, -1.0)
+        g = temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, -1.0, n_coarse=3, shear_ar_big=10.0)
+        self.assertEqual(len(g.kr), 5)
+        for f in ("kr", "period", "u_scale", "shear", "aspect", "tilt_rad"):
+            self.assertEqual(tuple(getattr(g, f)), tuple(getattr(main, f))[1:] + tuple(getattr(fine, f)))
+        # 频率 20 → 1620：主云第 2–4 级 + 两个细八度，逐级 ×3
+        np.testing.assert_allclose(g.kr, [_K0 * 3 ** e for e in range(1, 6)])
+
+    def test_coarse_gains_cover_all_octaves(self):
+        self.assertEqual(temp_turb_gains(2, 1.0, n_coarse=3), (1.0,) * 5)
+        np.testing.assert_allclose(temp_turb_gains(2, 0.5, n_coarse=1), (1.0, 0.5, 0.25))
+
+    def test_coarse_bounds(self):
+        for s in (-1, _NOCT + 1):
+            with self.assertRaises(ValueError):
+                temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, 1.0, n_coarse=s, shear_ar_big=10.0)
+            with self.assertRaises(ValueError):
+                temp_turb_gains(2, 0.69, n_coarse=s, max_coarse=_NOCT)
+        with self.assertRaises(ValueError):
+            temp_turb_geometry(_K0, _NOCT, _AR_SMALL, _TILT, 2, 1.0, n_coarse=1)  # 缺 shear_ar_big
+
+    def test_params_validation(self):
+        self.assertEqual(DiskV2VolumeParams().temp_turb_coarse, 0)
+        DiskV2VolumeParams(temp_turb_coarse=4)
+        for s in (-1, 5):
+            with self.assertRaises(ValueError):
+                DiskV2VolumeParams(temp_turb_coarse=s)
 
 
 class WeightTest(unittest.TestCase):

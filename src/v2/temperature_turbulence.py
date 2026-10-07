@@ -60,65 +60,89 @@ def smoothstep01(s):
 
 
 def temp_turb_geometry(shear_k0: float, shear_octaves: int, shear_ar_small: float, shear_tilt_k: float,
-                       n_octaves: int, disk_spin: float) -> ShearCascadeGeometry:
-    """温度湍流延伸八度的噪声坐标系数（接在主云剪切级联最细八度之后）。
+                       n_octaves: int, disk_spin: float, n_coarse: int = 0,
+                       shear_ar_big: Optional[float] = None) -> ShearCascadeGeometry:
+    """温度湍流各八度的噪声坐标系数：可选的 S 个粗尺度八度在前，E 个延伸八度在后。
 
     Args:
         shear_k0: 主云剪切级联最大八度的 `ln r` 频率（格 / 单位 ln r，> 0）。
-        shear_octaves: 主云剪切级联八度数（≥ 1）。
+        shear_octaves: 主云剪切级联八度数 N（≥ 1）。
         shear_ar_small: 主云最细八度的长宽比（≥ 1）；延伸八度统一取该值。
         shear_tilt_k: 拖尾倾角系数（≥ 0），与主云相同。
-        n_octaves: 延伸八度数 E（1 ≤ E ≤ `MAX_OCTAVES`）。
+        n_octaves: 向小尺度延伸的八度数 E（1 ≤ E ≤ `MAX_OCTAVES`）。
         disk_spin: 盘旋转方向（+1 / −1）。
+        n_coarse: 向粗尺度延伸的八度数 S（0 ≤ S ≤ N）：温度起伏另取主云最细的 S 个八度的尺度。0 = 只有延伸八度。
+        shear_ar_big: 主云最大八度的长宽比（≥ 1）；S > 0 时必填，粗尺度八度的几何与主云对应八度相同。
 
     Returns:
-        `ShearCascadeGeometry`，各字段长度为 E；第 e 个八度的频率为 `shear_k0·3^(shear_octaves + e)`。
+        `ShearCascadeGeometry`，各字段长度为 S + E，按频率从低到高排列：
+        前 S 项与主云剪切级联第 N−S … N−1 个八度相同（频率 `shear_k0·3^k`），
+        后 E 项为延伸八度（频率 `shear_k0·3^(N + e)`）。S = 0 时与只取延伸八度完全相同。
 
     Raises:
-        ValueError: `n_octaves` 越界；其余参数由 `shear_cascade_geometry` 校验。
+        ValueError: `n_octaves` 或 `n_coarse` 越界、S > 0 时缺 `shear_ar_big`；其余参数由 `shear_cascade_geometry` 校验。
 
     Formula:
-        `shear_cascade_geometry(shear_k0·3^shear_octaves, E, shear_ar_small, shear_ar_small, shear_tilt_k, spin)`
+        延伸八度：`shear_cascade_geometry(shear_k0·3^N, E, AR_small, AR_small, tilt_k, spin)`
+        粗尺度八度：`shear_cascade_geometry(shear_k0, N, AR_big, AR_small, tilt_k, spin)[N−S : N]`
 
     Physical Meaning:
-        湍流级联继续向小尺度延伸，团块形状沿用开普勒剪切取形规律。
+        湍流级联继续向小尺度延伸，团块形状沿用开普勒剪切取形规律；粗尺度八度使温度起伏也出现
+        主云尺度的大片冷暖斑块，大斑块内部再由更细的八度细分（分形结构），远景中也能看到起伏。
 
     Simplifications:
-        延伸八度的长宽比不再随尺度变化（统一取主云最细八度的长宽比）。
+        延伸八度的长宽比不再随尺度变化（统一取主云最细八度的长宽比）；粗尺度八度与主云同尺度、
+        同几何，但噪声坐标偏移不同，起伏与主云密度不相关。
     """
     if not 1 <= n_octaves <= MAX_OCTAVES:
         raise ValueError(f"n_octaves must be in [1, {MAX_OCTAVES}]")
+    if not 0 <= n_coarse <= shear_octaves:
+        raise ValueError(f"n_coarse must be in [0, shear_octaves = {shear_octaves}]")
     k_first = float(shear_k0) * 3.0 ** int(shear_octaves)
-    return shear_cascade_geometry(k_first, n_octaves, shear_ar_small, shear_ar_small, shear_tilt_k, disk_spin)
+    fine = shear_cascade_geometry(k_first, n_octaves, shear_ar_small, shear_ar_small, shear_tilt_k, disk_spin)
+    if n_coarse == 0:
+        return fine
+    if shear_ar_big is None:
+        raise ValueError("shear_ar_big is required when n_coarse > 0")
+    main = shear_cascade_geometry(shear_k0, shear_octaves, shear_ar_big, shear_ar_small, shear_tilt_k, disk_spin)
+    sl = slice(shear_octaves - n_coarse, shear_octaves)
+    return ShearCascadeGeometry(*(tuple(getattr(main, f)[sl]) + tuple(getattr(fine, f))
+                                  for f in ("kr", "period", "u_scale", "shear", "aspect", "tilt_rad")))
 
 
-def temp_turb_gains(n_octaves: int, gain: float) -> Tuple[float, ...]:
-    """延伸八度的幅度 `a_e = gain^e`（a_0 = 1）。
+def temp_turb_gains(n_octaves: int, gain: float, n_coarse: int = 0,
+                    max_coarse: Optional[int] = None) -> Tuple[float, ...]:
+    """温度湍流各八度的幅度 `a_e = gain^e`（a_0 = 1，e 从最粗的八度起算）。
 
     Args:
-        n_octaves: 延伸八度数 E（1 ≤ E ≤ `MAX_OCTAVES`）。
-        gain: 逐八度幅度比（(0, 1]）。
+        n_octaves: 向小尺度延伸的八度数 E（1 ≤ E ≤ `MAX_OCTAVES`）。
+        gain: 逐八度幅度比（(0, 1]）；1 = 各八度等幅。
+        n_coarse: 向粗尺度延伸的八度数 S（≥ 0），见 `temp_turb_geometry`。
+        max_coarse: S 的上限（通常为主云八度数 N）；None = 只校验 S ≥ 0。
 
     Returns:
-        长度为 E 的元组，首项为 1，逐项乘 `gain`，值域 (0, 1]。
+        长度为 S + E 的元组，首项为 1，逐项乘 `gain`，值域 (0, 1]；顺序与 `temp_turb_geometry` 相同。
 
     Raises:
-        ValueError: `n_octaves` 或 `gain` 越界。
+        ValueError: `n_octaves`、`n_coarse` 或 `gain` 越界。
 
     Formula:
-        `a_e = gain^e`，e = 0 … E−1
+        `a_e = gain^e`，e = 0 … S+E−1
 
     Physical Meaning:
-        湍流起伏幅度随尺度减小而减弱；默认 0.69 ≈ 3^(−1/3) 为 Kolmogorov 标度（尺度缩小到 1/3）。
+        湍流起伏幅度随尺度减小而减弱；0.69 ≈ 3^(−1/3) 为 Kolmogorov 标度（尺度缩小到 1/3）。
+        含粗尺度八度时取 1（等幅）：按 Kolmogorov 标度逐级减弱时，6 个八度的最细一级只有最粗一级的 0.69⁵ ≈ 16%，近处细节消失。
 
     Simplifications:
         幅度比与尺度无关（纯幂律）。
     """
     if not 1 <= n_octaves <= MAX_OCTAVES:
         raise ValueError(f"n_octaves must be in [1, {MAX_OCTAVES}]")
+    if n_coarse < 0 or (max_coarse is not None and n_coarse > max_coarse):
+        raise ValueError(f"n_coarse must be in [0, {max_coarse}]")
     if not 0.0 < gain <= 1.0:
         raise ValueError("gain must be in (0, 1]")
-    return tuple(float(gain) ** e for e in range(n_octaves))
+    return tuple(float(gain) ** e for e in range(n_coarse + n_octaves))
 
 
 def temp_turb_warp_period(period: int) -> int:

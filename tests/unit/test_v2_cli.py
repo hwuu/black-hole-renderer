@@ -78,6 +78,18 @@ class V2VolumeOverridesTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_temp_turb", "0.6")))
 
+    def test_temp_turb_fractal_flags(self):
+        """`--v2_temp_turb_coarse/gain/clamp_px` 写入对应字段；未传时保持默认 0 / 0.69 / 3；越界报错。"""
+        from src.v2.params import DiskV2VolumeParams
+        self.assertEqual(cli.v2_volume_overrides(_args()), {})
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(_args(
+            "--v2_temp_turb_coarse", "3", "--v2_temp_turb_gain", "1", "--v2_temp_turb_clamp_px", "1")))
+        self.assertEqual((vp.temp_turb_coarse, vp.temp_turb_gain, vp.temp_turb_clamp_px), (3, 1.0, 1.0))
+        self.assertIsInstance(vp.temp_turb_coarse, int)
+        for kv in (("--v2_temp_turb_coarse", "5"), ("--v2_temp_turb_gain", "0"), ("--v2_temp_turb_clamp_px", "0")):
+            with self.assertRaises(ValueError):
+                DiskV2VolumeParams(**cli.v2_volume_overrides(_args(*kv)))
+
     def test_exposure_ev_flag(self):
         self.assertIsNone(_args().v2_exposure_ev)
         self.assertEqual(_args("--v2_exposure_ev", "0.5").v2_exposure_ev, 0.5)

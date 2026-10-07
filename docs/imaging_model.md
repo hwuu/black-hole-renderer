@@ -80,7 +80,8 @@ d²x/dλ² = −1.5 · L² · x / r⁵,    L = |x × dx/dλ|（角动量，守�
 - **小尺度温度湍流**（可选，默认关）：温度再乘对数正态起伏 `exp(σ_l·n − 2σ_l²·V)`（平均热辐射通量 ⟨T⁴⟩ 守恒），
   n 为主云剪切级联向更小尺度延伸的起伏，比像素小的尺度淡出（频率钳制，方差降为 V）；局部强度 σ_l 随主云浓淡成片变化
   （间歇性），噪声坐标经过扭曲、不呈行列排布。只改温度、不改密度与遮挡，
-  使贴盘面视角的近处云层出现细节；远景几乎不变。见 [`plans/v2_temperature_turbulence_plan.md`](plans/v2_temperature_turbulence_plan.md)。
+  使贴盘面视角的近处云层出现细节；远景几乎不变。可选再加主云最细几级尺度的粗尺度八度（`--v2_temp_turb_coarse`），
+  大片冷暖斑块由更细的起伏逐级细分（分形结构），中远景也能看到起伏。见 [`plans/v2_temperature_turbulence_plan.md`](plans/v2_temperature_turbulence_plan.md)。
 - **散射**：大气的散射反照率 `ω = 1/(1 + q·ρ/ρ_mid)` 由密度决定（稀处以电子散射为主），散射的入射光取下方
   盘面的发射 `(1 − e^{−τ_c})·S_disk`，所以大气呈当地盘面的金色。
 - **频移**：光子从物质参考系到相机的频移因子 `g = ν_obs/ν_em = g_grav / (γ(1 − β·cosθ))`
@@ -285,7 +286,8 @@ CLI `--help` 按同样的层分组显示。
 | | `--v2_lum_temp_scale` | 1.25 | 亮度温度倍率 s（物理 1） |
 | | `--v2_doppler_lum` / `--v2_doppler_color` | 0.25 / 0.75 | 多普勒亮度 / 颜色指数 p / q（物理 1） |
 | | `--v2_color_floor` | 0（关） | 色温下限 T_floor |
-| | `--v2_temp_turb` | 0（关） | 小尺度温度湍流强度 σ_T（全盘均方根；close_low、interstellar_skim 取 0.1，lensing_bend 取 0.05） |
+| | `--v2_temp_turb` | 0（关） | 小尺度温度湍流强度 σ_T（全盘均方根；close_low 取 0.1，lensing_bend 取 0.05，interstellar_skim 取 0.134 并开启粗尺度八度） |
+| | `--v2_temp_turb_coarse` / `--v2_temp_turb_gain` | 0 / 0.69 | 向粗尺度延伸的八度数 S 与逐八度幅度比：S > 0 时温度起伏另取主云最细 S 级的尺度（分形结构，中远景也有起伏），宜配 gain 1；interstellar_skim 取 3 / 1（见 `docs/plans/v2_temperature_turbulence_plan.md` §9） |
 | ③ 场景·背景 | `--texture` / `--n_stars` | 程序星空 / 6000 | 天空盒 |
 | | `--v2_sky_gain` | 0.5 | 天空亮度（曝光之后叠加） |
 | | `--v2_sky_rot_deg_per_sec` | 0 | 星空自转速度（视频） |

@@ -153,8 +153,14 @@ class DiskV2VolumeParams:
             见 docs/plans/v2_temperature_turbulence_plan.md。
         temp_turb_octaves: 温度湍流延伸八度数 E（1 或 2）：第 e 个八度的频率为
             `shear_k0·3^(shear_octaves + e)`。上限 2 由单精度坐标精度决定（E = 3 时出现插值台阶条纹）。默认 2。
-        temp_turb_gain: 延伸八度的逐八度幅度比（(0, 1]）：第 e 个八度幅度乘 gain^e。
-            默认 0.69 ≈ 3^(−1/3)（Kolmogorov 标度，尺度缩小到 1/3 时起伏幅度乘 3^(−1/3)）。
+        temp_turb_coarse: 温度湍流向粗尺度延伸的八度数 S（[0, shear_octaves]）：温度起伏另取主云最细的 S 个
+            八度的尺度（几何与主云对应八度相同、噪声与主云不相关），排在延伸八度之前，共 S + E 个八度。
+            大片冷暖斑块由更细的八度逐级细分（分形结构），中远景也能看到起伏。0 = 只有延伸八度（与改动前
+            逐位一致）。默认 0；interstellar_skim 场景取 3（配合 gain = 1、clamp_px = 1）。
+            见 docs/plans/v2_temperature_turbulence_plan.md §9。
+        temp_turb_gain: 逐八度幅度比（(0, 1]）：从最粗的八度起，第 e 个八度幅度乘 gain^e。
+            默认 0.69 ≈ 3^(−1/3)（Kolmogorov 标度，尺度缩小到 1/3 时起伏幅度乘 3^(−1/3)）；
+            含粗尺度八度时宜取 1（等幅），否则最细八度过弱、近处盘面细节消失。
         temp_turb_clamp_px: 频率钳制阈值 K（> 0）：八度的径向格宽小于 K 个像素足迹时完全淡出，
             大于 2K 个时完全可见。越小细节越多、越易出现锯齿。默认 3。
         temp_turb_lens_deg: 透镜淡出角 δ₀（度，(0, 90]）：光线累计偏折角 δ ≤ δ₀/2 时延伸八度完全可见，
@@ -222,6 +228,7 @@ class DiskV2VolumeParams:
     shear_tilt_k: float = 0.01
     temp_turb_sigma: float = 0.0
     temp_turb_octaves: int = 2
+    temp_turb_coarse: int = 0
     temp_turb_gain: float = 0.69
     temp_turb_clamp_px: float = 3.0
     temp_turb_lens_deg: float = 10.0
@@ -289,6 +296,8 @@ class DiskV2VolumeParams:
             raise ValueError("temp_turb_sigma must be in [0, 0.5]")
         if not 1 <= self.temp_turb_octaves <= TEMP_TURB_MAX_OCTAVES:
             raise ValueError(f"temp_turb_octaves must be in [1, {TEMP_TURB_MAX_OCTAVES}]")
+        if not 0 <= self.temp_turb_coarse <= self.shear_octaves:
+            raise ValueError("temp_turb_coarse must be in [0, shear_octaves]")
         if not 0.0 < self.temp_turb_gain <= 1.0:
             raise ValueError("temp_turb_gain must be in (0, 1]")
         if self.temp_turb_clamp_px <= 0.0:

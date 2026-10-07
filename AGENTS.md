@@ -102,7 +102,8 @@
   - 参数解析与模式分发（V1 / V2、单帧 / 视频 / 运镜）
 - `scenes/`
   - 成品场景，每个场景一个目录，内含说明（README.md）、渲染命令与运镜路径文件；
-    `v2_arts/interstellar_skim.json` 为示例路径（120 s，开启温度湍流）；`close_low/close_low.json` 为贴云顶匀速环绕（60 s，开启温度湍流）；
+    `v2_arts/interstellar_skim.json` 为示例路径（120 s，视野固定 50°，30–74 s 摇向前进方向（`pans` 块），
+    分形温度湍流 + 色调"白平衡 10000 K / 胶片响应 1 / +3 档"，命令见其 README）；`close_low/close_low.json` 为贴云顶匀速环绕（60 s，开启温度湍流）；
     `lensing_bend/lensing_bend.json` 为逼近侧透镜转弯处的长焦特写（30 s，视野 6°、黑洞在画面外、0.2°/s 极慢环绕，
     白平衡 12000 K 等成像参数见其 README）
 - `scripts/`

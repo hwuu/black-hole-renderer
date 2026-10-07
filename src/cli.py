@@ -161,6 +161,18 @@ def parse_args() -> argparse.Namespace:
                              "（浓处强、稀处平静，σ_T 为全盘均方根），噪声坐标经过扭曲、不呈行列排布。只改温度、不改密度与遮挡，"
                              "使贴盘面视角的近处云层出现明暗与冷暖细节，远景基本不变。0.1 = 温度起伏约 10%%；"
                              "视频贴盘帧耗时约 2.4 倍。0 = 关闭。默认 0。原理见 docs/plans/v2_temperature_turbulence_plan.md")
+    g_rad.add_argument("--v2_temp_turb_coarse", type=int, default=None, metavar="S",
+                        help="V2 温度湍流向粗尺度延伸的八度数 S（0 到主云八度数 4）：温度起伏另取主云最细的 S 个八度的"
+                             "尺度，大片冷暖斑块由更细的八度逐级细分（分形结构），中远景也能看到起伏。共 S + 2 个八度，"
+                             "耗时随八度数增加（S = 3 时视频约 1.85 倍）。宜配合 --v2_temp_turb_gain 1。"
+                             "0 = 只有向小尺度延伸的 2 个八度。默认 0；需 --v2_temp_turb > 0 才生效")
+    g_rad.add_argument("--v2_temp_turb_gain", type=float, default=None,
+                        help="V2 温度湍流逐八度幅度比（(0, 1]）：从最粗的八度起，第 e 个八度幅度乘 gain^e。"
+                             "0.69 ≈ Kolmogorov 标度；1 = 各八度等幅（含粗尺度八度时推荐，否则最细八度过弱、"
+                             "近处盘面细节消失）(default: 0.69)")
+    g_solver.add_argument("--v2_temp_turb_clamp_px", type=float, default=None, metavar="K",
+                        help="V2 温度湍流频率钳制阈值 K（像素足迹，> 0）：八度的径向格宽小于 K 个像素时完全淡出、"
+                             "大于 2K 个时完全可见。越小细节越多、越易闪烁；1 与 1.5 的闪烁实测相同 (default: 3)")
     g_rad.add_argument("--v2_color_floor", type=float, default=0.0,
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
@@ -226,7 +238,8 @@ def v2_volume_overrides(args) -> dict:
     Args:
         args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_core_contrast`、
             `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`、`--v2_temp_turb`、`--v2_core_floor`、
-            `--v2_temp_density_coupling`，None = 未传入）。
+            `--v2_temp_density_coupling`、`--v2_temp_turb_coarse`、`--v2_temp_turb_gain`、`--v2_temp_turb_clamp_px`，
+            None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
@@ -235,7 +248,8 @@ def v2_volume_overrides(args) -> dict:
               "core_contrast": args.v2_core_contrast, "atm_frac": args.v2_atm_frac,
               "atm_height": args.v2_atm_height, "atm_fine_sigma": args.v2_atm_fine,
               "temp_turb_sigma": args.v2_temp_turb, "core_floor": args.v2_core_floor,
-              "dt_i": args.v2_temp_density_coupling}
+              "dt_i": args.v2_temp_density_coupling, "temp_turb_coarse": args.v2_temp_turb_coarse,
+              "temp_turb_gain": args.v2_temp_turb_gain, "temp_turb_clamp_px": args.v2_temp_turb_clamp_px}
     return {k: v for k, v in fields.items() if v is not None}
 
 

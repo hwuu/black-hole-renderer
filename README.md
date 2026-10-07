@@ -58,14 +58,19 @@ python render.py --disk_model v2 --pov 0 -39.7 4.87 --fov 38 \
 python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
                  --ar1 3 --ar2 30 -r hd --device gpu --n_frames 240 --fps 24 -o output/v2.mp4
 
-# 运镜视频（示例路径 120 s：远景 → 掠云 → 穿过盘面 → 盘底 → 绕盘边回升 → 远景；帧数 = round(路径时长 × --fps)）
+# 运镜视频（示例路径 120 s：远景 → 掠云（摇向前进方向）→ 穿过盘面 → 盘底 → 绕盘边回升 → 远景；
+# 帧数 = round(路径时长 × --fps)；分形温度湍流与色调取值见 scenes/v2_arts/README.md）
 python render.py --disk_model v2 --video --v2_camera_path scenes/v2_arts/interstellar_skim.json \
-                 --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 --v2_temp_turb 0.1 \
+                 --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
+                 --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 --v2_temp_turb_clamp_px 1 \
+                 --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
                  -r fhd --fps 60 --device gpu -o output/v2_path.mp4
 
 # 运镜路径的单帧（检查构图）与联系表（各关键帧经过时刻各一格，画三分线与黑洞目标位置）
 python render.py --disk_model v2 --v2_camera_path scenes/v2_arts/interstellar_skim.json --v2_camera_path_time 63.9 \
-                 --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 --v2_temp_turb 0.1 \
+                 --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
+                 --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 --v2_temp_turb_clamp_px 1 \
+                 --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
                  -r sd --device gpu -o output/v2_path_t64.png
 python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation --v2_orbit_seconds 8 \
                  -o output/v2_arts/contact_sheet.png   # 联系表只用于检查构图，不含温度湍流
@@ -141,7 +146,10 @@ python render.py --video --orbit --resume -o output/demo.mp4
 | ② 场景·辐射 | `--v2_doppler_lum` | 多普勒亮度强度 p（≥ 0）：逼近侧变亮、远离侧变暗的程度，亮度按 Y(g^p·T) 计算。1 = 物理（左右亮度比很大）；0 = 无多普勒明暗 | 0.25 |
 | ② 场景·辐射 | `--v2_doppler_color` | 多普勒颜色强度 q（≥ 0）：逼近侧偏白、远离侧偏红的程度，色度按 χ(T·g^q) 计算，色度温度封顶到白平衡色温（最亮处止于白色，不偏蓝）。1 = 物理；0 = 无多普勒变色；应与 `--v2_doppler_lum` 同步调 | 0.75 |
 | ② 场景·辐射 | `--v2_color_floor` | 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区固定为暗金、只靠亮度变暗，颜色序列为 黑 → 暗金 → 金 → 白。只影响颜色不影响亮度；建议 2500–3000；0 = 不设下限 | 0 |
-| ② 场景·辐射 | `--v2_temp_turb` | 小尺度温度湍流强度 σ_T（0–0.5）：温度乘对数正态起伏 exp(σ_l·n − 2σ_l²·V)（平均热辐射通量 ⟨T⁴⟩ 守恒），n 为主云剪切级联向更小尺度延伸 2 个八度的起伏，比像素小的尺度自动淡出、经过强透镜的光线不加；局部强度 σ_l 随主云浓淡成片变化（σ_T 为全盘均方根），噪声坐标经过扭曲、不呈行列排布。只改温度、不改密度与遮挡，使贴盘面视角的近处云层出现明暗与冷暖细节，远景基本不变；视频贴盘帧耗时约 2.4 倍。0.1 = 温度起伏约 10%。见 [`docs/plans/v2_temperature_turbulence_plan.md`](docs/plans/v2_temperature_turbulence_plan.md) | 0（关闭） |
+| ② 场景·辐射 | `--v2_temp_turb` | 小尺度温度湍流强度 σ_T（0–0.5）：温度乘对数正态起伏 exp(σ_l·n − 2σ_l²·V)（平均热辐射通量 ⟨T⁴⟩ 守恒），n 为主云剪切级联向更小尺度延伸 2 个八度的起伏，比像素小的尺度自动淡出、经过强透镜的光线不加；局部强度 σ_l 随主云浓淡成片变化（σ_T 为全盘均方根），噪声坐标经过扭曲、不呈行列排布。只改温度、不改密度与遮挡，使贴盘面视角的近处云层出现明暗与冷暖细节，远景基本不变（开启 `--v2_temp_turb_coarse` 后另含粗尺度八度，中远景也有起伏）；视频贴盘帧耗时约 2.4 倍。0.1 = 温度起伏约 10%。见 [`docs/plans/v2_temperature_turbulence_plan.md`](docs/plans/v2_temperature_turbulence_plan.md) | 0（关闭） |
+| ② 场景·辐射 | `--v2_temp_turb_coarse` | 温度湍流向粗尺度延伸的八度数 S（0 到主云八度数 4）：温度起伏另取主云最细的 S 个八度的尺度，大片冷暖斑块由更细的八度逐级细分（分形结构），中远景也能看到起伏；共 S + 2 个八度，耗时随之增加（S = 3 时视频约 1.85 倍）。宜配合 `--v2_temp_turb_gain 1`；需 `--v2_temp_turb > 0`。见方案 §9 | 0 |
+| ② 场景·辐射 | `--v2_temp_turb_gain` | 温度湍流逐八度幅度比（(0, 1]）：从最粗的八度起，第 e 个八度幅度乘 gain^e。0.69 ≈ Kolmogorov 标度；1 = 等幅（含粗尺度八度时推荐，否则最细八度过弱、近处细节消失） | 0.69 |
+| 求解精度 | `--v2_temp_turb_clamp_px` | 温度湍流频率钳制阈值 K（像素足迹，> 0）：八度的径向格宽小于 K 个像素时完全淡出、大于 2K 个时完全可见。越小细节越多、越易闪烁 | 3 |
 | ③ 场景·背景 | `--v2_sky_gain` | 天空亮度系数（sRGB 解码为线性光后，曝光之后叠加；不影响盘曝光；0 = 黑天空） | 0.5 |
 | ④ 相机 | `--v2_camera_roll` | 相机滚转角（度），相机绕自身光轴旋转，整个画面（盘与星空）一起倾斜；在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向 | 0 |
 | ④ 相机 | `--v2_camera_path` | 运镜路径文件（JSON）。视频模式下每帧的相机位置、朝向、视野、滚转由路径给出，黑洞落在路径指定的画面位置；曝光改为沿路径测光 + 平滑，首尾淡入淡出；帧数 = round(路径时长 × `--fps`)。此时 `--pov`、`--fov`、`--v2_camera_roll` 不生效，不能与 `--orbit`、`--interactive` 同用。示例路径为 `scenes/v2_arts/interstellar_skim.json`。格式见 [`docs/plans/v2_camera_path_plan.md`](docs/plans/v2_camera_path_plan.md) §5.1 | 不使用 |

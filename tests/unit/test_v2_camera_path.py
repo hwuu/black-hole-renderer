@@ -181,9 +181,9 @@ class TestLoadAndValidate(unittest.TestCase):
         cls.path = load_camera_path(cls.spec)
 
     def test_default_path_keyframe_times(self):
-        """默认路径（120 s 版）各关键帧的经过时刻与 scenes/v2_arts/README.md 的分镜一致（±0.05 s）。"""
-        expected = [0.0, 5.8, 13.0, 21.9, 30.7, 37.4, 44.2, 51.7, 58.1, 63.9, 70.0, 76.6, 83.5, 90.6, 100.7,
-                    109.5, 115.0, 120.0]
+        """默认路径（120 s 版，视野全程 50°）各关键帧的经过时刻与 scenes/v2_arts/README.md 的分镜一致（±0.05 s）。"""
+        expected = [0.0, 5.6, 12.4, 20.9, 29.4, 36.2, 43.2, 51.0, 57.8, 63.9, 70.2, 76.7, 83.3, 90.4, 100.7,
+                    109.7, 115.0, 120.0]
         np.testing.assert_allclose(self.path.keyframe_times(), expected, atol=0.05)
 
     def test_default_path_passes_check(self):
@@ -225,6 +225,7 @@ class TestLoadAndValidate(unittest.TestCase):
         """黑洞目标画面位置可越出画面：边界 −1、2 可加载，构图落在目标位置。"""
         for uv in ([-1.0, 0.5], [2.0, 0.5], [0.5, -1.0], [0.5, 2.0], [-0.3, 0.6]):
             spec = json.loads(json.dumps(self.spec))
+            spec.pop("pans", None)
             for k in spec["keyframes"]:
                 k["subject_uv"] = uv
             st = load_camera_path(spec).state_at(40.0, 16 / 9)
@@ -249,6 +250,98 @@ class TestLoadAndValidate(unittest.TestCase):
         kfs = [Keyframe(0.5, 0.0, 30.0, 40.0, 0.0, (0.5, 0.5)), Keyframe(0.5, 10.0, 31.0, 40.0, 0.0, (0.5, 0.5))]
         with self.assertRaises(ValueError):
             CameraPath(kfs, PathTiming(duration=5.0, ramp_in=1.0, ramp_out=1.0)).check(16 / 9)
+
+
+def _uv_at(path: CameraPath, t: float) -> np.ndarray:
+    """路径在时刻 t 时黑洞（原点）实际投影到的画面位置 (u, v)。"""
+    st = path.state_at(t, 16 / 9)
+    return project_origin(st.pos[None, :], st.forward[None, :], np.array([st.roll]), np.array([st.fov]), 16 / 9)[0]
+
+
+class TestPans(unittest.TestCase):
+    """`pans` 块：在时间上叠加"黑洞画面横坐标平滑移向 u、停留、再平滑移回"的摇镜，不改变节奏与相机位置。"""
+
+    PAN = {"start": 8.0, "end": 18.0, "ramp": 4.0, "u": 0.15}
+
+    def _spec(self, pans=None):
+        spec = {"duration": 30.0, "keyframes": [
+            {"r": 60.0, "phi_deg": -90.0, "z": 6.0, "fov": 40.0, "roll": 12.5, "subject_uv": [0.6, 0.45]},
+            {"r": 30.0, "phi_deg": -60.0, "z": 1.0, "fov": 40.0, "roll": 15.0, "subject_uv": [0.55, 0.5]},
+            {"r": 50.0, "phi_deg": -30.0, "z": 5.0, "fov": 40.0, "roll": 12.5, "subject_uv": [0.4, 0.45]}]}
+        if pans is not None:
+            spec["pans"] = pans
+        return spec
+
+    def test_no_pans_unchanged(self):
+        a, b = load_camera_path(self._spec()), load_camera_path(self._spec([]))
+        for t in np.linspace(0.0, 30.0, 31):
+            np.testing.assert_array_equal(a.state_at(float(t), 16 / 9).forward, b.state_at(float(t), 16 / 9).forward)
+
+    def test_pan_profile(self):
+        """摇镜前后与原路径逐位相同；停留段（12–14 s）黑洞落在 u = 0.15；位置、视野、滚转与节奏不变；u 随时间光滑。"""
+        base, pan = load_camera_path(self._spec()), load_camera_path(self._spec([self.PAN]))
+        np.testing.assert_array_equal(base.keyframe_times(), pan.keyframe_times())
+        for t in (0.0, 5.0, 8.0, 18.0, 22.0, 30.0):
+            np.testing.assert_array_equal(base.state_at(t, 16 / 9).forward, pan.state_at(t, 16 / 9).forward)
+        for t in (12.0, 13.0, 14.0):
+            np.testing.assert_allclose(_uv_at(pan, t)[0], 0.15, atol=1e-6)
+            np.testing.assert_allclose(_uv_at(pan, t)[1], _uv_at(base, t)[1], atol=1e-6)
+        ts = np.arange(0.0, 30.0, 0.05)
+        for t in ts[::20]:
+            sa, sb = base.state_at(float(t), 16 / 9), pan.state_at(float(t), 16 / 9)
+            np.testing.assert_array_equal(sa.pos, sb.pos)
+            self.assertEqual((sa.fov, sa.roll), (sb.fov, sb.roll))
+        u = np.array([pan.state_at(float(t), 16 / 9).subject_uv[0] for t in ts])
+        self.assertLess(np.max(np.abs(np.diff(u, 2))), 1e-3)
+        mid = pan.state_at(10.0, 16 / 9).subject_uv[0]
+        self.assertTrue(0.15 < mid < base.state_at(10.0, 16 / 9).subject_uv[0])
+
+    def test_invalid_pans_raise(self):
+        bad = [{"start": -1.0, "end": 18.0, "ramp": 4.0, "u": 0.15},
+               {"start": 8.0, "end": 10.0, "ramp": 4.0, "u": 0.15},
+               {"start": 8.0, "end": 31.0, "ramp": 4.0, "u": 0.15},
+               {"start": 8.0, "end": 18.0, "ramp": 0.0, "u": 0.15},
+               {"start": 8.0, "end": 18.0, "ramp": 4.0, "u": 2.5},
+               {"start": 8.0, "end": 18.0, "ramp": 4.0},
+               {"start": 8.0, "end": 18.0, "ramp": 4.0, "u": float("nan")}]
+        for p in bad:
+            with self.assertRaises(ValueError):
+                load_camera_path(self._spec([p]))
+        with self.assertRaises(ValueError):
+            load_camera_path(self._spec([self.PAN, {"start": 16.0, "end": 24.0, "ramp": 2.0, "u": 0.8}]))
+        with self.assertRaises(ValueError):
+            load_camera_path(self._spec({"start": 8.0}))
+        load_camera_path(self._spec([{"start": 2.0, "end": 4.0, "ramp": 1.0, "u": 0.8}, self.PAN]))
+
+
+class TestInterstellarSkimScene(unittest.TestCase):
+    """interstellar_skim：视野全程 50°（无变焦）；30 s 起摇镜，黑洞移到画面左侧 u = 0.12，66 s 起摇回。"""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(DEFAULT_PATH) as f:
+            cls.path = load_camera_path(json.load(f))
+
+    def test_fov_constant(self):
+        for t in np.linspace(0.0, self.path.duration, 61):
+            self.assertAlmostEqual(self.path.state_at(float(t), 16 / 9).fov, 50.0, places=9)
+
+    def test_pan_holds_subject_left(self):
+        for t in (38.0, 50.0, 66.0):
+            self.assertAlmostEqual(float(_uv_at(self.path, t)[0]), 0.12, places=6)
+        for t in (29.9, 74.1):
+            self.assertGreater(float(_uv_at(self.path, t)[0]), 0.45)
+
+    def test_photon_ring_stays_in_frame(self):
+        """摇镜期间光子环（视半径 asin(2.6/ρ)，临界冲击参数 3√3/2 ≈ 2.6 r_s）左缘不出画面。"""
+        for t in np.arange(30.0, 74.01, 0.5):
+            st = self.path.state_at(float(t), 16 / 9)
+            r_cam, u_c = camera_basis(st.forward[None, :], np.array([st.roll]))
+            d = -st.pos / np.linalg.norm(st.pos)
+            half_w = np.degrees(np.arctan(np.tan(np.radians(st.fov) / 2) * 16 / 9))
+            bh_x = np.degrees(np.arctan2(d @ r_cam[0], d @ st.forward))
+            ring = np.degrees(np.arcsin(2.6 / np.linalg.norm(st.pos)))
+            self.assertGreater(bh_x - ring + half_w, 0.3, f"t={t:.1f}s 光子环出画")
 
 
 class TestLensingBendScene(unittest.TestCase):
