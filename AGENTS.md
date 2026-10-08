@@ -80,7 +80,7 @@
 
 - 核心光线方程：`d²x/dλ² = -1.5 * L² * x / r⁵`
 - 单帧/视频主入口：`render.py`
-- 设计与背景说明：`docs/design.md`；Disk V2：`docs/design_ad_v2.md`；旧文档：`docs/archived/`
+- 设计与背景说明：`docs/design.md`；Disk V2：`docs/design_ad_v2.md`；旧文档：`docs/archived/`；研发复盘报告（给后人）：`docs/project_report.md`
 - 端到端渲染测试：`tests/e2e_render.py`
 - 方向相关单测：`tests/unit/test_parametric_rotation_direction.py`
 
@@ -338,3 +338,15 @@ scp -i ~/.ssh/id_ed25519_mac -P <端口> root@<主机>:/root/autodl-tmp/out/<文
     - 现象：`while pgrep -f "x.mp4"; do sleep 30; done` 永不退出，渲染在后台长时间占满本机
     - 根因：等待循环所在 shell 的命令行本身包含该字符串，`pgrep -f` 匹配到自己
     - 做法：记录后台进程 PID（`$!`）后用 `kill -0 $PID` 判断；长渲染放远端，本机只跑几秒的短验证
+
+39. **温度查找表读写坐标系不一致**（V2 首周踩到；#31 十三处移植偏差之一，因症状最具迷惑性单独记录）
+    - 现象：盘面暗了约十倍，其余环节数值大体正常
+    - 根因：温度表写入按对数半径插值、读取按线性半径；两种插值在小半径段的差异平缓，从图上几乎看不出错在哪里
+    - 修复：读写统一为同一坐标系
+    - 文件位置：`src/v2/physical_fields.py`（写入）、`src/v2/taichi_impl.py`（读取）
+
+40. **体积采样首步对齐造成方块锯齿**（V2 首周踩到）
+    - 现象：盘面浮现方块状伪影
+    - 根因：所有光线从像素中心出发且首步对齐，采样点在空间里排成整齐格点
+    - 修复：每个像素的首步加随机抖动打散格点；超采样倍率让每像素多条光线取平均，两者互补（与超采样一起构成蒙特卡洛体积积分）
+    - 文件位置：`src/v2/taichi_render.py`（首步抖动）、`src/cli.py`（`--v2_supersample`）
