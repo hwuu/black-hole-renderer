@@ -3,7 +3,7 @@
 模块分层：
 
 - `params.py`：参数对象（`DiskV2Params` 盘几何、`DiskV2VolumeParams` 体积模型）。
-- `physical_fields.py`：Page–Thorne 温度 / T_peak 推导、SS 外区 H(r)、Σ(r)（NumPy 参考）。
+- `physical_fields.py`：Page–Thorne 温度 / T_peak 推导、SS 外区 H(r)、Σ(r)、内边界力矩与坠落区（NumPy 参考）。
 - `relativity.py`：频移 g 的 NumPy 参考与严格 GR 对照。
 - `palette.py`：CIE 黑体色度 / 亮度查找表、von Kries 白平衡。
 - `noise_ti.py` / `advection.py` / `shear_cascade.py`：程序化噪声、刚体环平流与主云剪切级联几何。
@@ -16,7 +16,15 @@
 
 from .palette import blackbody_color, blackbody_luminance, white_balance_gain
 from .params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params, DiskV2VolumeParams
-from .physical_fields import derive_t_peak, page_thorne_flux, ss_half_thickness, ss_surface_density
+from .physical_fields import (
+    derive_t_peak,
+    inner_boundary_factor,
+    page_thorne_flux,
+    plunge_surface_density_ratio,
+    plunge_temperature,
+    ss_half_thickness,
+    ss_surface_density,
+)
 from .relativity import disk_g_factor, exact_equatorial_g_factor, local_photon_direction, orbital_beta_local
 
 __all__ = [
@@ -27,7 +35,10 @@ __all__ = [
     "blackbody_luminance",
     "white_balance_gain",
     "derive_t_peak",
+    "inner_boundary_factor",
     "page_thorne_flux",
+    "plunge_surface_density_ratio",
+    "plunge_temperature",
     "ss_half_thickness",
     "ss_surface_density",
     "disk_g_factor",

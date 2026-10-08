@@ -42,7 +42,8 @@ from .noise_ti import (
     vnoise,
     vnoise_fast,
 )
-from .params import DiskV2Params, DiskV2VolumeParams
+from . import physical_fields
+from .params import SCHWARZSCHILD_ISCO_R_S, DiskV2Params, DiskV2VolumeParams
 from .shear_cascade import shear_cascade_geometry
 from .temperature_turbulence import (
     GNOISE_STD as _TT_GNOISE_STD,
@@ -246,7 +247,16 @@ class DiskV2Taichi:
         self._thick = float(vp.thickness_scale)
         self._hr_ref = float(vp.hr_ref) * self._thick
         self._r_ref_vol = float(vp.r_ref)
-        self._f_ref_ss = 1.0 - math.sqrt(self._r_in / self._r_ref_vol)
+        # 内边界力矩 β 与坠落区（公式见 physical_fields；β = 0 时坠落区代码在编译期移除）。
+        # 采样下界 r_gate：β > 0 时取光子球 1.5 r_s（Δr ≤ 0.3 时该处 Σ/Σ_I ≤ 7.1%），否则为 r_in
+        self._beta = float(vp.isco_stress)
+        if self._beta > 0.0 and self._r_in != SCHWARZSCHILD_ISCO_R_S:
+            # 力矩与坠落区都以 r_in 为 ISCO（Page–Thorne 积分下界、坠落测地线起点）
+            raise ValueError(f"isco_stress > 0 requires r_in = {SCHWARZSCHILD_ISCO_R_S} (ISCO), got {self._r_in}")
+        self._u_pl_k = math.sqrt(1.0 / (3.0 * self._r_in))
+        self._v_i = physical_fields.plunge_isco_velocity(self._r_in, float(vp.plunge_width))
+        self._r_gate = 1.5 if self._beta > 0.0 else self._r_in
+        self._f_ref_ss = float(physical_fields.inner_boundary_factor(self._r_ref_vol, self._r_in, self._beta))
         self._surf_noise = float(vp.surf_noise)
         # 灰大气
         self._grey_mix = float(vp.grey_mix)
@@ -344,8 +354,7 @@ class DiskV2Taichi:
 
         # Page–Thorne 温度 LUT
         self._pt_lut = ti.field(dtype=ti.f32, shape=_BB_LUT_N)
-        from .physical_fields import build_page_thorne_lut
-        build_page_thorne_lut(self._pt_lut, self._r_in, self._r_out, _BB_LUT_N)
+        physical_fields.build_page_thorne_lut(self._pt_lut, self._r_in, self._r_out, _BB_LUT_N, isco_stress=self._beta)
 
         # T_peak（第 1 层：M、Mdot 推出）
         if vp.t_peak_override_K > 0:
@@ -610,17 +619,99 @@ class DiskV2Taichi:
         return c, tn
 
     @ti.func
+    def _inner_boundary_factor(self, r):
+        """薄盘内边界因子 f_β（与 `physical_fields.inner_boundary_factor` 逐值一致）。
+
+        Args:
+            r: 盘局部柱半径（r_s，标量）；r < r_in 时按 r_in 计算。
+
+        Returns:
+            标量，[max(β, 1e-6), 1)：r_in 处为 β（β = 0 时截断到 1e-6），向外趋于 1。
+
+        Formula:
+            `f_β = max(1 − (1 − β)·√(r_in / max(r, r_in)), 1e-6)`（β = 0 时 1 − β = 1，与零力矩逐位一致）
+
+        Physical Meaning:
+            粘滞力矩在内边界的取值：零力矩时 ISCO 处 f → 0，β > 0 时内边界仍有力矩、耗散与柱密度有限。
+
+        Simplifications:
+            牛顿近似（与 SS 外区剖面配套），不含相对论修正。
+        """
+        return ti.max(1.0 - (1.0 - self._beta) * ti.sqrt(self._r_in / ti.max(r, self._r_in)), 1e-6)
+
+    @ti.func
     def _ss_half_thickness(self, r):
-        """SS 外区标高 H = HR_REF·r·(r/r_ref)^{1/8}·(f/f_ref)^{3/20}。"""
-        fr = ti.max(1.0 - ti.sqrt(self._r_in / ti.max(r, self._r_in)), 1e-6)
-        return self._hr_ref * r * ti.pow(r / self._r_ref_vol, 0.125) * ti.pow(fr / self._f_ref_ss, 0.15)
+        """SS 外区标高（与 `physical_fields.ss_half_thickness` 逐值一致）。
+
+        Args:
+            r: 盘局部柱半径（r_s，标量）。
+
+        Returns:
+            标量 H（r_s，> 0）。
+
+        Formula:
+            `H = HR_REF·r̃·(r̃/r_ref)^{1/8}·(f_β(r̃)/f_β(r_ref))^{3/20}`，f_β 见 `_inner_boundary_factor`；
+            β = 0 时 r̃ = r，β > 0 时 r̃ = max(r, r_in)（坠落区标高不变）。
+
+        Physical Meaning:
+            气压主导、Kramers 不透明度的 SS 外区静力平衡标高。
+
+        Simplifications:
+            坠落区标高取 ISCO 处的值（气体来不及重新建立静力平衡）。
+        """
+        rr = r
+        if ti.static(self._beta > 0.0):
+            rr = ti.max(r, self._r_in)  # 坠落区取 ISCO 处的剖面
+        fr = self._inner_boundary_factor(rr)
+        return self._hr_ref * rr * ti.pow(rr / self._r_ref_vol, 0.125) * ti.pow(fr / self._f_ref_ss, 0.15)
 
     @ti.func
     def _ss_surface_density(self, r):
-        """SS 外区柱密度 Σ ∝ (r/r_ref)^{-3/4}·(f/f_ref)^{7/10}·外缘截断。"""
-        fr = ti.max(1.0 - ti.sqrt(self._r_in / ti.max(r, self._r_in)), 1e-6)
-        outer = 1.0 - _ti_smoothstep(0.72 * self._r_out, self._r_out, r)
-        return ti.pow(r / self._r_ref_vol, -0.75) * ti.pow(fr / self._f_ref_ss, 0.7) * outer
+        """SS 外区柱密度，β > 0 时含坠落区（与 `physical_fields.ss_surface_density` 逐值一致）。
+
+        Args:
+            r: 盘局部柱半径（r_s，标量）。
+
+        Returns:
+            标量 Σ（无量纲形状，≥ 0）。
+
+        Formula:
+            `Σ = (r̃/r_ref)^{-3/4}·(f_β/f_β,ref)^{7/10}·outer(r̃)·P(r)`，P 为 `_plunge_ratio`（β = 0 时 r̃ = r、P = 1）。
+
+        Physical Meaning:
+            SS 外区柱密度剖面；零力矩时 ISCO 处趋于 0，有限力矩时 ISCO 处有限，坠落区由质量守恒稀释。
+        """
+        rr = r
+        if ti.static(self._beta > 0.0):
+            rr = ti.max(r, self._r_in)  # 坠落区取 ISCO 处的剖面
+        fr = self._inner_boundary_factor(rr)
+        outer = 1.0 - _ti_smoothstep(0.72 * self._r_out, self._r_out, rr)
+        sig = ti.pow(rr / self._r_ref_vol, -0.75) * ti.pow(fr / self._f_ref_ss, 0.7) * outer
+        if ti.static(self._beta > 0.0):
+            sig *= self._plunge_ratio(r)
+        return sig
+
+    @ti.func
+    def _plunge_ratio(self, r):
+        """坠落区柱密度比 Σ/Σ_I（与 `physical_fields.plunge_surface_density_ratio` 逐值一致）。
+
+        Args:
+            r: 盘局部柱半径（r_s，标量，> 0）。
+
+        Returns:
+            标量，> 0：r ≥ r_in 时为 1，向内下降（值域细节见 NumPy 参考）。
+
+        Formula:
+            `Σ/Σ_I = r_in·v_I / (r·(v_I + u_pl))`，`u_pl = √(1/(3 r_in))·(r_in/r − 1)^{3/2}`
+
+        Physical Meaning:
+            稳态吸积质量守恒：坠落气体沿测地线加速内落、越来越稀。
+        """
+        p = 1.0
+        if r < self._r_in:
+            u = self._u_pl_k * ti.pow(self._r_in / r - 1.0, 1.5)
+            p = self._r_in * self._v_i / (r * (self._v_i + u))
+        return p
 
     @ti.func
     def _erfc_pos(self, x):
@@ -1210,7 +1301,7 @@ class DiskV2Taichi:
             `∈ [0.7, 1.3·grey_cap]`，开启时再乘对数正态因子 f_T，只保证 > 0；`ab_c ≥ 0` 核心吸收（无量纲，渲染核乘 κ）；`ab_a ≥ 0` 大气消光（吸收 + 散射）；
             `em_a = (1 − ω)·ab_a ∈ [0, ab_a]` 大气热发射权重；
             `sc_a = ω·ab_a·(1 − e^{−τ_c}) ∈ [0, ab_a − em_a]` 大气散射权重（渲染核乘 `scatter_j·S_disk`）。
-            盘外或大气顶以上为 `(0, 1, 0, 0, 0, 0)`。
+            盘外或大气顶以上为 `(0, 1, 0, 0, 0, 0)`；盘的内边界是 r_in，内边界力矩 β > 0 时延伸到 1.5 r_s（坠落区）。
 
         Formula:
             ```
@@ -1223,10 +1314,12 @@ class DiskV2Taichi:
             tf     = 1 + grey_mix·(min((¾(τ_z + ⅔))^{1/4}, grey_cap) − 1)，再乘 clamp(1 + dt_i·(ĉ − 1), 0.7, 1.3)
             f_T    = exp(σ_l·n_T − 2σ_l²·V)，tf ← tf·f_T                （温度湍流，`_temp_turb_*`；σ_T = 0 时无此项）
             σ_l    = σ_T·clip(ĉ, 0, 3)^γ / M                           （间歇性；γ = 0 时 σ_l = σ_T）
+            tf     ← tf·(Σ/Σ_I)^{2/3}                                 （坠落区绝热冷却，r < r_in 且 β > 0）
             τ_c    = κ·cfac·Σ                                         （当地核心整柱光学深度）
             J      = scatter_j·S_disk·(1 − e^{−τ_c})                  （渲染核：sc_a·scatter_j·S_disk）
             ```
-            Σ(r) 为 SS 柱密度乘大尺度 lognormal 调制；H 为 SS 标高，H_s 为带表面起伏的标高
+            Σ(r) 为 SS 柱密度（β > 0 时含坠落区稀释，见 `_ss_surface_density`）乘大尺度 lognormal 调制；
+            H 为 SS 标高（坠落区取 H(r_in)），H_s 为带表面起伏的标高
             （H·(1 − surf_noise + surf_noise·softsat(tn))），H_a = atm_height·r；A = atm_frac。
             核心截断于 |z| < 3H_s，大气截断于 |z| < max(3H, atm_extent·H_a)。
 
@@ -1241,7 +1334,9 @@ class DiskV2Taichi:
         Simplifications:
             κ_abs 的 T^{−3.5} 依赖忽略；大气无独立速度场（与核心同刚体环平流）；τ_z 用平行平面近似，
             其大气项不含 m(n)（取局部平均柱）；
-            J 只取正下方核心（半个天空、各向同性，不做方向积分与多次散射），cfac 取采样点处的值。
+            J 只取正下方核心（半个天空、各向同性，不做方向积分与多次散射），cfac 取采样点处的值；
+            坠落区沿用盘内的刚体环平流与圆轨道频移（轨道速度在 ISCO 以内取 ISCO 处的值、引力红移按实际半径），
+            不计径向坠落速度。
         """
         em_c = 0.0
         tf_c = 1.0
@@ -1249,7 +1344,7 @@ class DiskV2Taichi:
         ab_a = 0.0
         em_a = 0.0
         sc_a = 0.0
-        if r > self._r_in and r < self._r_out:
+        if r > self._r_gate and r < self._r_out:
             h_geo = self._ss_half_thickness(r)
             sig = self._ss_surface_density(r)
             # 大尺度低频 lognormal 调制（保均值）
@@ -1318,6 +1413,9 @@ class DiskV2Taichi:
                         sl = self._tt_sig * ti.pow(ti.min(ti.max(cn, 0.0), _TT_CN_MAX), self._tt_gam) / self._tt_intm
                     # 平均通量守恒的对数正态温度起伏：⟨f_T⁴⟩ = 1；tv = 0 时 nt = 0，f_T 精确为 1
                     tf_c *= ti.exp(sl * nt - 2.0 * sl * sl * tv)
+                if ti.static(self._beta > 0.0):
+                    # 坠落区绝热冷却：T ∝ ρ^{2/3}，标高不变 → T/T_I = (Σ/Σ_I)^{2/3}（盘内 Σ/Σ_I = 1）
+                    tf_c *= ti.pow(self._plunge_ratio(r), 2.0 / 3.0)
         return em_c, tf_c, ab_c, ab_a, em_a, sc_a
 
     @ti.func

@@ -104,8 +104,8 @@
   - 成品场景，每个场景一个目录，内含说明（README.md）、渲染命令与运镜路径文件；
     `v2_arts/interstellar_skim.json` 为示例路径（120 s，视野固定 50°，30–74 s 摇向前进方向（`pans` 块），
     分形温度湍流 + 色调"白平衡 10000 K / 胶片响应 1 / +3 档"，命令见其 README）；`close_low/close_low.json` 为贴云顶匀速环绕（60 s，开启温度湍流）；
-    `lensing_bend/lensing_bend.json` 为逼近侧透镜转弯处的长焦特写（30 s，视野 6°、黑洞在画面外、0.2°/s 极慢环绕，
-    白平衡 12000 K 等成像参数见其 README）
+    `lensing_bend/lensing_bend.json` 为逼近侧透镜转弯处的长焦特写（30 s，r = 15 贴盘平视、视野 9°、黑洞在画面外、
+    0.1°/s 极慢环绕；内边界力矩 0.005、温度湍流不按透镜淡出、橙金色调（白平衡 25000 K、饱和度 1.6）等参数见其 README）
 - `scripts/`
   - `contact_sheet.py` 运镜联系表（审构图）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验

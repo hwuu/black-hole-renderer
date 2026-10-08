@@ -6,7 +6,7 @@
 - 盘：`DiskV2Taichi.density_I` 统一气体模型（SS 外区结构 + 刚体环平流剪切级联；高斯核心 + 指数大气，
   大气含热发射与下方盘面的单次散射）。
 - 辐射转移：`I = Σ T·ΔI_disk + T_end·I_sky`，段内精确均匀解 `ΔI = (j/α)(1 − e^{−αΔs})`。
-- 后处理：`postfx`（白平衡 → bloom → 镶边 → 色散 → 保色度 ACES → sRGB）。
+- 后处理：`postfx`（白平衡 → 镜头 PSF → 色散 → ACES（胶片响应）→ 饱和度 → sRGB）。
 
 调用方式（由 `render.py --disk_model v2` 触发）：
 
@@ -88,6 +88,9 @@ class DiskV2Renderer:
         film_response: 胶片响应 m ∈ [0, 1]（ISP 层，传给 `postfx.tonemap_film`）：0（默认）= 保色度 ACES，
             与引入该参数前逐位一致，高光止于浅金；1 = 逐通道 ACES（胶片各层 / 传感器各通道独立饱和），
             同一颜色越亮越淡、最亮处趋白；中间值线性混合。
+        saturation: 饱和度 s ∈ [0, 3]（ISP 层，传给 `postfx.adjust_saturation`，在色调映射之后）：
+            `rgb' = Y + s·(rgb − Y)`（Y 为 BT.709 亮度，结果裁剪到 [0, 1]）。1（默认）= 不变，与引入该参数前逐位一致；
+            > 1 更艳（暖色盘面由浅金变为橙金），< 1 更淡，0 = 灰度。
         sky_gain: 天空亮度系数：天空（sRGB 解码为线性光后）× `sky_gain` 在盘曝光之后叠加，
             不参与自动曝光；0 = 黑色天空。
         ss: 超采样倍率（每像素 `ss²` 条光线；内部以 `ss·W × ss·H` 积分后盒式下采样）。
@@ -118,6 +121,7 @@ class DiskV2Renderer:
         lens_glare: Optional[float] = None,
         exposure_ev: float = 1.5,
         film_response: float = 0.0,
+        saturation: float = 1.0,
         sky_gain: float = 0.5,
         ss: int = 1,
         opt_level: int = 0,
@@ -169,6 +173,9 @@ class DiskV2Renderer:
         if not 0.0 <= film_response <= 1.0:
             raise ValueError("film_response must be in [0, 1]")
         self.film_response = float(film_response)
+        if not 0.0 <= saturation <= 3.0:
+            raise ValueError("saturation must be in [0, 3]")
+        self.saturation = float(saturation)
         self.sky_gain = float(sky_gain)
         self.ss = max(1, int(ss))
         # 内部渲染分辨率：ss×ss 超采样后在 NumPy 侧盒式下采样（与参考实现 render_hdr 一致）
@@ -363,13 +370,14 @@ class DiskV2Renderer:
                     #   核心盘包络 zb = 3H(r_c) + 0.02 内 h → 0.03·s，离开后按距离 0.3·d 放大；
                     #   大气包络 atm_extent·H_a + 0.02 内 h → max(0.3·H_a, 0.03·s)（H_a = atm_height·r_c）；
                     #   s = thickness_scale（盘厚缩放），H 已含 s，H_a 不含。
-                    # 盘相关距离在盘局部坐标下计算（支持倾角）。
+                    # 盘相关距离在盘局部坐标下计算（支持倾角）；径向包络从采样下界 r_gate 起算
+                    # （= r_in；内边界力矩 β > 0 时为坠落区下界 1.5 r_s）。
                     h = ti.min(0.06 * r_cur, 2.0)
                     h = ti.min(h, 0.02 + 0.06 * ti.max(r_cur - 1.0, 0.0))
                     pl = _world_to_local_disk(pos)
                     rc_h = ti.sqrt(pl[0] * pl[0] + pl[1] * pl[1])
                     zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.02
-                    rad_out = ti.max(disk._r_in * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
+                    rad_out = ti.max(disk._r_gate * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
                     d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
                     h = ti.min(h, sc * 0.03 * thick + 0.3 * d_slab)
                     d_atm = ti.max(ti.abs(pl[2]) - (disk._atm_ext * disk._atm_h * rc_h + 0.02), 0.0) + rad_out
@@ -413,7 +421,7 @@ class DiskV2Renderer:
                     pm = 0.5 * (pos + new_pos)
                     _sl = _world_to_local_disk(pm)
                     r_local = ti.sqrt(_sl[0] ** 2 + _sl[1] ** 2)
-                    if r_local > disk._r_in and r_local < disk._r_out:
+                    if r_local > disk._r_gate and r_local < disk._r_out:
                         z_local = _sl[2]
                         z_lim = 3.0 * disk._ss_half_thickness(r_local) + 0.01
                         z_lim = ti.max(z_lim, disk._atm_ext * disk._atm_h * r_local)
@@ -589,7 +597,7 @@ class DiskV2Renderer:
             曝光优先级：参数 `exposure` → `fixed_exposure`（视频首帧锁定）→ 自动曝光
             `0.9 / p99.9(L) · 2^exposure_ev`，L 为盘区亮度（`L > 1e-4`，只看盘；
             EV = 0 即参考实现预设 M 的 p99.9 → 0.9）。合成 `x = exposure·disk + sky_gain·sky`，
-            再经 `postfx`：白平衡 → 镜头 PSF → 色散 → ACES（胶片响应 `film_response`）→ sRGB。
+            再经 `postfx`：白平衡 → 镜头 PSF → 色散 → ACES（胶片响应 `film_response`）→ 饱和度 → sRGB。
         """
         if exposure is not None:
             exposure = float(exposure)
@@ -605,7 +613,8 @@ class DiskV2Renderer:
         if sky is not None:
             x = x + self.sky_gain * sky
         fx = {"bloom_luma_threshold": self.bloom_luma_threshold, "lens_model": self.lens_model,
-              "white_balance_K": self.white_balance_K, "film_response": self.film_response}
+              "white_balance_K": self.white_balance_K, "film_response": self.film_response,
+              "saturation": self.saturation}
         if self.lens_glare is not None:
             fx["lens_glare"] = self.lens_glare
         img = postfx(x, exposure=1.0, **fx)

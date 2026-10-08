@@ -351,7 +351,7 @@ class ExposureCompensationTest(unittest.TestCase):
 
         from src.v2.taichi_render import DiskV2Renderer
         stub = SimpleNamespace(fixed_exposure=fixed, exposure_ev=ev, sky_gain=0.0, bloom_luma_threshold=True,
-                               lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=0.0,
+                               lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=0.0, saturation=1.0,
                                last_white_point=1.0)
         rng = np.random.default_rng(3)
         hdr = rng.uniform(0.01, 1.0, (24, 32, 3)) * rng.uniform(0.0, 2.0, (24, 32, 1))
@@ -378,7 +378,7 @@ class ExposureCompensationTest(unittest.TestCase):
         outs = []
         for m in (0.0, 1.0):
             stub = SimpleNamespace(fixed_exposure=1.0, exposure_ev=0.0, sky_gain=0.0, bloom_luma_threshold=True,
-                                   lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=m,
+                                   lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=m, saturation=1.0,
                                    last_white_point=1.0)
             outs.append(DiskV2Renderer.finish(stub, hdr, None))
         expect0 = postfx(hdr, white_balance_K=4500.0, lens_glare=0.0).astype(np.float32) / 255.0
@@ -386,6 +386,35 @@ class ExposureCompensationTest(unittest.TestCase):
         self.assertFalse(np.array_equal(outs[0], outs[1]))
         expect = postfx(hdr, white_balance_K=4500.0, lens_glare=0.0, film_response=1.0).astype(np.float32) / 255.0
         np.testing.assert_array_equal(outs[1], expect)
+
+    def test_adjust_saturation_properties(self):
+        """s = 1 原样返回；s = 0 为灰度（三通道 = BT.709 亮度）；s > 1 时越界通道裁剪到 [0, 1]。"""
+        from src.v2.postfx import adjust_saturation
+        rgb = np.array([[[0.9, 0.5, 0.1], [0.2, 0.2, 0.2]]])
+        self.assertIs(adjust_saturation(rgb, 1.0), rgb)
+        y = rgb @ np.array([0.2126, 0.7152, 0.0722])
+        np.testing.assert_allclose(adjust_saturation(rgb, 0.0), np.repeat(y[..., None], 3, -1))
+        out = adjust_saturation(rgb, 3.0)
+        self.assertEqual(float(out[0, 0, 0]), 1.0)
+        self.assertEqual(float(out[0, 0, 2]), 0.0)
+        np.testing.assert_allclose(out[0, 1], rgb[0, 1])  # 灰色不受影响
+
+    def test_finish_passes_saturation(self):
+        """`finish` 把渲染器的 saturation 传给 postfx；默认 1 与不传时逐位一致。"""
+        from types import SimpleNamespace
+
+        from src.v2.taichi_render import DiskV2Renderer
+        hdr = np.random.default_rng(6).uniform(0.0, 3.0, (12, 16, 3)) * np.array([1.0, 0.6, 0.3])
+        outs = []
+        for sat in (1.0, 1.6):
+            stub = SimpleNamespace(fixed_exposure=1.0, exposure_ev=0.0, sky_gain=0.0, bloom_luma_threshold=True,
+                                   lens_model="psf", white_balance_K=4500.0, lens_glare=0.0, film_response=0.0,
+                                   saturation=sat, last_white_point=1.0)
+            outs.append(DiskV2Renderer.finish(stub, hdr, None))
+        np.testing.assert_array_equal(outs[0], postfx(hdr, white_balance_K=4500.0, lens_glare=0.0).astype(np.float32) / 255.0)
+        expect = postfx(hdr, white_balance_K=4500.0, lens_glare=0.0, saturation=1.6).astype(np.float32) / 255.0
+        np.testing.assert_array_equal(outs[1], expect)
+        self.assertFalse(np.array_equal(outs[0], outs[1]))
 
 
 if __name__ == "__main__":

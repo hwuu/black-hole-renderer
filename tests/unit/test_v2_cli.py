@@ -90,6 +90,15 @@ class V2VolumeOverridesTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 DiskV2VolumeParams(**cli.v2_volume_overrides(_args(*kv)))
 
+    def test_temp_turb_lens_deg_flag(self):
+        """`--v2_temp_turb_lens_deg` → temp_turb_lens_deg；未传时保持默认 10；360 = 不淡出（上限）。"""
+        from src.v2.params import DiskV2VolumeParams
+        self.assertNotIn("temp_turb_lens_deg", cli.v2_volume_overrides(_args()))
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_temp_turb_lens_deg", "360")))
+        self.assertEqual(vp.temp_turb_lens_deg, 360.0)
+        with self.assertRaises(ValueError):
+            DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_temp_turb_lens_deg", "361")))
+
     def test_exposure_ev_flag(self):
         self.assertIsNone(_args().v2_exposure_ev)
         self.assertEqual(_args("--v2_exposure_ev", "0.5").v2_exposure_ev, 0.5)
@@ -101,6 +110,14 @@ class V2VolumeOverridesTest(unittest.TestCase):
         for bad in ("-0.1", "1.5"):
             with self.assertRaises(ValueError):
                 cli.validate_args(_args("--v2_film_response", bad))
+
+    def test_saturation_flag(self):
+        """`--v2_saturation`：未传为 None（渲染器取默认 1）；不在 [0, 3] 在校验阶段报错。"""
+        self.assertIsNone(_args().v2_saturation)
+        self.assertEqual(_args("--v2_saturation", "1.6").v2_saturation, 1.6)
+        for bad in ("-0.1", "3.5", "nan"):
+            with self.assertRaises(ValueError):
+                cli.validate_args(_args("--v2_saturation", bad))
 
     def test_az_stretch_flag_removed(self):
         """旧主云级联已删除，`--v2_az_stretch` 不再接受。"""

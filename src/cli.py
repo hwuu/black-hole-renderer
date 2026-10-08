@@ -124,6 +124,15 @@ def parse_args() -> argparse.Namespace:
     g_struct.add_argument("--v2_core_floor", type=float, default=None,
                         help="V2 主云密度下限 f（0–1）：盘面密度因子 = f + (1 − f)·c/⟨c⟩。越小稀处越空，"
                              "斜看（如透镜瀑布）时团块之间透出缝；0 = 稀处可完全透空。默认 0.15")
+    g_struct.add_argument("--v2_isco_stress", type=float, default=None, metavar="BETA",
+                        help="V2 内边界力矩系数 β（[0, 1)）：ISCO 处的力矩 = β·吸积率·内缘比角动量（Agol & Krolik 2000）。"
+                             "0 = 零力矩：内缘温度与密度降到 0，贴盘面看去是一道又冷又不透明的暗弧。β > 0 时内缘仍有耗散"
+                             "与气体，并启用 ISCO 以内的坠落区（见 --v2_plunge_width）。β 很小即可主导内缘："
+                             "0.005 → 内缘温度为峰值的 0.80 倍，0.01 → 0.95 倍，0.02 起内缘成为最热处。默认 0")
+    g_struct.add_argument("--v2_plunge_width", type=float, default=None, metavar="DR",
+                        help="V2 坠落区渐隐宽度 Δr（r_s，(0, 0.3]）：ISCO 以内的气体加速坠入黑洞、越落越稀，"
+                             "Δr 为密度降到 ISCO 处约一半的深度。越大坠落气体越多，掠射时在阴影前形成暗烟幕；"
+                             "0.1 时基本看不到。仅 --v2_isco_stress > 0 时生效。默认 0.1")
     g_rad.add_argument("--v2_temp_density_coupling", type=float, default=None,
                         help="V2 密度–温度耦合 β（0–1）：温度 × clamp(1 + β·(c/⟨c⟩ − 1), 0.7, 1.3)，浓处更热。"
                              "盘光学厚时亮度只取决于温度，团块明暗主要靠它；局部耗散 ∝ 柱密度推得物理值 0.25。"
@@ -173,6 +182,10 @@ def parse_args() -> argparse.Namespace:
     g_solver.add_argument("--v2_temp_turb_clamp_px", type=float, default=None, metavar="K",
                         help="V2 温度湍流频率钳制阈值 K（像素足迹，> 0）：八度的径向格宽小于 K 个像素时完全淡出、"
                              "大于 2K 个时完全可见。越小细节越多、越易闪烁；1 与 1.5 的闪烁实测相同 (default: 3)")
+    g_solver.add_argument("--v2_temp_turb_lens_deg", type=float, default=None, metavar="DEG",
+                        help="V2 温度湍流透镜淡出角 δ₀（度，(0, 360]）：光线累计偏折角超过 δ₀/2 后温度湍流逐渐淡出、"
+                             "超过 δ₀ 时完全消失（强透镜下像素足迹估计不可靠）。360 = 不淡出，透镜像（如瀑布）也保留细节，"
+                             "但视频中高速流动的细纹理更易频闪 (default: 10)")
     g_rad.add_argument("--v2_color_floor", type=float, default=0.0,
                         help="V2 颜色温度下限 T_floor（K，≥ 0）：色度温度低于它时取 T_floor（硬截断），冷区不再显示"
                              "为橙红，颜色序列变为 黑 → 暗金 → 金 → 白（暗处只靠亮度变暗）。只影响颜色，不影响亮度。"
@@ -190,6 +203,9 @@ def parse_args() -> argparse.Namespace:
                             "0 = 保色度（只压亮度，最亮处止于浅金、不烧白）；1 = 逐通道（胶片各层 / 传感器各通道"
                             "独立饱和，同一颜色越亮越淡、最亮处趋白，更有发光感；暗部饱和度略升）。"
                             "原理见 docs/imaging_model.md §6 (default: 0)")
+    g_isp.add_argument("--v2_saturation", type=float, default=None,
+                       help="V2 饱和度 s（0–3）：色调映射之后围绕亮度缩放色度，rgb' = Y + s·(rgb − Y)。"
+                            "1 = 不变；> 1 更艳（暖色盘面由浅金变为橙金，1.5 左右为火焰色）；< 1 更淡；0 = 灰度 (default: 1)")
     g_cam.add_argument("--v2_camera_roll", type=float, default=0.0,
                         help="V2 相机滚转角（度）：相机绕自身光轴旋转，整个画面（吸积盘与星空）一起倾斜；"
                              "在画面系中生效，环绕过程中倾角恒定；+12.5 = 画面左低右高，负值反向。"
@@ -238,8 +254,8 @@ def v2_volume_overrides(args) -> dict:
     Args:
         args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_core_contrast`、
             `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`、`--v2_temp_turb`、`--v2_core_floor`、
-            `--v2_temp_density_coupling`、`--v2_temp_turb_coarse`、`--v2_temp_turb_gain`、`--v2_temp_turb_clamp_px`，
-            None = 未传入）。
+            `--v2_temp_density_coupling`、`--v2_temp_turb_coarse`、`--v2_temp_turb_gain`、`--v2_temp_turb_clamp_px`、
+            `--v2_temp_turb_lens_deg`、`--v2_isco_stress`、`--v2_plunge_width`，None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
@@ -249,7 +265,9 @@ def v2_volume_overrides(args) -> dict:
               "atm_height": args.v2_atm_height, "atm_fine_sigma": args.v2_atm_fine,
               "temp_turb_sigma": args.v2_temp_turb, "core_floor": args.v2_core_floor,
               "dt_i": args.v2_temp_density_coupling, "temp_turb_coarse": args.v2_temp_turb_coarse,
-              "temp_turb_gain": args.v2_temp_turb_gain, "temp_turb_clamp_px": args.v2_temp_turb_clamp_px}
+              "temp_turb_gain": args.v2_temp_turb_gain, "temp_turb_clamp_px": args.v2_temp_turb_clamp_px,
+              "temp_turb_lens_deg": args.v2_temp_turb_lens_deg,
+              "isco_stress": args.v2_isco_stress, "plunge_width": args.v2_plunge_width}
     return {k: v for k, v in fields.items() if v is not None}
 
 
@@ -261,7 +279,7 @@ def validate_args(args) -> None:
 
     Raises:
         ValueError: 视野不在 (0, 180)；盘内半径不小于外半径；积分步长 ≤ 0；抗锯齿强度不在 [0.5, 2]；
-            `--v2_film_response` 不在 [0, 1]；帧数或帧率 ≤ 0；轨道角度或内缘周期秒数不是有限值（内缘周期秒数还须 > 0）；
+            `--v2_film_response` 不在 [0, 1]；`--v2_saturation` 不在 [0, 3]；帧数或帧率 ≤ 0；轨道角度或内缘周期秒数不是有限值（内缘周期秒数还须 > 0）；
             `--disk_texture` 用于视频或交互模式；运镜参数组合非法（只支持 V2、不能与 `--orbit` 或
             `--interactive` 同用、单帧模式必须给 `--v2_camera_path_time`、视频模式不能给）。
     """
@@ -286,6 +304,8 @@ def validate_args(args) -> None:
         raise ValueError(f"--v2_orbit_seconds 必须是有限正数，得到 {args.v2_orbit_seconds}")
     if args.v2_film_response is not None and not 0.0 <= args.v2_film_response <= 1.0:
         raise ValueError(f"--v2_film_response 必须在 [0, 1] 之间，得到 {args.v2_film_response}")
+    if args.v2_saturation is not None and not 0.0 <= args.v2_saturation <= 3.0:
+        raise ValueError(f"--v2_saturation 必须在 [0, 3] 之间，得到 {args.v2_saturation}")
     if args.disk_texture and (args.video or args.interactive):
         raise ValueError("--disk_texture 仅支持静态单帧渲染，video/interactive 模式请使用生命周期系统")
 
@@ -370,7 +390,8 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--v2_exposure_ev/--v2_film_response/--device`；
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--v2_exposure_ev/--v2_film_response/
+                --v2_saturation/--device`；
                 两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
             video: 是否为视频模式；决定 `--v2_opt`（单帧 1、视频 2）与 `--v2_supersample`
@@ -412,6 +433,7 @@ def main():
             **({} if args.v2_white_balance is None else {"white_balance_K": args.v2_white_balance}),
             **({} if args.v2_exposure_ev is None else {"exposure_ev": args.v2_exposure_ev}),
             **({} if args.v2_film_response is None else {"film_response": args.v2_film_response}),
+            **({} if args.v2_saturation is None else {"saturation": args.v2_saturation}),
             opt_level=opt,
             device=args.device,
         )

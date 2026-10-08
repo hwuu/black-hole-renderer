@@ -163,14 +163,28 @@ class DiskV2VolumeParams:
             含粗尺度八度时宜取 1（等幅），否则最细八度过弱、近处盘面细节消失。
         temp_turb_clamp_px: 频率钳制阈值 K（> 0）：八度的径向格宽小于 K 个像素足迹时完全淡出，
             大于 2K 个时完全可见。越小细节越多、越易出现锯齿。默认 3。
-        temp_turb_lens_deg: 透镜淡出角 δ₀（度，(0, 90]）：光线累计偏折角 δ ≤ δ₀/2 时延伸八度完全可见，
-            δ ≥ δ₀ 时完全淡出（强透镜下像素足迹的直线近似失效）。默认 10。
+        temp_turb_lens_deg: 透镜淡出角 δ₀（度，(0, 360]）：光线累计偏折角 δ ≤ δ₀/2 时温度湍流完全可见，
+            δ ≥ δ₀ 时完全淡出（强透镜下像素足迹的直线近似失效）。偏折角不超过 180°，故 360 = 不淡出。
+            默认 10。实测强透镜处真实足迹中位数只比直线近似大 13–35%（见 docs/plans/v2_temperature_turbulence_plan.md
+            §10），所以调大后透镜像（如掠射时的"瀑布"）也能保留细节，代价是视频中高速流动的细纹理更易频闪。
         temp_turb_intermittency: 温度湍流的间歇性指数 γ（[0, 3]）：局部强度 σ_l = σ_T·m(ĉ)，
             `m = clip(ĉ, 0, 3)^γ / M`（ĉ 为归一化主云密度，M 使全盘 ⟨m²⟩ = 1）。主云浓处起伏强、稀处接近平静，
             起伏成片出现，避免处处同强的"均匀贴图"感。0 = 处处同强。默认 1.5。
         temp_turb_warp: 温度湍流的坐标扭曲幅度 A（格，[0, 1)）：每个延伸八度的噪声坐标按半频梯度噪声偏移约 A 格，
             打散值噪声格子的行列排布。越大越不规则，但 ≥ 0.8 时特征被压缩到一格以下、出现颗粒感。
             0 = 不扭曲。默认 0.35（视频档贴盘帧耗时约增加 40%）。
+        isco_stress: 内边界力矩系数 β（[0, 1)，无量纲）：ISCO 处的力矩 `W_in = β·Ṁ·L_in`（Agol & Krolik 2000）。
+            盘的内边界因子由零力矩的 `f = 1 − √(r_in/r)` 改为 `f_β = 1 − (1 − β)·√(r_in/r)`，SS 标高 / 柱密度
+            随之改用 f_β；Page–Thorne 通量积分加常数 `β·(E − ΩL)_in·L_in`（内缘额外加热，温度表仍按 β = 0 的
+            峰值归一）。β > 0 时 ISCO 处密度与温度不再为 0，并启用坠落区（见 `plunge_width`）。
+            ISCO 附近的角动量曲线很平，β 很小即可主导内缘：0.005 → 内缘温度 0.80·T_峰，0.01 → 0.95·T_峰，
+            0.02 起内缘成为最热处。0 = 零力矩（输出与引入该参数前逐位一致）。默认 0。
+            β > 0 要求盘内半径 r_in 等于 ISCO（3 r_s），否则构造渲染器时报错。
+            见 docs/design_ad_v2.md §3.2「内边界与坠落区」。
+        plunge_width: 坠落区渐隐宽度 Δr（r_s，(0, 0.3]）：ISCO 以内气体沿 Schwarzschild 坠落测地线加速内落，
+            由质量守恒 `Σ ∝ 1/(r·v_r)` 稀释；Δr 为柱密度降到 ISCO 值约一半处的深度，反推 ISCO 处径向速度
+            `v_I = √(1/(3 r_in))·(r_in/(r_in − Δr) − 1)^{3/2}`（0.1 → 0.002 c，0.3 → 0.012 c）。
+            越大坠落气体越多，掠射时在阴影前形成可见的暗烟幕。仅 `isco_stress > 0` 时生效。默认 0.1。
         dln_r / k_rigid: 刚体环带宽与种子寿命（主云 + 厚度扰动共用）。
         light_delay: 1 = 采样时间 = t - 光程（光行时间）。
         static_cam: 1 = 相机为静止观者本地标架。
@@ -234,6 +248,8 @@ class DiskV2VolumeParams:
     temp_turb_lens_deg: float = 10.0
     temp_turb_intermittency: float = 1.5
     temp_turb_warp: float = 0.35
+    isco_stress: float = 0.0
+    plunge_width: float = 0.1
     dln_r: float = 0.1989  # ln(1.22)
     k_rigid: float = 4.0
     light_delay: bool = True
@@ -302,9 +318,13 @@ class DiskV2VolumeParams:
             raise ValueError("temp_turb_gain must be in (0, 1]")
         if self.temp_turb_clamp_px <= 0.0:
             raise ValueError("temp_turb_clamp_px must be positive")
-        if not 0.0 < self.temp_turb_lens_deg <= 90.0:
-            raise ValueError("temp_turb_lens_deg must be in (0, 90]")
+        if not 0.0 < self.temp_turb_lens_deg <= 360.0:
+            raise ValueError("temp_turb_lens_deg must be in (0, 360]")
         if not 0.0 <= self.temp_turb_intermittency <= 3.0:
             raise ValueError("temp_turb_intermittency must be in [0, 3]")
         if not 0.0 <= self.temp_turb_warp < 1.0:
             raise ValueError("temp_turb_warp must be in [0, 1)")
+        if not 0.0 <= self.isco_stress < 1.0:
+            raise ValueError("isco_stress must be in [0, 1)")
+        if not 0.0 < self.plunge_width <= 0.3:
+            raise ValueError("plunge_width must be in (0, 0.3]")

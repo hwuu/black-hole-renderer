@@ -356,22 +356,22 @@ class TestLensingBendScene(unittest.TestCase):
         self.path.check(16 / 9)
 
     def test_subject_fixed_off_frame(self):
-        """每个时刻黑洞都投影到画面外的 (−0.3, 0.6)，视野 6°、滚转 0°、半径与高度不变。"""
+        """每个时刻黑洞都投影到画面外的 (−0.571, 0.650)，视野 9°、滚转 −2°、半径 15、高度 0.4 不变。"""
         for t in np.linspace(0.0, self.path.duration, 13):
             st = self.path.state_at(float(t), 16 / 9)
             uv = project_origin(st.pos[None, :], st.forward[None, :], np.array([st.roll]), np.array([st.fov]),
                                 16 / 9)[0]
-            np.testing.assert_allclose(uv, [-0.3, 0.6], atol=1e-6)
-            self.assertAlmostEqual(st.fov, 6.0, places=9)
-            self.assertAlmostEqual(st.roll, 0.0, places=9)
-            self.assertAlmostEqual(float(np.hypot(st.pos[0], st.pos[1])), 39.9, places=9)
-            self.assertAlmostEqual(float(st.pos[2]), 2.8, places=9)
+            np.testing.assert_allclose(uv, [-0.571, 0.650], atol=1e-6)
+            self.assertAlmostEqual(st.fov, 9.0, places=9)
+            self.assertAlmostEqual(st.roll, -2.0, places=9)
+            self.assertAlmostEqual(float(np.hypot(st.pos[0], st.pos[1])), 15.0, places=9)
+            self.assertAlmostEqual(float(st.pos[2]), 0.4, places=9)
 
     def test_uniform_slow_retrograde_orbit(self):
-        """方位角 30 s 内从 −93° 匀速转到 −87°（0.2°/s）；盘反转（disk_spin = −1）时为逆行。"""
+        """方位角 30 s 内从 −91.5° 匀速转到 −88.5°（0.1°/s）；盘反转（disk_spin = −1）时为逆行。"""
         ts = np.linspace(0.0, self.path.duration, 61)
         phi = np.array([np.degrees(np.arctan2(*self.path.state_at(float(t), 16 / 9).pos[1::-1])) for t in ts])
-        np.testing.assert_allclose(phi, -93.0 + 0.2 * ts, atol=1e-6)
+        np.testing.assert_allclose(phi, -91.5 + 0.1 * ts, atol=1e-6)
         lines = self.path.report(time_scale=time_scale(3.0, 8.0), r_in=3.0, r_out=30.0, disk_spin=-1.0)
         self.assertTrue(all("逆行" in ln for ln in lines if ln.startswith("  t=")))
 

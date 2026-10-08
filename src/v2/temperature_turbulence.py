@@ -222,7 +222,9 @@ def temp_turb_lens_weight(delta_rad, lens_rad: float):
         `L = 1 − sstep((δ − δ₀/2) / (δ₀/2))`
 
     Physical Meaning:
-        强透镜把一个像素映射到气体中大得多的面积，真实足迹远大于 λθ；淡出细八度避免锯齿与亮斑。
+        强透镜把一个像素映射到气体中更大的面积，真实足迹大于 λθ；淡出细八度避免锯齿与亮斑。
+        实测强透镜处真实足迹中位数只比 λθ 大 13–35%（docs/plans/v2_temperature_turbulence_plan.md §10），
+        所以 δ₀ 可放宽到 360°（累计偏折角不超过 180°，即不淡出）。
 
     Simplifications:
         用累计偏折角代替完整的光线映射（工程近似，阈值为经验值）。

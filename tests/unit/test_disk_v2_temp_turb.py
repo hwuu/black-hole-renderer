@@ -154,6 +154,12 @@ class WeightTest(unittest.TestCase):
         d = np.linspace(0.0, 2.0 * d0, 300)
         self.assertTrue(np.all(np.diff(temp_turb_lens_weight(d, d0)) <= 0.0))
 
+    def test_lens_weight_360_never_fades(self):
+        """δ₀ = 360° 时，合法的累计偏折角 [0, 180°] 权重恒为 1（不淡出）。"""
+        d0 = math.radians(360.0)
+        d = np.radians(np.array([0.0, 10.0, 90.0, 180.0]))
+        np.testing.assert_array_equal(temp_turb_lens_weight(d, d0), np.ones(4))
+
     def test_smoothstep(self):
         np.testing.assert_allclose(smoothstep01(np.array([-1.0, 0.0, 0.5, 1.0, 2.0])), [0.0, 0.0, 0.5, 1.0, 1.0])
 
@@ -240,7 +246,7 @@ class ParamsValidationTest(unittest.TestCase):
     def test_invalid(self):
         for kw in ({"temp_turb_sigma": -0.01}, {"temp_turb_sigma": 0.51}, {"temp_turb_octaves": 0},
                    {"temp_turb_octaves": 3}, {"temp_turb_gain": 0.0}, {"temp_turb_gain": 1.01},
-                   {"temp_turb_clamp_px": 0.0}, {"temp_turb_lens_deg": 0.0}, {"temp_turb_lens_deg": 91.0},
+                   {"temp_turb_clamp_px": 0.0}, {"temp_turb_lens_deg": 0.0}, {"temp_turb_lens_deg": 360.1},
                    {"temp_turb_intermittency": -0.1}, {"temp_turb_intermittency": 3.1},
                    {"temp_turb_warp": -0.1}, {"temp_turb_warp": 1.0}):
             with self.assertRaises(ValueError, msg=str(kw)):
