@@ -31,7 +31,7 @@ python render.py --disk_model v2 --video \
     --v2_camera_path scenes/close_low/close_low.json \
     --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 --v2_temp_turb 0.1 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r fhd --fps 60 --device gpu -o output/close_low/close_low_1080p60.mp4
+    -r fhd --fps 60 --device gpu -o output/scenes/close_low/close_low_1080p60.mp4
 
 # 中断后续传：同一条命令末尾加 --resume（每 240 帧一个分段，最多重渲 1 段）
 
@@ -40,14 +40,14 @@ python render.py --disk_model v2 --video \
     --v2_camera_path scenes/close_low/close_low.json \
     --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 --v2_temp_turb 0.1 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r sd --fps 15 --device gpu -o output/close_low/close_low_360p15.mp4
+    -r sd --fps 15 --device gpu -o output/scenes/close_low/close_low_360p15.mp4
 
 # 单帧：检查某一时刻的构图（例如 30 s）
 python render.py --disk_model v2 \
     --v2_camera_path scenes/close_low/close_low.json --v2_camera_path_time 30 \
     --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 --v2_temp_turb 0.1 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r fhd --device gpu -o output/close_low/close_low_t30.png
+    -r fhd --device gpu -o output/scenes/close_low/close_low_t30.png
 ```
 
 - `--ar1 3 --ar2 30` 必须显式给出（`--ar1` / `--ar2` 的默认值属于 V1）。

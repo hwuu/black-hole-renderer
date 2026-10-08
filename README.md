@@ -73,7 +73,7 @@ python render.py --disk_model v2 --v2_camera_path scenes/v2_arts/interstellar_sk
                  --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
                  -r sd --device gpu -o output/v2_path_t64.png
 python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation --v2_orbit_seconds 8 \
-                 -o output/v2_arts/contact_sheet.png   # 联系表只用于检查构图，不含温度湍流
+                 -o output/scenes/interstellar_skim/contact_sheet.png   # 联系表只用于检查构图，不含温度湍流
 ```
 
 ### 视频生成

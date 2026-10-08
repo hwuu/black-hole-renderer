@@ -13,7 +13,7 @@
 
 > **状态**：已实施（2026-06-14）。Step 0~5 完成；最终人工验收以用户参考图为准。
 >
-> **触发原因**：Phase 1~7 代码链路已通，但 V2 单帧视觉三轮迭代均失败——全白（save_image bug）、鬣狗斑（团块进发射）、斑马纹（纯傅里叶 F_shear）。用户已明确：最终验收标准是外部参考图，而不是仓库内 V1 输出。V1 经典参数（`output/v1_classic_darksky.png`）只作为技术对照。
+> **触发原因**：Phase 1~7 代码链路已通，但 V2 单帧视觉三轮迭代均失败——全白（save_image bug）、鬣狗斑（团块进发射）、斑马纹（纯傅里叶 F_shear）。用户已明确：最终验收标准是外部参考图，而不是仓库内 V1 输出。V1 经典参数（`output/v2_dev/2026-10-01_v2.3_S0-S9验收/v1_classic_darksky.png`）只作为技术对照。
 >
 > **真源关系**：盘体架构仍以 [`docs/design_ad_v2.md`](../design_ad_v2.md) 为准；本方案只修正 **结构纹理层职责划分** 与 **视觉验收口径**，不推翻几何 / 物理场 / palette / 体积积分 / g-factor 已有实现。
 >
@@ -37,7 +37,7 @@
 
 `/Users/hwuu/.cursor/projects/Users-hwuu-dev-github-hwuu-black-hole-renderer/assets/__2026-06-14_13.24.27-e87096b9-f8b3-41e9-8d81-9ceb9b51d0fb.png`
 
-**仓库内技术对照**：`output/v1_classic_darksky.png`
+**仓库内技术对照**：`output/v2_dev/2026-10-01_v2.3_S0-S9验收/v1_classic_darksky.png`
 
 说明：V1 classic 只用于确认构图、透镜环与基础色带没有跑偏；最终人工验收以用户参考图为准。
 

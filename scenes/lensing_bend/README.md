@@ -40,7 +40,7 @@ python render.py --disk_model v2 --video \
     --v2_lens_glare 0.25 --v2_exposure_ev 2 \
     --v2_white_balance 25000 --v2_film_response 0.3 --v2_saturation 1.6 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r fhd --fps 60 --device gpu -o output/lensing_bend/lensing_bend_1080p60.mp4
+    -r fhd --fps 60 --device gpu -o output/scenes/lensing_bend/lensing_bend_1080p60.mp4
 
 # 中断后续传：同一条命令末尾加 --resume（每 240 帧一个分段，最多重渲 1 段）
 
@@ -55,7 +55,7 @@ python render.py --disk_model v2 \
     --v2_lens_glare 0.25 --v2_exposure_ev 2 \
     --v2_white_balance 25000 --v2_film_response 0.3 --v2_saturation 1.6 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r fhd --device gpu -o output/lensing_bend/lensing_bend_t15.png
+    -r fhd --device gpu -o output/scenes/lensing_bend/lensing_bend_t15.png
 ```
 
 - `--ar1 3 --ar2 30` 必须显式给出（`--ar1` / `--ar2` 的默认值属于 V1）；`--v2_isco_stress > 0` 要求 `--ar1 3`（内缘 = ISCO）。

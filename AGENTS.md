@@ -207,7 +207,7 @@ python render.py --disk_model v2 --video --pov 0 -39.7 4.87 --fov 38 \
 # V2 运镜视频（帧数 = round(路径时长 × fps)；先测光约 2 分钟）与联系表
 python render.py --disk_model v2 --video --v2_camera_path scenes/v2_arts/interstellar_skim.json \
                  --ar1 3 --ar2 30 --v2_reverse_rotation -r fhd --fps 60 --device gpu -o output/v2_path.mp4
-python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
+python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation -o output/scenes/interstellar_skim/contact_sheet.png
 
 # V2 单测全部
 python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')

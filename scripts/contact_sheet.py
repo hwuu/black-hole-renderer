@@ -6,7 +6,7 @@
 用法::
 
     python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json \\
-        --texture sky.jpg --v2_reverse_rotation -o output/v2_arts/contact_sheet.png
+        --texture sky.jpg --v2_reverse_rotation -o output/scenes/interstellar_skim/contact_sheet.png
 """
 
 from __future__ import annotations
@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size", type=int, nargs=2, default=[640, 360], metavar=("W", "H"), help="每格分辨率 (default: 640 360)")
     p.add_argument("--v2_opt", type=int, default=3, choices=[0, 1, 2, 3], help="优化级别 (default: 3)")
     p.add_argument("--columns", type=int, default=4, help="每行格数 (default: 4)")
-    p.add_argument("--output", "-o", default="output/v2_arts/contact_sheet.png", help="输出图片路径")
+    p.add_argument("--output", "-o", default="output/scenes/interstellar_skim/contact_sheet.png", help="输出图片路径")
     return p.parse_args()
 
 

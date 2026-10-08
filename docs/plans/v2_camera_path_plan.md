@@ -311,7 +311,7 @@ c 由 ∫₀ᵀ v dt = S_total 解出；S(t) = ∫₀ᵗ v dt；p(t) 满足 S(p(
 | C1 | 相机 `forward` 与逐帧滚转 | 不传时与 HEAD 逐位一致（360p 渲染，HDR、天空、LDR 三路全部相同） |
 | C2 | 空间路径、构图求解、节奏、报告与检查 | 单测通过；示例路径各关键帧经过时刻与确认过的 240p 预览相差 < 1e-4 s |
 | C3 | 测光 + 平滑曝光、逐帧曝光、淡入淡出、续传保存 E₀ | 单测通过；无路径时的视频管线未改动 |
-| C4 | CLI 接入、联系表 | CLI 单测通过；联系表 `output/v2_arts/contact_sheet_c4.png` |
+| C4 | CLI 接入、联系表 | CLI 单测通过；联系表 `output/scenes/interstellar_skim/02_运镜路径开发_20261004/contact_sheet_c4.png` |
 | C5 | 用 CLI 出 360p / 15 fps 全程预览并与确认过的 240p 预览对比 | 曝光曲线逐点相同；同一时刻、同一抖动种子的 HDR 平均相对差约 2e-4（相机位置最多相差约 1.5e-4 r_s，来自样条与线性插值的差别），首末帧逐位相同 |
 | C6 | 文档同步 | — |
 | C7 | 1080p / 60 fps 正片（优化级别 2） | 87.5 s 版 5250 帧已在 M 系列 GPU 上渲染（8.7 h）；120 s 版 7200 帧待用户指令，在 RTX 4090 上渲染 |
@@ -356,7 +356,7 @@ c 由 ∫₀ᵀ v dt = S_total 解出；S(t) = ∫₀ᵗ v dt；p(t) 满足 S(p(
 | 俯冲穿越（关键帧 5 → 9） | 38.6 → 58.7 s，20.1 s |
 | 平视盘缘（关键帧 11） | 72.9 s，匀速经过 |
 | 360p / 15 fps 预览（CLI） | 1312 帧 1271 s（约 0.97 s/帧），另加测光约 1.5 分钟 |
-| 预览与联系表 | `output/v2_arts/preview_c5_360p15.mp4`、`preview_c5_frames.png`、`contact_sheet_c4.png` |
+| 预览与联系表 | `output/scenes/interstellar_skim/02_运镜路径开发_20261004/preview_c5_360p15.mp4`、`dev_camera_path/preview_c5_frames.png`、`dev_camera_path/contact_sheet_c4.png` |
 
 ## 变更记录
 

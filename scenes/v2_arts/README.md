@@ -52,7 +52,7 @@ python render.py --disk_model v2 --video \
     --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 --v2_temp_turb_clamp_px 1 \
     --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r fhd --fps 60 --device gpu -o output/v2_arts/interstellar_skim_1080p60.mp4
+    -r fhd --fps 60 --device gpu -o output/scenes/interstellar_skim/interstellar_skim_1080p60.mp4
 
 # 中断后续传：同一条命令末尾加 --resume（每 240 帧一个分段，最多重渲 1 段）
 
@@ -63,7 +63,7 @@ python render.py --disk_model v2 --video \
     --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 --v2_temp_turb_clamp_px 1 \
     --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r sd --fps 15 --device gpu -o output/v2_arts/interstellar_skim_360p15.mp4
+    -r sd --fps 15 --device gpu -o output/scenes/interstellar_skim/interstellar_skim_360p15.mp4
 
 # 单帧：检查某一时刻的构图（例如 50 s 摇镜停留段）
 python render.py --disk_model v2 \
@@ -72,11 +72,11 @@ python render.py --disk_model v2 \
     --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 --v2_temp_turb_clamp_px 1 \
     --v2_white_balance 10000 --v2_film_response 1 --v2_exposure_ev 3 \
     -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg \
-    -r sd --device gpu -o output/v2_arts/interstellar_skim_t50.png
+    -r sd --device gpu -o output/scenes/interstellar_skim/interstellar_skim_t50.png
 
 # 联系表：每个关键帧的经过时刻各一格，画三分线与黑洞目标位置
 python scripts/contact_sheet.py scenes/v2_arts/interstellar_skim.json --v2_reverse_rotation --v2_orbit_seconds 8 \
-    -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg -o output/v2_arts/interstellar_skim_contact_sheet.png
+    -t /Users/hwuu/TychoSkymapII.t5_8192x4096.jpg -o output/scenes/interstellar_skim/interstellar_skim_contact_sheet.png
 ```
 
 - `--ar1 3 --ar2 30` 必须显式给出（`--ar1` / `--ar2` 的默认值属于 V1）。
