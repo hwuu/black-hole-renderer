@@ -16,21 +16,21 @@
   },
   "keyframes": [
     {
-      "r": 15.0,
+      "r": 30.0,
       "phi_deg": -91.5,
       "z": 0.4,
-      "fov": 9.0,
-      "roll": -2.0,
-      "subject_uv": [-0.571, 0.650],
+      "fov": 5.0,
+      "roll": -0.5,
+      "subject_uv": [-0.46, 0.75],
       "label": "start"
     },
     {
-      "r": 15.0,
+      "r": 30.0,
       "phi_deg": -88.5,
       "z": 0.4,
-      "fov": 9.0,
-      "roll": -2.0,
-      "subject_uv": [-0.571, 0.650],
+      "fov": 5.0,
+      "roll": -0.5,
+      "subject_uv": [-0.46, 0.75],
       "label": "end"
     }
   ]
