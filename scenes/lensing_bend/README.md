@@ -1,6 +1,6 @@
 # 场景：透镜转弯处特写（lensing_bend）
 
-一段 30 s 的长焦特写：相机在 30 r_s 外长焦平视盘面（仰角约 0.8°，等效约 275 mm），镜头偏向黑洞右侧，拍逼近侧的透镜转弯处——
+一段 30 s 的长焦特写：相机在 30 r_s 外长焦俯瞰盘面（仰角约 2.7°，等效约 275 mm），镜头偏向黑洞右侧，拍逼近侧的透镜转弯处——
 经引力透镜翻到黑洞上方的远端盘像瀑布一样从画面顶部落下，在转弯处汇入近侧盘面，再向右流出。
 黑洞本身在画面左侧之外，只露出光子环的一条细线。相机以 0.1°/s 极慢地逆着盘的旋转方向环绕，画面里的
 运动几乎全部来自盘自身的转动。吸积盘为 V2 统一气体模型：开启分形温度湍流（瀑布中也保留，不按透镜淡出），
@@ -15,10 +15,10 @@
 
 | 项目 | 取值 |
 |------|------|
-| 相机位置 | r = 30、z = 0.4（r_s），仰角约 0.76°；方位角从 −91.5° 匀速转到 −88.5° |
+| 相机位置 | r = 30、z = 1.4（r_s），仰角约 2.67°；方位角从 −91.5° 匀速转到 −88.5° |
 | 相机速度 | 0.1°/s（0.05 r_s/s），全程不变；逆着盘的旋转方向（相对气体约 4°/s） |
-| 视野与姿态 | 竖直视野 5°（折合 35mm 全画幅约 275 mm），滚转 −0.5° |
-| 黑洞位置 | 画面 (−0.46, 0.75)：横向在画面左边缘之外 0.46 个画面宽，纵向在中线以下 0.25 个画面高（镜头略上仰，多拍瀑布） |
+| 视野与姿态 | 竖直视野 5°（折合 35mm 全画幅约 275 mm），滚转 −1.5° |
+| 黑洞位置 | 画面 (−0.52, 0.75)：横向在画面左边缘之外 0.52 个画面宽，纵向在中线以下 0.25 个画面高（镜头略上仰，多拍瀑布） |
 | 淡入淡出 | 开头 2 s 淡入，结尾 3 s 淡出 |
 | 曝光 | 渲染前沿路径测光、平滑，叠加曝光补偿 +2 档（测光后全程 +1.7 … +2.3 档） |
 
@@ -34,6 +34,7 @@ python render.py --disk_model v2 --video \
     --v2_camera_path scenes/lensing_bend/lensing_bend.json \
     --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
     --v2_core_contrast 2.0 --v2_core_floor 0 --v2_isco_stress 0.005 --v2_plunge_width 0.1 \
+    --v2_atm_frac 0.04 --v2_grey_mix 1 \
     --v2_temp_density_coupling 0.25 --v2_lum_temp_scale 1.0 \
     --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 \
     --v2_temp_turb_clamp_px 1.5 --v2_temp_turb_lens_deg 360 \
@@ -49,6 +50,7 @@ python render.py --disk_model v2 \
     --v2_camera_path scenes/lensing_bend/lensing_bend.json --v2_camera_path_time 15 \
     --ar1 3 --ar2 30 --v2_reverse_rotation --v2_orbit_seconds 8 \
     --v2_core_contrast 2.0 --v2_core_floor 0 --v2_isco_stress 0.005 --v2_plunge_width 0.1 \
+    --v2_atm_frac 0.04 --v2_grey_mix 1 \
     --v2_temp_density_coupling 0.25 --v2_lum_temp_scale 1.0 \
     --v2_temp_turb 0.134 --v2_temp_turb_coarse 3 --v2_temp_turb_gain 1 \
     --v2_temp_turb_clamp_px 1.5 --v2_temp_turb_lens_deg 360 \
@@ -73,7 +75,9 @@ python render.py --disk_model v2 \
 | 场景·结构 | `--v2_core_contrast` | 2.0（0.8） | 主云明暗起伏加强，瀑布与近处盘面的团块更分明 |
 | 场景·结构 | `--v2_core_floor` | 0（0.15） | 稀处可完全透空，斜看的瀑布里团块之间透出缝 |
 | 场景·结构 | `--v2_isco_stress` / `--v2_plunge_width` | 0.005 / 0.1（0 / 0.1） | 零力矩时内缘又冷又不透明，掠射时在光子环前形成一道暗弧；β = 0.005 使内缘温度回到峰值的 0.8 倍，坠落气体在阴影前几乎看不到。原理见 [`docs/design_ad_v2.md`](../../docs/design_ad_v2.md) §3.2「内边界与坠落区」 |
+| 场景·结构 | `--v2_atm_frac` | 0.04（0.15） | 大气减薄：默认大气贴盘看时是一层与盘面差不多亮的雾，均匀地盖在团块上、压平明暗；减到 0.04 后雾基本散开，瀑布团块间的缝更黑更利。实测对数亮度局部对比（15 / 41 px 高通）0.342 / 0.631 → 0.412 / 0.764。代价：近处盘面露出横向剪切条纹（贴盘视角把盘面核心结构拉长）。物理说明见 [`docs/imaging_model.md`](../../docs/imaging_model.md) §2.3 |
 | 场景·辐射 | `--v2_temp_density_coupling` | 0.25（0.05） | 取物理值：盘光学厚时亮度只取决于温度，团块明暗主要靠浓处更热 |
+| 场景·辐射 | `--v2_grey_mix` | 1（0.5） | 取物理值（完整 Eddington 灰大气）：上层气体更冷，残余的雾贴边看时更暗更红，不再与盘面一样亮 |
 | 场景·辐射 | `--v2_lum_temp_scale` | 1.0（1.25） | 取物理值：特写里外盘不在画面中，不需要提亮外盘 |
 | 场景·辐射 | `--v2_temp_turb` 等 | 0.134 / 粗尺度 3 / 等幅（关闭） | 分形温度湍流，与 interstellar_skim 相同的配置，近处盘面出现大小层次的冷暖云纹 |
 | 求解精度 | `--v2_temp_turb_clamp_px` | 1.5（3） | 细节更多（interstellar_skim 实测 1 与 1.5 的闪烁相同） |
@@ -91,7 +95,7 @@ python render.py --disk_model v2 \
   只有 0.8%），快门方向的频率钳制也只能降到 7.7%。接受不了时把 `--v2_temp_turb_lens_deg` 改回 10，瀑布会变平滑。
   实测见 [`docs/plans/v2_temperature_turbulence_plan.md`](../../docs/plans/v2_temperature_turbulence_plan.md) §10。
 - **温度湍流只在高分辨率下可见**：它的尺度比主云更细，格宽小于 K 个像素足迹时按频率钳制淡出；4K 下细节更多。
-- **黑洞在画面外**：`subject_uv` 横向为 −0.46，越出 [0, 1]（路径文件允许 [−1, 2]）；联系表脚本的黑洞标记会画在画面之外。
+- **黑洞在画面外**：`subject_uv` 横向为 −0.52，越出 [0, 1]（路径文件允许 [−1, 2]）；联系表脚本的黑洞标记会画在画面之外。
 - **静止观者近似**：每一帧按位于该处的静止观者成像，不计相机速度带来的光行差与频移；相机速度不到 0.001 c。
 - **耗时**：本机（M5）1080p 视频档实测约 101 s/帧（r30 / fov5 构图，温度湍流不按透镜淡出，盘区都要算），1800 帧
   约 50 h，只适合渲几秒的验证片段；远端 4090 未实测，按其余场景约 1/7 的耗时比估计约 14 s/帧、全片约 7 h。
