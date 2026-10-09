@@ -69,6 +69,17 @@ class V2VolumeOverridesTest(unittest.TestCase):
             _args("--v2_atm_frac", "0.3", "--v2_atm_height", "0.02", "--v2_atm_fine", "0.7")))
         self.assertEqual((vp.atm_frac, vp.atm_height, vp.atm_fine_sigma), (0.3, 0.02, 0.7))
 
+    def test_grey_mix_flag(self):
+        """`--v2_grey_mix` 写入 `grey_mix`；未传时不出现在覆盖项（保持默认 0.5）；不在 [0, 1] 时构造参数报错。"""
+        from src.v2.params import DiskV2VolumeParams
+        self.assertNotIn("grey_mix", cli.v2_volume_overrides(_args()))
+        self.assertEqual(DiskV2VolumeParams().grey_mix, 0.5)
+        vp = DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_grey_mix", "1")))
+        self.assertEqual(vp.grey_mix, 1.0)
+        for bad in ("-0.1", "1.2"):
+            with self.assertRaises(ValueError):
+                DiskV2VolumeParams(**cli.v2_volume_overrides(_args("--v2_grey_mix", bad)))
+
     def test_temp_turb_flag(self):
         """`--v2_temp_turb` 写入 `temp_turb_sigma`；未传时保持默认（关闭）。"""
         from src.v2.params import DiskV2VolumeParams

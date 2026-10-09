@@ -137,6 +137,11 @@ def parse_args() -> argparse.Namespace:
                         help="V2 密度–温度耦合 β（0–1）：温度 × clamp(1 + β·(c/⟨c⟩ − 1), 0.7, 1.3)，浓处更热。"
                              "盘光学厚时亮度只取决于温度，团块明暗主要靠它；局部耗散 ∝ 柱密度推得物理值 0.25。"
                              "默认 0.05")
+    g_rad.add_argument("--v2_grey_mix", type=float, default=None,
+                        help="V2 灰大气强度 m（0–1）：气体温度随上方光学深度 τ 变化，温度倍率 = 1 + m·(T_grey/T_eff − 1)，"
+                             "T_grey/T_eff = (3/4·(τ + 2/3))^{1/4}（Eddington 灰大气）。1 = 完整灰大气（物理）："
+                             "上层气体更冷，盘面上方的雾贴边看时更暗更红、不再盖住团块；0 = 竖直等温。"
+                             "宜与 --v2_atm_frac 一起调（见 docs/imaging_model.md §8）。默认 0.5")
     g_struct.add_argument("--v2_atm_frac", type=float, default=None,
                         help="V2 大气柱密度比 A（≥ 0）：盘面上方大气（指数尾巴）的柱密度 / 盘面核心柱密度。"
                              "大气与盘面是同一团气体、跟随同一湍流结构，稀处出现空隙；越大大气越浓、盘面越朦胧，"
@@ -255,7 +260,7 @@ def v2_volume_overrides(args) -> dict:
         args: CLI 参数（读取 `--v2_thickness_scale`、`--v2_lum_temp_scale`、`--v2_core_contrast`、
             `--v2_atm_frac`、`--v2_atm_height`、`--v2_atm_fine`、`--v2_temp_turb`、`--v2_core_floor`、
             `--v2_temp_density_coupling`、`--v2_temp_turb_coarse`、`--v2_temp_turb_gain`、`--v2_temp_turb_clamp_px`、
-            `--v2_temp_turb_lens_deg`、`--v2_isco_stress`、`--v2_plunge_width`，None = 未传入）。
+            `--v2_temp_turb_lens_deg`、`--v2_isco_stress`、`--v2_plunge_width`、`--v2_grey_mix`，None = 未传入）。
 
     Returns:
         `DiskV2VolumeParams` 关键字参数字典，只含显式传入的字段；全部未传入时为空字典。
@@ -267,7 +272,8 @@ def v2_volume_overrides(args) -> dict:
               "dt_i": args.v2_temp_density_coupling, "temp_turb_coarse": args.v2_temp_turb_coarse,
               "temp_turb_gain": args.v2_temp_turb_gain, "temp_turb_clamp_px": args.v2_temp_turb_clamp_px,
               "temp_turb_lens_deg": args.v2_temp_turb_lens_deg,
-              "isco_stress": args.v2_isco_stress, "plunge_width": args.v2_plunge_width}
+              "isco_stress": args.v2_isco_stress, "plunge_width": args.v2_plunge_width,
+              "grey_mix": args.v2_grey_mix}
     return {k: v for k, v in fields.items() if v is not None}
 
 
