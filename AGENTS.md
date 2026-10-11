@@ -229,7 +229,7 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
 ```bash
 # 1. 同步代码（本机执行；包含未提交的改动时用 tar，否则可用 git archive HEAD）
 tar czf /tmp/bhr.tar.gz src tests scenes scripts render.py
-scp -i ~/.ssh/id_ed25519_mac -P <端口> /tmp/bhr.tar.gz root@<主机>:/tmp/
+rsync -e "ssh -i ~/.ssh/id_ed25519_mac -p <端口>" /tmp/bhr.tar.gz root@<主机>:/tmp/
 ssh -i ~/.ssh/id_ed25519_mac -p <端口> root@<主机> 'mkdir -p /root/autodl-tmp/bhr && tar -xzf /tmp/bhr.tar.gz -C /root/autodl-tmp/bhr'
 
 # 2. 验证环境（远端）
@@ -243,14 +243,15 @@ cd /root/autodl-tmp/bhr && nohup /root/miniconda3/bin/python render.py --disk_mo
     -o /root/autodl-tmp/out/interstellar_skim_1080p60.mp4 > /root/autodl-tmp/out/interstellar_skim_1080p60.log 2>&1 &
 
 # 4. 取回产物（本机执行）
-scp -i ~/.ssh/id_ed25519_mac -P <端口> root@<主机>:/root/autodl-tmp/out/<文件> output/<场景>/
+rsync -av -e "ssh -i ~/.ssh/id_ed25519_mac -p <端口>" root@<主机>:/root/autodl-tmp/out/<目录或文件> output/<场景>/
 ```
 
+- **文件传输一律用 rsync**（增量、可续传、支持目录同步），不要用 scp。
 - **速度（实测，1080p、优化级别 2）**：GPU 积分 0.37–0.81 s/帧（M5 为 2.5–7.1 s/帧）；后处理按 `src/cli.py` 的
   `POSTFX_THREADS = 8` 多线程执行，单线程 3.7 s/帧、8 线程约 0.55 s/帧；首次 kernel 编译约 40 s。
   360p / 15 fps 的 60 s 运镜小样（900 帧）约 6 分钟。
 - **注意**：
-  - 按秒计费，渲染完及时关机；关机前把产物 scp 回本机。
+  - 按秒计费，渲染完及时关机；关机前把产物 rsync 回本机。
   - 本机不要跑完整长视频做验证：会让 GPU 长时间满载、机器卡顿；验证用几秒的短路径，或放到远端跑。
 
 
