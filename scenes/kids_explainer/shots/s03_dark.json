@@ -1,0 +1,15 @@
+{
+  "duration": 24,
+  "fade": {"fade_in": 0, "fade_out": 0},
+  "exposure": {"gain": 0, "reference_time": 20.0},
+  "scene_anim": {
+    "gravity_scale": [[0, 1.0]],
+    "doppler_scale": [[0, 0.0]],
+    "disk_weight": [[0, 0.0], [5.0, 0.0], [8.0, 0.15], [14.0, 1.0]],
+    "disk_radius_scale": [[0, 0.06], [5.0, 0.06], [8.0, 0.25], [14.0, 1.0]]
+  },
+  "keyframes": [
+    {"r": 40, "phi_deg": -96, "z": 4.5, "fov": 38, "roll": 0, "subject_uv": [0.5, 0.5], "label": "黑影"},
+    {"r": 40, "phi_deg": -86, "z": 4.5, "fov": 38, "roll": 0, "subject_uv": [0.5, 0.5], "label": "盘亮"}
+  ]
+}

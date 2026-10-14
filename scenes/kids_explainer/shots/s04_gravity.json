@@ -1,0 +1,14 @@
+{
+  "duration": 30,
+  "fade": {"fade_in": 0, "fade_out": 0},
+  "exposure": {"gain": 0, "reference_time": 0.5},
+  "scene_anim": {
+    "gravity_scale": [[0, 1.0], [5.0, 1.0], [11.0, 0.0], [17.0, 0.0], [24.0, 1.0]],
+    "doppler_scale": [[0, 0.0]],
+    "disk_weight": [[0, 1.0]]
+  },
+  "keyframes": [
+    {"r": 40, "phi_deg": -86, "z": 4.5, "fov": 38, "roll": 0, "subject_uv": [0.5, 0.5], "label": "k1"},
+    {"r": 40, "phi_deg": -80, "z": 4.5, "fov": 38, "roll": 0, "subject_uv": [0.5, 0.5], "label": "k来回"}
+  ]
+}

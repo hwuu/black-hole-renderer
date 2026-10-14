@@ -1,0 +1,14 @@
+{
+  "duration": 28,
+  "fade": {"fade_in": 0, "fade_out": 0},
+  "exposure": {"gain": 0, "reference_time": 1.0},
+  "scene_anim": {
+    "gravity_scale": [[0, 1.0]],
+    "doppler_scale": [[0, 1.0]],
+    "disk_weight": [[0, 1.0]]
+  },
+  "keyframes": [
+    {"r": 46, "phi_deg": -95, "z": 6.0, "fov": 36, "roll": 0, "subject_uv": [0.5, 0.47], "label": "回顾"},
+    {"r": 58, "phi_deg": -88, "z": 8.0, "fov": 36, "roll": 0, "subject_uv": [0.5, 0.45], "label": "拉出"}
+  ]
+}

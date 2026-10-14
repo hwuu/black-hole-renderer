@@ -1,0 +1,2 @@
+manim>=0.22
+edge-tts>=7.2

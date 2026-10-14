@@ -1,0 +1,9 @@
+{
+  "duration": 2,
+  "rhythm": {"ramp_in": 0.4, "ramp_out": 0.4},
+  "fade": {"fade_in": 0, "fade_out": 0},
+  "keyframes": [
+    {"r": 9, "phi_deg": -90, "z": 46, "fov": 40, "roll": 0, "subject_uv": [0.5, 0.5], "label": "俯视"},
+    {"r": 9, "phi_deg": -90, "z": 46, "fov": 40, "roll": 0, "subject_uv": [0.5, 0.5], "label": "俯视"}
+  ]
+}

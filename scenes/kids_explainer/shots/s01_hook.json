@@ -1,0 +1,8 @@
+{
+  "duration": 14,
+  "fade": {"fade_in": 0, "fade_out": 0},
+  "keyframes": [
+    {"r": 64, "phi_deg": -97, "z": 9.0, "fov": 34, "roll": 0, "subject_uv": [0.5, 0.44], "label": "远景"},
+    {"r": 52, "phi_deg": -92, "z": 8.0, "fov": 34, "roll": 0, "subject_uv": [0.5, 0.46], "label": "缓推"}
+  ]
+}
