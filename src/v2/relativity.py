@@ -69,13 +69,17 @@ def local_photon_direction(
     pos: np.ndarray,
     k_coord: np.ndarray,
     rs: float = 1.0,
+    *,
+    gravity_scale: float = 1.0,
 ) -> np.ndarray:
     """把光子在笛卡尔等效坐标下的方向变换为本地静止观者测得的方向。
 
     Args:
         pos: 光子所在位置，形状 `(..., 3)`，单位 `r_s`，原点为黑洞中心。
         k_coord: 同一点的坐标方向（不必归一），形状 `(..., 3)`，与 `pos` 广播。
-        rs: Schwarzschild 半径。
+        rs: Schwarzschild 半径（基准质量）。
+        gravity_scale: 引力强度旋钮 k（黑洞质量缩放，见 `scene_anim`）：公式中 `r_s → k·r_s`；
+            1 = 现状；0 = 无引力，方向不变。
 
     Returns:
         本地静止观者坐标系中的单位方向，形状 `(..., 3)`。
@@ -84,10 +88,10 @@ def local_photon_direction(
         ```
         r̂ = pos / |pos|
         k_rad = (k · r̂) r̂,  k_tan = k − k_rad
-        k_loc ∝ k_rad + sqrt(1 − r_s/r) · k_tan
+        k_loc ∝ k_rad + sqrt(1 − k·r_s/r) · k_tan
         ```
-        等价于 `tanψ_local = sqrt(1 − r_s/r) · tanψ_coord`（ψ 为与径向夹角）：
-        静止观者的径向固有长度 `dl = dr / sqrt(1 − r_s/r)`，切向 `r dφ` 不变。
+        等价于 `tanψ_local = sqrt(1 − k·r_s/r) · tanψ_coord`（ψ 为与径向夹角）：
+        静止观者的径向固有长度 `dl = dr / sqrt(1 − k·r_s/r)`，切向 `r dφ` 不变。
 
     Physical Meaning:
         Doppler 公式中的 `cosθ` 必须在发射点的本地静止标架中计算；直接用坐标方向
@@ -101,7 +105,8 @@ def local_photon_direction(
     r = np.linalg.norm(p, axis=-1, keepdims=True)
     r_hat = p / np.maximum(r, 1e-30)
     k_rad = np.sum(k * r_hat, axis=-1, keepdims=True) * r_hat
-    k_tan = (k - k_rad) * np.sqrt(np.maximum(1.0 - float(rs) / np.maximum(r, 1e-30), 1e-12))
+    k_tan = (k - k_rad) * np.sqrt(np.maximum(1.0 - float(gravity_scale) * float(rs)
+                                                 / np.maximum(r, 1e-30), 1e-12))
     k_loc = k_rad + k_tan
     return k_loc / np.maximum(np.linalg.norm(k_loc, axis=-1, keepdims=True), 1e-30)
 
@@ -111,6 +116,9 @@ def disk_g_factor(
     trace_dir: np.ndarray,
     r_obs: float,
     rs: float = 1.0,
+    *,
+    gravity_scale: float = 1.0,
+    doppler_scale: float = 1.0,
 ) -> float | np.ndarray:
     """盘面圆轨道发射体 → 远处静止观者的频移因子 `g = ν_obs / ν_em`。
 
@@ -119,7 +127,11 @@ def disk_g_factor(
         trace_dir: 反向追踪光线在该点的坐标方向（从相机射出的方向），形状 `(..., 3)`。
             光子真实传播方向为 `−trace_dir`。
         r_obs: 观察者半径（静止观者），单位 `r_s`。
-        rs: Schwarzschild 半径。
+        rs: Schwarzschild 半径（基准质量）。
+        gravity_scale: 引力强度旋钮 k（黑洞质量缩放）：引力红移与光子方向变换中 `r_s → k·r_s`；
+            1 = 现状；0 = 无引力红移。
+        doppler_scale: 多普勒强度旋钮 d：频移中 `β → d·β`；1 = 现状；0 = 无多普勒频移
+            （只剩引力红移）。**只作用于频移**，盘的旋转动画与几何不受影响。
 
     Returns:
         `g`，形状为广播后的前导形状（标量输入返回 float）。逼近侧 > 1，远离侧 < 1。
@@ -127,9 +139,9 @@ def disk_g_factor(
     Formula:
         ```
         R = sqrt(x² + y²)（圆柱半径，决定轨道），r = |pos|（球半径，决定引力红移）
-        v̂ = (−y, x, 0) / R,  β = sqrt(M / (R − 2M)),  γ = 1/sqrt(1 − β²)
-        cosθ = v̂ · local_photon_direction(pos, −trace_dir)
-        g = sqrt(1 − r_s/r) / sqrt(1 − r_s/r_obs) · 1 / (γ (1 − β cosθ))
+        v̂ = (−y, x, 0) / R,  β = sqrt(M / (R − 2M)),  γ = 1/sqrt(1 − (d·β)²)
+        cosθ = v̂ · local_photon_direction(pos, −trace_dir, rs, k)
+        g = sqrt(1 − k·r_s/r) / sqrt(1 − k·r_s/r_obs) · 1 / (γ (1 − d·β cosθ))
         ```
 
     Physical Meaning:
@@ -137,18 +149,22 @@ def disk_g_factor(
 
     Simplifications:
         盘内（含有限厚度处）物质都按其圆柱半径做赤道开普勒圆轨道；`R < 3 r_s` 处按 ISCO
-        取 β，保持数值稳定（该区域不参与发射）。
+        取 β，保持数值稳定（该区域不参与发射）。**β 及其 ISCO 钳制按基准质量（k = 1）
+        计算，不随 `gravity_scale` 缩放**——"k 旋钮 + d = 1" 的组合物理上不自洽，
+        影片中不出现（见 `docs/plans/kids_explainer_plan.md` §3.1）。
     """
     p = _to_array(pos)
     k = -_to_array(trace_dir)
     big_r = np.sqrt(p[..., 0] ** 2 + p[..., 1] ** 2)
     r3 = np.linalg.norm(p, axis=-1)
     beta = _to_array(orbital_beta_local(np.maximum(big_r, 3.0 * float(rs)), rs))
+    beta_eff = float(doppler_scale) * beta
     v_hat = np.stack([-p[..., 1], p[..., 0], np.zeros_like(big_r)], axis=-1) / np.maximum(big_r, 1e-30)[..., None]
-    cos_th = np.sum(v_hat * local_photon_direction(p, k, rs), axis=-1)
-    gamma = 1.0 / np.sqrt(1.0 - beta * beta)
-    g_grav = np.sqrt(np.maximum(1.0 - float(rs) / r3, 1e-12)) / math.sqrt(max(1.0 - float(rs) / float(r_obs), 1e-12))
-    g = g_grav / (gamma * (1.0 - beta * cos_th))
+    cos_th = np.sum(v_hat * local_photon_direction(p, k, rs, gravity_scale=gravity_scale), axis=-1)
+    gamma = 1.0 / np.sqrt(1.0 - beta_eff * beta_eff)
+    k_rs = float(gravity_scale) * float(rs)
+    g_grav = np.sqrt(np.maximum(1.0 - k_rs / r3, 1e-12)) / math.sqrt(max(1.0 - k_rs / float(r_obs), 1e-12))
+    g = g_grav / (gamma * (1.0 - beta_eff * cos_th))
     return float(g) if np.ndim(g) == 0 else g
 
 

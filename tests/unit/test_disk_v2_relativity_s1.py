@@ -122,6 +122,62 @@ class DiskGFactorTest(unittest.TestCase):
         self.assertEqual(disk_g_factor(pos, d, self.R_OBS).shape, (2,))
 
 
+class KnobScalingTest(unittest.TestCase):
+    """场景旋钮（gravity_scale k / doppler_scale d）对频移的作用。"""
+
+    R_OBS = 60.0
+
+    def test_default_kwargs_match_legacy(self):
+        """显式传 k = d = 1 与不传（默认）逐位相同。"""
+        pos = np.array([8.0, 0.0, 0.0])
+        d = np.array([0.0, -1.0, 0.0])
+        self.assertEqual(disk_g_factor(pos, d, self.R_OBS),
+                         disk_g_factor(pos, d, self.R_OBS, gravity_scale=1.0, doppler_scale=1.0))
+
+    def test_k0_d0_g_is_one(self):
+        """无引力、无轨道运动：g = 1（无频移）。"""
+        pos = np.array([8.0, 0.0, 0.0])
+        d = np.array([0.0, -1.0, 0.0])
+        self.assertEqual(disk_g_factor(pos, d, self.R_OBS, gravity_scale=0.0, doppler_scale=0.0), 1.0)
+
+    def test_d0_leaves_gravity_only(self):
+        """d = 0：只剩引力红移 g = sqrt(1−k·rs/r)/sqrt(1−k·rs/r_obs)。"""
+        pos = np.array([8.0, 0.0, 0.0])
+        d = np.array([0.0, -1.0, 0.0])
+        for k in (0.0, 0.5, 1.0):
+            g = disk_g_factor(pos, d, self.R_OBS, gravity_scale=k, doppler_scale=0.0)
+            expected = math.sqrt(1.0 - k / 8.0) / math.sqrt(1.0 - k / self.R_OBS)
+            self.assertAlmostEqual(g, expected, places=12)
+
+    def test_gravity_scale_matches_formula(self):
+        pos = np.array([5.0, 3.0, 0.0])
+        d = np.array([0.0, -1.0, 0.0])
+        r = float(np.linalg.norm(pos))
+        g = disk_g_factor(pos, d, self.R_OBS, gravity_scale=0.5, doppler_scale=0.0)
+        self.assertAlmostEqual(g, math.sqrt(1.0 - 0.5 / r) / math.sqrt(1.0 - 0.5 / self.R_OBS), places=12)
+
+    def test_doppler_scale_reduces_deviation(self):
+        """d 越小，多普勒偏离 |g − g_grav| 越小（单调收敛到 0）。"""
+        pos = np.array([8.0, 0.0, 0.0])
+        d = np.array([0.0, -1.0, 0.0])
+        g_grav = disk_g_factor(pos, d, self.R_OBS, doppler_scale=0.0)
+        dev = [abs(disk_g_factor(pos, d, self.R_OBS, doppler_scale=s) - g_grav) for s in (0.25, 0.5, 1.0)]
+        self.assertTrue(dev[0] < dev[1] < dev[2])
+
+    def test_local_direction_k0_unchanged(self):
+        """k = 0：本地方向 = 坐标方向（无引力不改变角度）。"""
+        pos = np.array([4.0, 0.0, 0.0])
+        psi_c = math.radians(40.0)
+        k = np.array([math.cos(psi_c), math.sin(psi_c), 0.0])
+        np.testing.assert_allclose(local_photon_direction(pos, k, gravity_scale=0.0), k, atol=1e-12)
+
+    def test_local_direction_default_kwargs_match_legacy(self):
+        pos = np.array([4.0, 0.0, 0.0])
+        k = np.array([0.6, 0.8, 0.0])
+        np.testing.assert_array_equal(local_photon_direction(pos, k, gravity_scale=1.0),
+                                      local_photon_direction(pos, k))
+
+
 class TaichiParityTest(unittest.TestCase):
     """Taichi helper 与 NumPy reference 一致（f32 容差）。"""
 
@@ -174,10 +230,54 @@ class TaichiParityTest(unittest.TestCase):
         @ti.kernel
         def k():
             for i in p_f:
-                out[i] = T.disk_g_factor_ti(p_f[i], d_f[i], 60.0, 1.0, 1.0)
+                out[i] = T.disk_g_factor_ti(p_f[i], d_f[i], 60.0, 1.0, 1.0, 1.0, 1.0)
 
         k()
         np.testing.assert_allclose(out.to_numpy(), disk_g_factor(self.pos, self.dirs, 60.0), rtol=1e-4)
+
+    def test_disk_g_parity_knob_combos(self):
+        """(k, d) 组合下 Taichi 与 NumPy 逐值一致；(0, 0) 时 g 恒为 1。"""
+        ti, T = self.ti, self.T
+        n = len(self.pos)
+        p_f = ti.Vector.field(3, ti.f32, shape=n)
+        d_f = ti.Vector.field(3, ti.f32, shape=n)
+        out = ti.field(ti.f32, shape=n)
+        p_f.from_numpy(self.pos.astype(np.float32))
+        d_f.from_numpy(self.dirs.astype(np.float32))
+        out = ti.field(ti.f32, shape=n)
+
+        @ti.kernel
+        def k_one(kg: ti.f32, dg: ti.f32):
+            for i in p_f:
+                out[i] = T.disk_g_factor_ti(p_f[i], d_f[i], 60.0, 1.0, 1.0, kg, dg)
+
+        for k_g, d_g in [(0.0, 0.0), (0.0, 1.0), (0.5, 0.5), (1.0, 0.0)]:
+            k_one(k_g, d_g)
+            expected = disk_g_factor(self.pos, self.dirs, 60.0,
+                                     gravity_scale=k_g, doppler_scale=d_g)
+            np.testing.assert_allclose(out.to_numpy(), expected, rtol=1e-4)
+            if (k_g, d_g) == (0.0, 0.0):
+                np.testing.assert_allclose(out.to_numpy(), 1.0, rtol=0)
+
+    def test_local_direction_parity_with_gravity_scale(self):
+        """k ≠ 1 时 Taichi 与 NumPy 的本地方向变换逐值一致。"""
+        ti, T = self.ti, self.T
+        n = len(self.pos)
+        p_f = ti.Vector.field(3, ti.f32, shape=n)
+        d_f = ti.Vector.field(3, ti.f32, shape=n)
+        out_f = ti.Vector.field(3, ti.f32, shape=n)
+        p_f.from_numpy(self.pos.astype(np.float32))
+        d_f.from_numpy(self.dirs.astype(np.float32))
+
+        @ti.kernel
+        def k(kg: ti.f32):
+            for i in p_f:
+                out_f[i] = T.local_photon_direction_ti(p_f[i], d_f[i], 1.0, kg)
+
+        for kg in (0.0, 0.5, 1.0):
+            k(kg)
+            expected = local_photon_direction(self.pos, self.dirs, gravity_scale=kg)
+            np.testing.assert_allclose(out_f.to_numpy(), expected, atol=2e-6)
 
 
 if __name__ == "__main__":

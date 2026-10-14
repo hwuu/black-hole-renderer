@@ -86,45 +86,51 @@ def schwarzschild_orbital_beta_ti(r, rs, eps, beta_cap):
 
 
 @ti.func
-def local_photon_direction_ti(pos, k_coord, rs):
+def local_photon_direction_ti(pos, k_coord, rs, gravity_scale):
     """光子坐标方向 → 本地静止观者单位方向（与 `relativity.local_photon_direction` 一致）。
 
     Args:
         pos: 位置向量（r_s）。
         k_coord: 坐标方向（不必归一）。
-        rs: Schwarzschild 半径。
+        rs: Schwarzschild 半径（基准质量）。
+        gravity_scale: 引力强度旋钮 k：公式中 `r_s → k·r_s`；1 = 现状；0 = 方向不变。
 
     Returns:
-        单位向量；`tanψ_local = sqrt(1 − r_s/r) · tanψ_coord`。
+        单位向量；`tanψ_local = sqrt(1 − k·r_s/r) · tanψ_coord`。
     """
     r = ti.max(pos.norm(), 1e-6)
     r_hat = pos / r
     k_rad = k_coord.dot(r_hat) * r_hat
-    k_tan = (k_coord - k_rad) * ti.sqrt(ti.max(1.0 - rs / r, 1e-12))
+    k_tan = (k_coord - k_rad) * ti.sqrt(ti.max(1.0 - gravity_scale * rs / r, 1e-12))
     return (k_rad + k_tan).normalized()
 
 
 @ti.func
-def disk_g_factor_ti(pos, trace_dir, r_obs, rs, spin):
-    """盘面圆轨道发射体的频移 g（`relativity.disk_g_factor` 在 spin = +1 时逐值一致）。
+def disk_g_factor_ti(pos, trace_dir, r_obs, rs, spin, gravity_scale, doppler_scale):
+    """盘面圆轨道发射体的频移 g（`relativity.disk_g_factor` 在同参数下逐值一致）。
 
     Args:
         pos: 盘局部坐标发射点（盘面 z = 0）。
         trace_dir: 反向追踪光线方向（光子真实方向为其反向）。
         r_obs: 静止观察者半径。
-        rs: Schwarzschild 半径。
+        rs: Schwarzschild 半径（基准质量）。
         spin: 旋转方向符号（+1 逆时针 / −1 顺时针，从盘法向 +z 看）。
+        gravity_scale: 引力强度旋钮 k：引力红移与方向变换中 `r_s → k·r_s`。
+        doppler_scale: 多普勒强度旋钮 d：频移中 `β → d·β`，只作用于频移。
 
     Returns:
-        `g = g_grav / (γ (1 − β cosθ_local))`。
+        `g = g_grav / (γ' (1 − β' cosθ_local))`，其中 `β' = d·β`、
+        `g_grav = sqrt(1 − k·r_s/r)/sqrt(1 − k·r_s/r_obs)`。
+        β 与 ISCO 钳制按基准质量计算，不随 k 缩放。
     """
     big_r = ti.max(ti.sqrt(pos[0] * pos[0] + pos[1] * pos[1]), 1e-6)
     r3 = ti.max(pos.norm(), rs + 1e-6)
-    beta = schwarzschild_orbital_beta_ti(ti.max(big_r, 3.0 * rs), rs, 1e-6, 0.99)
+    beta = doppler_scale * schwarzschild_orbital_beta_ti(ti.max(big_r, 3.0 * rs), rs, 1e-6, 0.99)
     v_hat = spin * ti.Vector([-pos[1], pos[0], 0.0]) / big_r
-    cos_th = v_hat.dot(local_photon_direction_ti(pos, -trace_dir, rs))
+    cos_th = v_hat.dot(local_photon_direction_ti(pos, -trace_dir, rs, gravity_scale))
     gamma = 1.0 / ti.sqrt(1.0 - beta * beta)
-    g_grav = ti.sqrt(ti.max(1.0 - rs / r3, 1e-12)) / ti.sqrt(ti.max(1.0 - rs / r_obs, 1e-12))
+    g_grav = ti.sqrt(ti.max(1.0 - gravity_scale * rs / r3, 1e-12)) / ti.sqrt(
+        ti.max(1.0 - gravity_scale * rs / r_obs, 1e-12))
     return g_grav / (gamma * (1.0 - beta * cos_th))
 
 
