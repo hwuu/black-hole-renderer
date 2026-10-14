@@ -105,7 +105,10 @@
     `v2_arts/interstellar_skim.json` 为示例路径（120 s，视野固定 50°，30–74 s 摇向前进方向（`pans` 块），
     分形温度湍流 + 色调"白平衡 10000 K / 胶片响应 1 / +3 档"，命令见其 README）；`close_low/close_low.json` 为贴云顶匀速环绕（60 s，开启温度湍流）；
     `lensing_bend/lensing_bend.json` 为逼近侧透镜转弯处的长焦特写（30 s，r = 30 长焦平视、视野 5°（≈275 mm）、黑洞在画面外、
-    0.1°/s 极慢环绕；内边界力矩 0.005、温度湍流不按透镜淡出、橙金色调（白平衡 25000 K、饱和度 1.6）等参数见其 README）
+    0.1°/s 极慢环绕；内边界力矩 0.005、温度湍流不按透镜淡出、橙金色调（白平衡 25000 K、饱和度 1.6）等参数见其 README）；
+    `kids_explainer/` 为儿童科普片《黑洞是什么》（3:41，1080p30，VoxCPM2 旁白 + Manim 图解 +
+    4 个教学旋钮（引力/多普勒/气体量/盘生长）+ EHT 照片对比；制片层 `src/film/` 用法见 `docs/design_film.md`，
+    场景参数与分镜见其 `script.md`）
 - `scripts/`
   - `contact_sheet.py` 运镜联系表（审构图）
 - `tests/unit` 轻量定向单测；`tests/e2e_render.py` V1 固定参数渲染 + hash 校验
@@ -225,6 +228,14 @@ python -m unittest $(ls tests/unit/test_disk_v2_*.py | sed 's#/#.#g; s#\.py$##')
   `--device gpu` 在 Linux 上自动走 CUDA，命令与本机相同。
 - **目录**：代码 `/root/autodl-tmp/bhr`，天空贴图 `/root/autodl-tmp/TychoSkymapII.t5_8192x4096.jpg`，产物 `/root/autodl-tmp/out`
   （`/root/autodl-tmp` 是数据盘，关机后保留 15 天）。
+- **当前实例（2026-10-13，原 4090 库存不足改用克隆机，SeetaCloud）**：
+  `ssh -i ~/.ssh/openclaw-remote-build-20260416134320 -p 32068 root@connect.bjb3.seetacloud.com`。
+  **密钥注意**：本机 `id_ed25519_mac` 已于 2026-10-13 轮换为新密钥对（旧公钥备份在
+  `id_ed25519_mac.pub.old-20261013`），服务器上登记的还是旧公钥——连远程实例一律用
+  `openclaw-remote-build-20260416134320`（即轮换前的旧私钥，其公钥与旧备份一致）。
+  硬件：RTX 4080 SUPER（32 GB 显存）、驱动 595；`/root/miniconda3/bin/python` 3.12，
+  **torch 2.12.1+cu130 已预装**（VoxCPM2 直接可用）；数据盘为空，做渲染前需重传代码与天空贴图。
+  语音合成（VoxCPM2）、视频小样等生成任务先用这台。
 
 ```bash
 # 1. 同步代码（本机执行；包含未提交的改动时用 tar，否则可用 git archive HEAD）

@@ -183,6 +183,35 @@ docstring），不开放 CLI。其中主云剪切级联的 `shear_*`（长宽比
 - 天空：`--texture` 读等距柱状 PNG，不传则程序生成星空；双线性采样，星点参与 bloom。
 - 速度（M 系列 GPU 实测，默认参数，720p、每像素 1 条光线，只计光线积分）：级别 0 4.5 s，级别 1 4.7 s，级别 2 2.7 s，级别 3 2.0 s（统一气体模型比旧烟雾模型快约 40%；级别 1 在统一模型下已无提速，只保证与级别 0 一致）；盘内视角（`--pov 0 -22 0.3`）级别 2 约 2.5 s。720p 视频（级别 2，含天空、后处理与编码）约 3.4 s/帧。超采样倍率 N 耗时约为 N² 倍。
 
+## 成片制作（`src/film/` 制片层）
+
+儿童科普片等完整影片通过制片层流水线制作（设计见 [`docs/design_film.md`](docs/design_film.md)）：
+脚本 → 配音 → 时间线 → 渲染任务 → Manim 图解 → 合成，各步骤独立可重跑。
+
+```bash
+# 旁白（VoxCPM2 大模型 Voice Design，需 CUDA，在远程 GPU 实例运行）
+python -m src.film scenes/kids_explainer/film.json narrate
+
+# 时间线（含路径时长校验，锁定每镜时长）
+python -m src.film scenes/kids_explainer/film.json timeline
+
+# 渲染任务（生成 render_jobs.sh，在远端执行）
+python -m src.film scenes/kids_explainer/film.json jobs --remote
+
+# Manim 图解（本地渲染）
+python -m src.film scenes/kids_explainer/film.json diagrams
+
+# 音效 / 字幕
+python -m src.film scenes/kids_explainer/film.json sfx
+python -m src.film scenes/kids_explainer/film.json subtitles
+
+# 合成成片（裁剪 → xfade 交叉淡化 → 混音 → 字幕烧录）
+python -m src.film scenes/kids_explainer/film.json assemble
+```
+
+首个场景：`scenes/kids_explainer/`（《黑洞是什么》，3:41，1080p30），
+参数与分镜见其 `script.md`。
+
 ## 物理模型
 
 采用笛卡尔等效形式的光线方程：

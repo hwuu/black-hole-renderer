@@ -48,10 +48,12 @@
 - 每个渲染镜头对应一条可复现的命令，可导出为脚本在远端 4090 上执行（见 AGENTS.md "远程渲染"）；
 - 引擎层不需要重构（运镜视频管线目前是 `src/cli.py:main` 内的闭包）。
 
-制片层可以 import 引擎层的**纯函数模块**（不触发 Taichi 编译），目前用到两个：
+制片层可以 import 引擎层的**纯函数模块**（不触发 Taichi 编译），目前用到三个：
 `src/v2/scene_anim.py`（旋钮轨道求值，遥控器叠加层用它保证与画面同步）、
-`src/core/geodesic.py`（NumPy 光线积分，图解用它画光路）。
-两个模块都不得 import Taichi——它们要在制片层与图解的进程内使用。
+`src/core/geodesic.py`（NumPy 光线积分，图解用它画光路）、
+`src/v2/exposure_curve.py`（`FadeSettings` 的默认淡入淡出，render_jobs 据此判断
+路径文件省略 `fade` 块时是否与清单转场叠加）。
+这些模块都不得 import Taichi——它们要在制片层与图解的进程内使用。
 
 ## 3. 数据模型
 
@@ -79,7 +81,7 @@
      "narration": ["……"]}
   ],
   "assets": {"eht_m87": {"url": "https://…", "credit": "EHT Collaboration", "license": "CC BY 4.0"}},
-  "sfx": [{"shot": "s06_siren", "kind": "siren_doppler", "at": 1.0, "params": {"f0": 700, "v": 25}}]
+  "sfx": [{"shot": "s06_siren", "kind": "siren_doppler", "at": 1.0, "params": {"f0": 700, "speed": 25}}]
 }
 ```
 
@@ -87,7 +89,7 @@
 |------|------|------|
 | `title` | 片名，用于产物文件名与字幕 | 必填 |
 | `size` / `fps` | 成片画幅与帧率；`size` 必须对应 CLI 预设之一（`sd`/`hd`/`fhd`/`4k`，如 `[1920,1080] → fhd`），由它生成 `-r` | 预设之外的尺寸报错 |
-| `voice` | 配音引擎与音色、语速 | 当前只支持 `edge-tts`；`rate` 形如 `"+0%"` |
+| `voice` | 配音引擎与音色、语速 | `engine` 支持 `edge-tts`（在线）与 `say`（macOS 本地回退）；`rate` 仅 edge-tts 使用 |
 | `music` | 背景音乐文件路径或 null | 可省略；说话时自动压低（§4.7） |
 | `padding` | 旁白留白（秒）：镜头开头 `lead`、句间 `gap`、结尾 `tail` | 均 ≥ 0 |
 | `render_defaults` | 所有渲染镜头共用的 `render.py` 参数 | 不得包含 `-r`/`--resolution`、`--fps`、`-o`/`--output`、`--video`、`--n_frames`、`--resume`、`--v2_camera_path`、`--v2_camera_path_time`、`--disk_model`（由制片层生成；制片层只支持 V2 路径模式，`--disk_model v2` 由 jobs 固定给出） |
@@ -101,7 +103,7 @@
 | `shots[].layers` | image：图片图层（资源名 + 归一化位置框） | image 必填；`asset` 须在 `assets` 中定义；`box` 为 `[x, y, w, h]`，均在 `[0, 1]` 且 `x+w ≤ 1`、`y+h ≤ 1` |
 | `shots[].narration` | 旁白句子列表（每句一条字幕） | 可为空 |
 | `shots[].min_duration` | 最短时长（秒） | 默认 0 |
-| `shots[].transition` | 与上一镜头的转场：`type` 为 `cut` / `fade`，`fade` 带 `duration` | 默认 cut；`0 < duration ≤ min(D_{i−1}, D_i)`，清单加载时校验 |
+| `shots[].transition` | 与上一镜头的转场：`type` 为 `cut` / `fade`，`fade` 带 `duration` | 默认 cut；`0 < duration`（清单加载时校验），且 ≤ min(D_{i−1}, D_i)（D_{i} 由 timeline 求出后校验，见 §4.2） |
 | `assets` | 外部图片：下载地址、署名、许可 | 每项含 `url`、`credit`、`license`（必填字符串）；字幕区末尾自动列出署名 |
 | `sfx` | 音效：所属镜头、镜头内起始时刻、类型与参数 | `shot` 须指向存在的镜头 id；`at ≥ 0` 且落在该镜头时长内；类型见 §4.5 |
 
@@ -160,8 +162,10 @@ assemble ----> <film>.mp4 (+ subtitles)     (reads all artifacts + timeline.json
 
 ### 4.1 旁白（narration）
 
-逐句调用 edge-tts 合成 mp3，用 ffprobe 测量时长；缓存键为 `(音色, 语速, 句子文本)` 的哈希，
+逐句合成 mp3，用 ffprobe 测量时长；缓存键为 `(引擎, 音色, 语速, 句子文本)` 的哈希，
 文本不变不重新合成。**逐句合成**使每句字幕的起止时刻精确已知，不需要按字数估计。
+引擎二选一：`edge-tts`（在线，微软语音）与 `say`（macOS 本地回退，含 Eddy / Flo 等神经声音；
+edge-tts 服务在部分网络不可达，实测 2026-10-13）。
 
 ### 4.2 时间线（timeline）
 
@@ -243,8 +247,8 @@ f_obs(t) = f_src · c_s / (c_s − v·cosθ(t))         c_s = 343 m/s
 ## 5. 依赖
 
 制片层依赖单独列在 `requirements-film.txt`（`manim`、`edge-tts`），不进 `requirements.txt`，引擎环境保持精简。
-系统依赖：ffmpeg（含 libass）；Manim 的 cairo / pango 优先由 pip 轮子提供，缺库时用 brew 补装。
-edge-tts 调用微软在线服务，需要联网。
+系统依赖：ffmpeg（含 libass，brew 用 `ffmpeg-full`；`say` 引擎还需 macOS）；Manim 的 cairo / pango
+优先由 pip 轮子提供，缺库时用 brew 补装。edge-tts 调用微软在线服务，需要联网；不可达时用 `say`。
 
 ## 6. 测试
 
