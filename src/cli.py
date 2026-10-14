@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     g_cam = parser.add_argument_group("④ 相机：位置、视野、姿态、运动（§3）")
     g_lens = parser.add_argument_group("⑤ 镜头：眩光与色差（§4）")
     g_isp = parser.add_argument_group("⑥ 传感器与 ISP：曝光、白平衡、色调映射（§5、§6）")
+    g_knobs = parser.add_argument_group("场景·想象实验：教学旋钮（跨层的教学开关，见 docs/plans/kids_explainer_plan.md §3）")
     g_solver = parser.add_argument_group("求解精度（非成像参数）")
     g_out = parser.add_argument_group("输出与视频（非成像参数）")
     g_v1 = parser.add_argument_group("V1 专用：程序纹理与旋转算法")
@@ -230,6 +231,26 @@ def parse_args() -> argparse.Namespace:
                         help="V2 天空亮度系数（线性光，曝光之后叠加，不影响盘曝光；0 = 黑天空）(default: 0.5)")
     g_struct.add_argument("--v2_orbit_seconds", type=float, default=16.0,
                         help="V2 视频模式：内缘开普勒轨道对应视频秒数 (default: 16.0)")
+    g_knobs.add_argument("--v2_gravity_scale", type=float, default=None, metavar="K",
+                        help="V2 引力强度旋钮 k（0–1，黑洞质量缩放）：作用于光线弯曲、吞光半径、引力红移、"
+                             "光行差与步长。1 = 现状（默认）；0 = 无黑洞（光走直线、盘后透出星空）。"
+                             "路径文件的 scene_anim 轨道可逐帧覆盖（轨道优先）")
+    g_knobs.add_argument("--v2_doppler_scale", type=float, default=None, metavar="D",
+                        help="V2 多普勒强度旋钮 d（0–1）：频移中 β → d·β，只作用于颜色与亮度，"
+                             "不影响盘的旋转动画。1 = 现状（默认）；0 = 无多普勒明暗与变色。"
+                             "路径文件的 scene_anim 轨道可逐帧覆盖（轨道优先）")
+    g_knobs.add_argument("--v2_disk_weight", type=float, default=None, metavar="W",
+                        help="V2 盘气体量旋钮 w（0–1）：总发射与总消光（含散射）整体乘 w；"
+                             "0 = 无盘（只剩黑影与被扭曲的星空）。1 = 现状（默认）。"
+                             "路径文件的 scene_anim 轨道可逐帧覆盖（轨道优先）")
+    g_knobs.add_argument("--v2_disk_radius_scale", type=float, default=None, metavar="RHO",
+                        help="V2 盘空间范围旋钮 ρ（(0, 1]）：盘的有效外半径 = ρ × r_out，"
+                             "采样条件与步长包络同步缩放。配合 --v2_disk_weight 可实现"
+                             "盘从内向外生长的效果。1 = 现状（默认）。"
+                             "路径文件的 scene_anim 轨道可逐帧覆盖（轨道优先）")
+    g_rad.add_argument("--v2_color_cap", type=float, default=None, metavar="K",
+                        help="V2 颜色温度上限 T_cap（K，≥ 0）：色度温度超过它时取 T_cap，最亮处止于白色；"
+                             "0 = 不封顶（高温区真实偏蓝白，多普勒演示用）；默认跟随 --v2_white_balance")
     return parser.parse_args()
 
 
@@ -312,6 +333,15 @@ def validate_args(args) -> None:
         raise ValueError(f"--v2_film_response 必须在 [0, 1] 之间，得到 {args.v2_film_response}")
     if args.v2_saturation is not None and not 0.0 <= args.v2_saturation <= 3.0:
         raise ValueError(f"--v2_saturation 必须在 [0, 3] 之间，得到 {args.v2_saturation}")
+    for name in ("v2_gravity_scale", "v2_doppler_scale", "v2_disk_weight"):
+        v = getattr(args, name)
+        if v is not None and not (math.isfinite(v) and 0.0 <= v <= 1.0):
+            raise ValueError(f"--{name} 必须在 [0, 1] 之间，得到 {v}")
+    if args.v2_disk_radius_scale is not None and not (math.isfinite(args.v2_disk_radius_scale)
+                                                      and 0.0 < args.v2_disk_radius_scale <= 1.0):
+        raise ValueError(f"--v2_disk_radius_scale 必须在 (0, 1] 之间，得到 {args.v2_disk_radius_scale}")
+    if args.v2_color_cap is not None and not (math.isfinite(args.v2_color_cap) and args.v2_color_cap >= 0):
+        raise ValueError(f"--v2_color_cap 必须是有限数且 ≥ 0（0 = 不封顶），得到 {args.v2_color_cap}")
     if args.disk_texture and (args.video or args.interactive):
         raise ValueError("--disk_texture 仅支持静态单帧渲染，video/interactive 模式请使用生命周期系统")
 
@@ -366,6 +396,20 @@ def main():
     if args.v2_camera_path is not None:
         from src.v2.path_video import load_camera_plan
         camera_plan = load_camera_plan(args.v2_camera_path)
+        for name, cli_value in (("gravity_scale", args.v2_gravity_scale),
+                                 ("doppler_scale", args.v2_doppler_scale),
+                                 ("disk_weight", args.v2_disk_weight)):
+            if cli_value is not None and name in camera_plan.anim.tracks:
+                print(f"[scene_anim] {name} 同时有 CLI 参数与轨道，以轨道为准")
+
+    def _knob_defaults():
+        """场景旋钮的 CLI 值（未传入时为 1）；路径文件的 scene_anim 轨道覆盖同名项。"""
+        return {"gravity_scale": 1.0 if args.v2_gravity_scale is None else args.v2_gravity_scale,
+                "doppler_scale": 1.0 if args.v2_doppler_scale is None else args.v2_doppler_scale,
+                "disk_weight": 1.0 if args.v2_disk_weight is None else args.v2_disk_weight,
+                "disk_radius_scale": (1.0 if args.v2_disk_radius_scale is None
+                                      else args.v2_disk_radius_scale)}
+
     args.n_frames = resolve_n_frames(args, camera_plan.path.duration if camera_plan else None)
 
     resolutions = {"4k": (3840, 2160), "fhd": (1920, 1080), "hd": (1280, 720), "sd": (640, 360)}
@@ -396,7 +440,8 @@ def main():
 
         Args:
             args: CLI 参数（读取 `--ar1/--ar2/--disk_tilt/--r_max/--texture/--n_stars/--v2_opt/
-                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_camera_roll/--v2_lens_glare/--v2_white_balance/--v2_exposure_ev/--v2_film_response/
+                --v2_supersample/--v2_sky_gain/--v2_doppler_lum/--v2_doppler_color/--v2_color_floor/--v2_color_cap/
+                --v2_camera_roll/--v2_lens_glare/--v2_white_balance/--v2_exposure_ev/--v2_film_response/
                 --v2_saturation/--device`；
                 两个多普勒参数未传入时用渲染器默认值）。
             width, height: 输出分辨率（像素）。
@@ -435,6 +480,7 @@ def main():
             **({} if args.v2_doppler_lum is None else {"doppler_lum": args.v2_doppler_lum}),
             **({} if args.v2_doppler_color is None else {"doppler_color": args.v2_doppler_color}),
             color_temp_floor_K=args.v2_color_floor,
+            **({} if args.v2_color_cap is None else {"color_temp_cap_K": args.v2_color_cap}),
             **({} if args.v2_lens_glare is None else {"lens_glare": args.v2_lens_glare}),
             **({} if args.v2_white_balance is None else {"white_balance_K": args.v2_white_balance}),
             **({} if args.v2_exposure_ev is None else {"exposure_ev": args.v2_exposure_ev}),
@@ -472,6 +518,7 @@ def main():
         from src.v2.video_segments import render_segmented
 
         renderer = _make_v2_renderer(args, width, height, video=True)
+        renderer.set_scene_knobs(**_knob_defaults())
 
         # 物理时间步：内缘轨道周期 = v2_orbit_seconds 视频秒（r_in 取 ISCO 钳制后的值）
         period_in = inner_orbit_period(renderer.params.r_in)
@@ -552,27 +599,31 @@ def main():
 
         Formula:
             第 f 帧：视频时刻 t_f = f / fps，物理时刻见 `path_video.physical_time`，抖动种子 f + 1；
-            曝光 E_f = E₀·2^{ev(t_f)}，E₀ = 0.9 / p99.9(首帧盘区亮度)；输出 = α(t_f)·sRGB 画面。
+            曝光 E_f = E₀·2^{ev(t_f)}，E₀ = 0.9 / p99.9(参考帧盘区亮度)——参考帧为第 0 帧
+            （`exposure.reference_time` 缺省，与引入该参数前逐位一致）或 `reference_time` 时刻
+            用正片渲染器渲的一帧（种子 1）；输出 = α(t_f)·sRGB 画面。
 
         Notes:
             续传：进度文件保存 E₀，校验参数包含路径文件内容；曝光曲线每次运行重新测光（抖动种子固定，
-            结果可复现，约 2 分钟）。测光渲染器（128×72）与正片渲染器共用同一 Taichi 运行时。
+            结果可复现，约 2 分钟）。测光渲染器（128×72）与正片渲染器共用同一 Taichi 运行时，
+            测光帧同样应用场景旋钮轨道。
         """
         import json as _json
         import time as _time
 
         from src.v2.exposure_curve import auto_exposure, fade_factor
-        from src.v2.path_video import meter_plan, render_path_hdr, time_scale
+        from src.v2.path_video import meter_plan, reference_exposure, render_path_hdr, time_scale
         from src.v2.video_segments import render_segmented
 
         path = plan.path
         orbit_s = args.v2_orbit_seconds
+        knob_defaults = _knob_defaults()
         path.check(width / height)
         meter = _make_v2_renderer(args, *plan.metering.size, video=True, quality=(3, 1))
         for line in path.report(time_scale(meter.params.r_in, orbit_s), meter.params.r_in, meter.params.r_out,
                                 meter.params.disk_spin):
             print(line)
-        curve = meter_plan(meter, plan, meter.exposure_ev, orbit_s)
+        curve = meter_plan(meter, plan, meter.exposure_ev, orbit_s, knob_defaults=knob_defaults)
         renderer = _make_v2_renderer(args, width, height, video=True, init_taichi=False)
 
         start = _time.time()
@@ -605,9 +656,13 @@ def main():
                 生成器，按帧序产出 `(uint8 帧, E₀)`（供 `render_segmented` 保存 E₀）。
             """
             queue = collections.deque()
+            if e0 is None and plan.metering.reference_time > 0.0:
+                e0 = reference_exposure(renderer, path, orbit_s, plan.metering.reference_time,
+                                        anim=plan.anim, knob_defaults=knob_defaults)
             for f in range(f0, f1):
                 t = f / args.fps
-                hdr, sky = render_path_hdr(renderer, path, t, orbit_s, seed=f + 1)
+                hdr, sky = render_path_hdr(renderer, path, t, orbit_s, seed=f + 1,
+                                           anim=plan.anim, knob_defaults=knob_defaults)
                 if e0 is None:
                     e0 = auto_exposure(hdr)
                 # 池满（在途帧数达到线程数）时先收最旧的一帧，背压 GPU 侧的内存占用
@@ -648,10 +703,12 @@ def main():
                 raise ValueError(f"--v2_camera_path_time 须在 [0, {camera_plan.path.duration}] 内，得到 {t_path}")
             camera_plan.path.check(width / height)
             renderer = _make_v2_renderer(args, width, height, video=False)
-            hdr, sky = render_path_hdr(renderer, camera_plan.path, t_path, args.v2_orbit_seconds, seed=1)
+            hdr, sky = render_path_hdr(renderer, camera_plan.path, t_path, args.v2_orbit_seconds, seed=1,
+                                       anim=camera_plan.anim, knob_defaults=_knob_defaults())
             save_image(renderer.finish(hdr, sky), args.output)
         else:
             renderer = _make_v2_renderer(args, width, height, video=False)
+            renderer.set_scene_knobs(**_knob_defaults())
             img = renderer.render(cam_pos=args.pov, fov=fov)
             save_image(img, args.output)
     elif args.interactive:

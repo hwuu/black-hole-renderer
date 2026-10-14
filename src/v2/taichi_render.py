@@ -224,8 +224,54 @@ class DiskV2Renderer:
         self.pixel_width_field = ti.field(dtype=ti.f32, shape=())
         self.pixel_height_field = ti.field(dtype=ti.f32, shape=())
         self.r_escape_field = ti.field(dtype=ti.f32, shape=())
+        # 场景旋钮（想象实验，docs/plans/kids_explainer_plan.md §3）：引力强度 k / 多普勒强度 d /
+        # 盘气体量 w。运行时读数（不进 ti.static，改值不重编译）；取 1 = 与旋钮引入前一致
+        # （实测天空路逐位、HDR ≤ 1 ulp、8-bit 输出逐位，验收见执行方案 §6）。
+        self.gravity_scale_field = ti.field(dtype=ti.f32, shape=())
+        self.doppler_scale_field = ti.field(dtype=ti.f32, shape=())
+        self.disk_weight_field = ti.field(dtype=ti.f32, shape=())
+        self.disk_radius_scale_field = ti.field(dtype=ti.f32, shape=())
+        self.set_scene_knobs()
 
         self._compile_kernels()
+
+    def set_scene_knobs(self, gravity_scale: float = 1.0, doppler_scale: float = 1.0,
+                        disk_weight: float = 1.0, disk_radius_scale: float = 1.0) -> None:
+        """设置四个场景旋钮（想象实验，见 `docs/plans/kids_explainer_plan.md` §3）。
+
+        Args:
+            gravity_scale: 引力强度 k ∈ [0, 1]（黑洞质量缩放）：作用于光线弯曲、吞光半径、
+                引力红移、光子方向变换、静止相机光行差修正、光子环步长保护带与近视界步长。
+            doppler_scale: 多普勒强度 d ∈ [0, 1]：频移中 `β → d·β`，只作用于频移
+                （颜色与亮度），不影响盘的旋转动画与几何。
+            disk_weight: 盘气体量 w ∈ [0, 1]：总发射与总消光（含大气散射）整体乘 w；
+                0 = 无盘（跳过盘采样，天空透射不受影响）。
+            disk_radius_scale: 盘空间范围 ρ ∈ (0, 1]：盘的有效外半径 = ρ × r_out；
+                采样条件与步长包络都按有效外半径计算。配合 disk_weight 可实现
+                "从内向外生长"的盘形成效果（物理上盘确实从 ISCO 向外扩展）。
+
+        Returns:
+            无。旋钮写入 Taichi 运行时标量，下一次 `render_hdr` 生效，不触发重编译。
+
+        Physical Meaning:
+            k 是"质量旋钮"：就光线测地线与引力红移而言，k 对应质量 k·M 的真实时空
+            （视界 k·r_s、阴影 (3√3/2)·k ≈ 2.6k r_s）；d、w、ρ 是教学开关。
+            ρ < 1 时盘在 r > ρ·r_out 区域完全无发射/吸收，产生从中心向外的锐利边界。
+
+        Simplifications:
+            盘的结构（内外半径、温度、平流转速）与轨道 β 不随 k、d 缩放；
+            四旋钮取 1 时新增因子均为乘以精确 1.0——实测（Metal）天空路逐位一致、
+            HDR 相对偏差 ≤ 1 ulp、8-bit 输出逐位一致，验收以执行方案 §6 的实测标准为准。
+        """
+        for name, value in (("gravity_scale", gravity_scale), ("doppler_scale", doppler_scale),
+                            ("disk_weight", disk_weight), ("disk_radius_scale", disk_radius_scale)):
+            v = float(value)
+            if not (math.isfinite(v) and 0.0 <= v <= 1.0):
+                raise ValueError(f"{name} must be a finite value in [0, 1], got {value!r}")
+        self.gravity_scale_field[None] = float(gravity_scale)
+        self.doppler_scale_field[None] = float(doppler_scale)
+        self.disk_weight_field[None] = float(disk_weight)
+        self.disk_radius_scale_field[None] = float(disk_radius_scale)
 
     def _compile_kernels(self) -> None:
         """编译主光追 kernel（闭包捕获盘体句柄与编译期常量）。"""
@@ -248,12 +294,12 @@ class DiskV2Renderer:
         ss_f = float(self.ss)
 
         @ti.func
-        def _compute_acceleration(pos, L2):
-            """Schwarzschild 笛卡尔等效势的加速度：a = -1.5 L² x / r⁵。"""
+        def _compute_acceleration(pos, L2, k_grav):
+            """Schwarzschild 笛卡尔等效势的加速度（质量 k·M）：a = -1.5·k·L² x / r⁵。"""
             r2 = pos.dot(pos)
             r = ti.sqrt(r2)
             r5 = r2 * r2 * r
-            return -1.5 * L2 / r5 * pos
+            return -1.5 * L2 / r5 * pos * k_grav
 
         @ti.func
         def _sample_skybox(direction):
@@ -308,11 +354,25 @@ class DiskV2Renderer:
 
         @ti.kernel
         def _ray_march_kernel():
-            """主光追：Schwarzschild 测地线 + 体积发射-吸收积分，写 `hdr_field` / `sky_field`。"""
+            """主光追：Schwarzschild 测地线 + 体积发射-吸收积分，写 `hdr_field` / `sky_field`。
+
+            场景旋钮（kernel 顶部读一次，逐像素共享）：k = 引力强度（质量缩放，作用于光线弯曲、
+            吞光半径、引力红移、光行差与步长）、d = 多普勒强度（只作用于频移）、w = 盘气体量
+            （总发射与总消光含散射整体乘 w；w = 0 跳过盘采样）、ρ = 盘空间范围
+            （有效外半径 = ρ × r_out，采样条件与步长包络同步缩放）。
+            """
             r_esc = self.r_escape_field[None]
             max_iter = ti.cast(r_esc * 40.0 / _H_BUDGET, ti.i32)
             max_affine = r_esc * 40.0
-            r_cap = 1.0 * rs
+            k_grav = self.gravity_scale_field[None]
+            d_dop = self.doppler_scale_field[None]
+            w_gas = self.disk_weight_field[None]
+            r_scale = self.disk_radius_scale_field[None]
+            # 盘的有效外半径（ρ = 1 时与原始 r_out 逐位一致）
+            r_out_eff = disk._r_out * r_scale
+            # 吞光半径与近视界步长的缩放下限：k → 0 时防止 L²/r⁵ 发散产生 NaN
+            k_cap = ti.max(k_grav, 1e-3)
+            r_cap = k_cap * rs
 
             cp = self.cam_pos_field[None]
             cr = self.cam_right_field[None]
@@ -331,12 +391,12 @@ class DiskV2Renderer:
                 pixel_pos = tl + (px_f + 0.5) * pw * cr - (py_f + 0.5) * ph * cu
                 ray_dir = (pixel_pos - cp).normalized()
                 if ti.static(static_cam):
-                    # 静止观者本地方向 → 坐标方向：tanψ_coord = tanψ_local / sqrt(1 − r_s/r)
-                    # （ψ 为与径向夹角；径向分量不变，切向分量除以 sqrt(1 − r_s/r)）
+                    # 静止观者本地方向 → 坐标方向：tanψ_coord = tanψ_local / sqrt(1 − k·r_s/r)
+                    # （ψ 为与径向夹角；径向分量不变，切向分量除以 sqrt(1 − k·r_s/r)）
                     r0 = cp.norm()
                     rh = cp / r0
                     d_rad = ray_dir.dot(rh) * rh
-                    ray_dir = (d_rad + (ray_dir - d_rad) / ti.sqrt(1.0 - rs / r0)).normalized()
+                    ray_dir = (d_rad + (ray_dir - d_rad) / ti.sqrt(1.0 - k_grav * rs / r0)).normalized()
 
                 pos = cp
                 step_idx = 0
@@ -346,12 +406,12 @@ class DiskV2Renderer:
                 # 角动量平方 L² = |r × dir|²。
                 L_vec = pos.cross(dir_)
                 L2_val = L_vec.dot(L_vec)
-                # 光子环保护：冲击参数 b ≈ |x × d| 落在临界值 3√3/2 ≈ 2.6 附近（[2.4, 4.0]）的光线
+                # 光子环保护：冲击参数 b ≈ |x × d| 落在临界值 3√3/2 ≈ 2.6 附近（[2.4k, 4.0k]）的光线
                 # 形成光子环与阴影边缘，它们掠过极薄的内盘；这些光线保持原步长，避免放大步长后
                 # 漏采薄层、光子环断成点。该环带只占画面约 2%。
                 sc = step_c
                 b_imp = ti.sqrt(L2_val)
-                if b_imp > 2.4 and b_imp < 4.0:
+                if b_imp > 2.4 * k_grav and b_imp < 4.0 * k_grav:
                     sc = 1.0
 
                 escaped = False
@@ -373,11 +433,11 @@ class DiskV2Renderer:
                     # 盘相关距离在盘局部坐标下计算（支持倾角）；径向包络从采样下界 r_gate 起算
                     # （= r_in；内边界力矩 β > 0 时为坠落区下界 1.5 r_s）。
                     h = ti.min(0.06 * r_cur, 2.0)
-                    h = ti.min(h, 0.02 + 0.06 * ti.max(r_cur - 1.0, 0.0))
+                    h = ti.min(h, 0.02 * k_cap + 0.06 * ti.max(r_cur - k_cap, 0.0))
                     pl = _world_to_local_disk(pos)
                     rc_h = ti.sqrt(pl[0] * pl[0] + pl[1] * pl[1])
                     zb = 3.0 * disk._ss_half_thickness(ti.max(rc_h, disk._r_in)) + 0.02
-                    rad_out = ti.max(disk._r_gate * 0.95 - rc_h, 0.0) + ti.max(rc_h - disk._r_out * 1.02, 0.0)
+                    rad_out = ti.max(disk._r_gate * 0.95 - rc_h, 0.0) + ti.max(rc_h - r_out_eff * 1.02, 0.0)
                     d_slab = ti.max(ti.abs(pl[2]) - zb, 0.0) + rad_out
                     h = ti.min(h, sc * 0.03 * thick + 0.3 * d_slab)
                     d_atm = ti.max(ti.abs(pl[2]) - (disk._atm_ext * disk._atm_h * rc_h + 0.02), 0.0) + rad_out
@@ -399,13 +459,13 @@ class DiskV2Renderer:
 
                     # RK4 主光线。
                     k1p = h * dir_
-                    k1d = h * _compute_acceleration(pos, L2_val)
+                    k1d = h * _compute_acceleration(pos, L2_val, k_grav)
                     k2p = h * (dir_ + 0.5 * k1d)
-                    k2d = h * _compute_acceleration(pos + 0.5 * k1p, L2_val)
+                    k2d = h * _compute_acceleration(pos + 0.5 * k1p, L2_val, k_grav)
                     k3p = h * (dir_ + 0.5 * k2d)
-                    k3d = h * _compute_acceleration(pos + 0.5 * k2p, L2_val)
+                    k3d = h * _compute_acceleration(pos + 0.5 * k2p, L2_val, k_grav)
                     k4p = h * (dir_ + k3d)
-                    k4d = h * _compute_acceleration(pos + k3p, L2_val)
+                    k4d = h * _compute_acceleration(pos + k3p, L2_val, k_grav)
                     new_pos = pos + (k1p + 2 * k2p + 2 * k3p + k4p) / 6.0
                     new_dir = dir_ + (k1d + 2 * k2d + 2 * k3d + k4d) / 6.0
 
@@ -421,51 +481,53 @@ class DiskV2Renderer:
                     pm = 0.5 * (pos + new_pos)
                     _sl = _world_to_local_disk(pm)
                     r_local = ti.sqrt(_sl[0] ** 2 + _sl[1] ** 2)
-                    if r_local > disk._r_gate and r_local < disk._r_out:
+                    if r_local > disk._r_gate and r_local < r_out_eff:
                         z_local = _sl[2]
                         z_lim = 3.0 * disk._ss_half_thickness(r_local) + 0.01
                         z_lim = ti.max(z_lim, disk._atm_ext * disk._atm_h * r_local)
                         if ti.abs(z_local) < z_lim:
-                            phi_local = ti.atan2(_sl[1], _sl[0])
-                            # 光线方向转到盘局部坐标（g 因子与发射点位置同一坐标系）
-                            dm = _world_to_local_disk(0.5 * (dir_ + new_dir))
-                            # 光行时间：采样时刻 = 帧时刻 − (到段中点的光程)
-                            t_delay = 0.0
-                            if ti.static(light_delay):
-                                t_delay = lam - 0.5 * ds
-                            # 温度湍流的像素足迹（λ 取段中点）与透镜权重（段中点方向相对出射方向的偏折角）
-                            foot = 1.0
-                            lens_w = 0.0
-                            if ti.static(tt_on):
-                                foot = ti.max(lam - 0.5 * ds, _TT_MIN_PATH) * theta_out
-                                lens_w = disk._temp_turb_lens_weight((0.5 * (dir_ + new_dir)).normalized().dot(dir0))
-                            em_c, tf_c, ab_c, ab_a, em_a, sc_a = disk.density_I(
-                                r_local, z_local, phi_local, t_delay, foot, lens_w)
-                            if em_c + em_a + ab_c + ab_a > 1e-9:
-                                g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin)
-                                g_col = ti.pow(g_phys, self.doppler_color)
-                                # 颜色温度截断：χ(clamp(T·g_col, T_floor, T_cap))，暗金 → 白（_col_t 内实现）
-                                # 亮度温度 = s·g^{doppler_lum_eff}·T（s 为亮度温度倍率；色度不乘 s）
-                                g_lum = ti.pow(g_phys, self._doppler_lum_eff) * disk._lum_ts
-                                T_K = disk._page_thorne_temperature(r_local)
-                                # 核心：Y(s·g·T·tf_c)/Y(s·T_peak)·χ(g·T·tf_c)
-                                Tc = T_K * tf_c
-                                src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Tc * g_col))
-                                # 盘面有效温度源：S_disk = Y(s·g·T)/Y(s·T_peak)·χ(g·T)（散射入射场用）
-                                src_d = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(T_K * g_col))
-                                # 发射 j = 核心热发射 + 大气热发射（同为灰大气温度 T·tf）+ 大气散射 ω·ab_a·J，
-                                # J = scatter_j·(1 − e^{−τ_c})·S_disk（下方核心层，sc_a 已含 ω·ab_a·(1 − e^{−τ_c})）；
-                                # 消光 α = κ·(ab_c + ab_a)，κ 已按 tau_i 标定
-                                j_total = em_c * src_c + em_a * src_c + sc_a * disk._scatter_j * src_d
-                                alpha_coeff = disk._kappa_vol * (ab_a + ab_c)
-                                alpha_seg = alpha_coeff * ds
-                                # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
-                                if alpha_coeff > 1e-30:
-                                    hdr_accum += transmittance * j_total / alpha_coeff * (
-                                        1.0 - ti.exp(-alpha_seg))
-                                else:
-                                    hdr_accum += transmittance * j_total * ds
-                                transmittance *= ti.exp(-alpha_seg)
+                            # 盘气体量 w = 0 时跳过整个盘采样（光线追踪、视界判定与天空透射不受影响）
+                            if w_gas > 0.0:
+                                phi_local = ti.atan2(_sl[1], _sl[0])
+                                # 光线方向转到盘局部坐标（g 因子与发射点位置同一坐标系）
+                                dm = _world_to_local_disk(0.5 * (dir_ + new_dir))
+                                # 光行时间：采样时刻 = 帧时刻 − (到段中点的光程)
+                                t_delay = 0.0
+                                if ti.static(light_delay):
+                                    t_delay = lam - 0.5 * ds
+                                # 温度湍流的像素足迹（λ 取段中点）与透镜权重（段中点方向相对出射方向的偏折角）
+                                foot = 1.0
+                                lens_w = 0.0
+                                if ti.static(tt_on):
+                                    foot = ti.max(lam - 0.5 * ds, _TT_MIN_PATH) * theta_out
+                                    lens_w = disk._temp_turb_lens_weight((0.5 * (dir_ + new_dir)).normalized().dot(dir0))
+                                em_c, tf_c, ab_c, ab_a, em_a, sc_a = disk.density_I(
+                                    r_local, z_local, phi_local, t_delay, foot, lens_w)
+                                if em_c + em_a + ab_c + ab_a > 1e-9:
+                                    g_phys = disk_g_factor_ti(_sl, dm, cp.norm(), rs, g_spin, k_grav, d_dop)
+                                    g_col = ti.pow(g_phys, self.doppler_color)
+                                    # 颜色温度截断：χ(clamp(T·g_col, T_floor, T_cap))，暗金 → 白（_col_t 内实现）
+                                    # 亮度温度 = s·g^{doppler_lum_eff}·T（s 为亮度温度倍率；色度不乘 s）
+                                    g_lum = ti.pow(g_phys, self._doppler_lum_eff) * disk._lum_ts
+                                    T_K = disk._page_thorne_temperature(r_local)
+                                    # 核心：Y(s·g·T·tf_c)/Y(s·T_peak)·χ(g·T·tf_c)
+                                    Tc = T_K * tf_c
+                                    src_c = ti.exp(disk.blackbody_luminance_ti(Tc * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(Tc * g_col))
+                                    # 盘面有效温度源：S_disk = Y(s·g·T)/Y(s·T_peak)·χ(g·T)（散射入射场用）
+                                    src_d = ti.exp(disk.blackbody_luminance_ti(T_K * g_lum) - disk._ln_y_peak) * disk.blackbody_color_ti(self._col_t(T_K * g_col))
+                                    # 发射 j = 核心热发射 + 大气热发射（同为灰大气温度 T·tf）+ 大气散射 ω·ab_a·J，
+                                    # J = scatter_j·(1 − e^{−τ_c})·S_disk（下方核心层，sc_a 已含 ω·ab_a·(1 − e^{−τ_c})）；
+                                    # 消光 α = κ·(ab_c + ab_a)，κ 已按 tau_i 标定；w 为盘气体量（含散射整体缩放，tf_c 不缩放）
+                                    j_total = (em_c * src_c + em_a * src_c + sc_a * disk._scatter_j * src_d) * w_gas
+                                    alpha_coeff = disk._kappa_vol * (ab_a + ab_c) * w_gas
+                                    alpha_seg = alpha_coeff * ds
+                                    # 精确均匀段：ΔI = T · (j/α) · (1 − exp(−α·ds))；薄极限 → T · j · ds
+                                    if alpha_coeff > 1e-30:
+                                        hdr_accum += transmittance * j_total / alpha_coeff * (
+                                            1.0 - ti.exp(-alpha_seg))
+                                    else:
+                                        hdr_accum += transmittance * j_total * ds
+                                    transmittance *= ti.exp(-alpha_seg)
                     # 与参考实现一致：透射率低于 1e-3 即终止，并丢弃其后的天空贡献
                     if transmittance < 1e-3:
                         transmittance = 0.0

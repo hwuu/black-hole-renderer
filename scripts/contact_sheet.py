@@ -101,7 +101,8 @@ def main() -> None:
                               sky, DiskV2VolumeParams(), r_max=50.0, opt_level=args.v2_opt, ss=1)
     tiles = []
     for t, label in zip(times, labels):
-        hdr, sk = render_path_hdr(renderer, path, float(t), args.v2_orbit_seconds, seed=1)
+        hdr, sk = render_path_hdr(renderer, path, float(t), args.v2_orbit_seconds, seed=1,
+                                  anim=plan.anim)
         st = path.state_at(float(t), w / h)
         actual = project_origin(st.pos[None, :], st.forward[None, :], np.array([st.roll]), np.array([st.fov]), w / h)[0]
         r_c = float(np.hypot(st.pos[0], st.pos[1]))

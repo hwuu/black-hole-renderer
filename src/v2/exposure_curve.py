@@ -33,6 +33,9 @@ class MeteringSettings:
         gain: 补偿比例 k（≥ 0）：1 = 完全抵消亮度变化（每帧亮度相同），0 = 不补偿（首帧锁定）；
             小于 1 时亮处仍更亮、暗处仍更暗。
         ev_range: 补偿量的夹取范围 `(下限, 上限)`（档），叠加在曝光补偿 `--v2_exposure_ev` 之上。
+        reference_time: 锁定曝光 E₀ 的测光时刻（视频秒，≥ 0）。默认 0 = 取第 0 帧（现状）；
+            旋钮镜头首帧可能没有盘（如 `disk_weight` 从 0 开始）时，指向有目标外观的时刻。
+            只决定 E₀；测光曲线 ev(t) 仍以 t = 0 的亮度为基准。
     """
 
     step: float = 0.5
@@ -40,6 +43,7 @@ class MeteringSettings:
     smoothing: float = 1.5
     gain: float = 0.6
     ev_range: Tuple[float, float] = (-0.9, 1.1)
+    reference_time: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -231,7 +235,8 @@ def load_metering_settings(spec: dict) -> MeteringSettings:
 
     Raises:
         ValueError: 字段取值非法，信息中给出字段名：`exposure` 不是对象；metering_step 不是有限正数；
-            metering_size 不是两个正整数；smoothing 或 gain 不是有限非负数；ev_range 不是两个有限数或下限大于上限。
+            metering_size 不是两个正整数；smoothing 或 gain 不是有限非负数；ev_range 不是两个有限数或下限大于上限；
+            reference_time 不是有限非负数。
     """
     block = optional_block(spec, "exposure")
     d = MeteringSettings()
@@ -241,19 +246,20 @@ def load_metering_settings(spec: dict) -> MeteringSettings:
         smoothing = float(block.get("smoothing", d.smoothing))
         gain = float(block.get("gain", d.gain))
         ev_range = [float(v) for v in _sequence2(block.get("ev_range", d.ev_range), "exposure.ev_range")]
+        reference_time = float(block.get("reference_time", d.reference_time))
     except TypeError as exc:
         raise ValueError(f"exposure 块字段类型错误：{exc}") from exc
     if not (np.isfinite(step) and step > 0):
         raise ValueError(f"exposure.metering_step 必须是有限正数，得到 {step}")
     if not all(isinstance(v, int) and not isinstance(v, bool) and v > 0 for v in size):
         raise ValueError(f"exposure.metering_size 必须是两个正整数 [宽, 高]，得到 {size}")
-    for name, v in (("smoothing", smoothing), ("gain", gain)):
+    for name, v in (("smoothing", smoothing), ("gain", gain), ("reference_time", reference_time)):
         if not (np.isfinite(v) and v >= 0):
             raise ValueError(f"exposure.{name} 必须是有限非负数，得到 {v}")
     if not all(np.isfinite(ev_range)) or ev_range[0] > ev_range[1]:
         raise ValueError(f"exposure.ev_range 必须是两个有限数 [下限, 上限] 且下限 ≤ 上限，得到 {ev_range}")
     return MeteringSettings(step=step, size=(size[0], size[1]), smoothing=smoothing, gain=gain,
-                            ev_range=(ev_range[0], ev_range[1]))
+                            ev_range=(ev_range[0], ev_range[1]), reference_time=reference_time)
 
 
 def load_fade_settings(spec: dict) -> FadeSettings:

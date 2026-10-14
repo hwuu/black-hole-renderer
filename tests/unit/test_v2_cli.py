@@ -173,5 +173,24 @@ class CameraPathArgsTest(unittest.TestCase):
             cli.resolve_n_frames(_args("--video", "--fps", "10"), 0.01)
 
 
+class SceneKnobArgsTest(unittest.TestCase):
+    """场景旋钮与颜色封顶参数：取值校验与渲染器参数收集。"""
+
+    def test_knob_range_validated(self):
+        for flag in ("--v2_gravity_scale", "--v2_doppler_scale", "--v2_disk_weight"):
+            for bad in ("-0.1", "1.5", "nan", "inf"):
+                with self.assertRaises(ValueError, msg=f"{flag} {bad}"):
+                    cli.validate_args(_args(flag, bad))
+            cli.validate_args(_args(flag, "0"))
+            cli.validate_args(_args(flag, "1"))
+
+    def test_color_cap_validated(self):
+        for bad in ("-1", "nan"):
+            with self.assertRaises(ValueError, msg=f"--v2_color_cap {bad}"):
+                cli.validate_args(_args("--v2_color_cap", bad))
+        cli.validate_args(_args("--v2_color_cap", "0"))
+        cli.validate_args(_args("--v2_color_cap", "10000"))
+
+
 if __name__ == "__main__":
     unittest.main()
